@@ -15,18 +15,40 @@ using OpenConstructionSet.Mods;
 // the game already loads guarantees every field/reference (clothing, weapons, etc.)
 // is valid. Writes a CANDIDATE file — never overwrites the live mod.
 
-const string SrcPath = @"C:\Program Files (x86)\Steam\steamapps\common\Kenshi\KenshiMP\kenshi-online.mod";
-const string OutPath = @"C:\Program Files (x86)\Steam\steamapps\common\Kenshi\KenshiMP\kenshi-online-16.mod";
+// Rutas ajustadas por Onyx 2026-06-17: apuntan al repo en E:, no a la ruta de Steam original.
+const string SrcPath = @"E:\Aplicaciones\Kenshi-Online\kenshi-online.mod";
+const string OutPath = @"E:\Aplicaciones\Kenshi-Online\kenshi-online-16.mod";
 const int TotalPlayers = 16;
 
 if (args.Length > 0 && args[0] == "dump")
 {
     var a = typeof(ModFile).Assembly;
-    foreach (var tn in new[] { "OpenConstructionSet.Data.Item", "OpenConstructionSet.Data.ReferenceCategory" })
+    foreach (var tn in new[] { "OpenConstructionSet.Data.Item", "OpenConstructionSet.Data.ReferenceCategory", "OpenConstructionSet.Data.Reference" })
     {
         var t = a.GetType(tn)!;
         Console.WriteLine($"\n=== {t.FullName} ===");
         foreach (var p in t.GetProperties()) Console.WriteLine($"  prop {p.PropertyType.Name} {p.Name} canWrite={p.CanWrite}");
+    }
+    return;
+}
+
+// Modo "explore" (Onyx): vuelca game starts y squads con su cableado de referencias,
+// para diagnosticar el bug del inicio "Multiplayer" (squad que apunta a un animal/Bonedog).
+if (args.Length > 0 && args[0] == "explore")
+{
+    // Acepta ruta opcional: "explore <ruta.mod>" (default = SrcPath). Para verificar el candidato.
+    var srcE = new ModFile(args.Length > 1 ? args[1] : SrcPath);
+    var dataE = await srcE.ReadDataAsync();
+    var byId = dataE.Items.ToDictionary(i => i.StringId, i => i, StringComparer.OrdinalIgnoreCase);
+    string NameOf(string sid) => byId.TryGetValue(sid, out var it) ? $"\"{it.Name}\" [{it.Type}]" : "(externo/?)";
+    foreach (var it in dataE.Items
+        .Where(i => i.Type == ItemType.NewGameStartoff || i.Type == ItemType.SquadTemplate)
+        .OrderBy(i => i.Type.ToString()).ThenBy(i => i.Name))
+    {
+        Console.WriteLine($"\n[{it.Type}] \"{it.Name}\"  ({it.StringId})");
+        foreach (var cat in it.ReferenceCategories)
+            foreach (var r in cat.References)
+                Console.WriteLine($"    {cat.Name} -> {NameOf(r.TargetId)}  ({r.TargetId})");
     }
     return;
 }
@@ -73,6 +95,29 @@ for (int n = 1; n <= TotalPlayers; n++)
 
 data.LastId = Math.Max(data.LastId, nextId - 1);
 Console.WriteLine($"Created {created} new Player records. Total items now {data.Items.Count}. Writing self-contained mod:\n  {OutPath}");
+
+// ── FIX del bug del perro (Onyx 2026-06-17) ──
+// El game start "Multiplayer" tenia su 'squad' apuntando a "startoff- Wanderer dead" (22-),
+// un escuadron SIN lider que solo contiene un animal ("Bonedog dead", 24-) -> el creador de
+// personaje solo ofrecia el perro. Lo re-cableamos a "Player 1 squad" (11-), que SI tiene un
+// leader Character jugable -> el jugador crea un personaje normal en vez del perro.
+{
+    var mpStart = data.Items.FirstOrDefault(i => i.Type == ItemType.NewGameStartoff && i.Name == "Multiplayer");
+    if (mpStart is null)
+    {
+        Console.WriteLine("  [WARN] game start 'Multiplayer' no encontrado — no se aplica el fix del perro");
+    }
+    else
+    {
+        int fixedRefs = 0;
+        foreach (var cat in mpStart.ReferenceCategories.Where(c => c.Name == "squad"))
+            foreach (var r in cat.References)
+                if (r.TargetId == "22-kenshi-online.mod") { r.TargetId = "11-kenshi-online.mod"; fixedRefs++; }
+        Console.WriteLine(fixedRefs > 0
+            ? $"  FIX perro: game start Multiplayer 'squad' 22- (Bonedog) -> 11- (Player 1 squad). Refs cambiadas: {fixedRefs}"
+            : "  [WARN] no se encontro la referencia squad 22- en el game start Multiplayer (ya arreglado?)");
+    }
+}
 
 var dst = new ModFile(OutPath);
 await dst.WriteDataAsync(data);

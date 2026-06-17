@@ -24,3 +24,6 @@ Thumbs.db
 deploy-onyx.ps1
 KenshiOnline*.log
 *.kmpsave
+
+# Candidato generado por ModGen
+kenshi-online-16.mod
