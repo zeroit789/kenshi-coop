@@ -42,13 +42,18 @@ if (args.Length > 0 && args[0] == "explore")
     var byId = dataE.Items.ToDictionary(i => i.StringId, i => i, StringComparer.OrdinalIgnoreCase);
     string NameOf(string sid) => byId.TryGetValue(sid, out var it) ? $"\"{it.Name}\" [{it.Type}]" : "(externo/?)";
     foreach (var it in dataE.Items
-        .Where(i => i.Type == ItemType.NewGameStartoff || i.Type == ItemType.SquadTemplate)
+        .Where(i => i.Type == ItemType.NewGameStartoff || i.Type == ItemType.SquadTemplate || i.Type == ItemType.Faction || i.Type == ItemType.Character)
         .OrderBy(i => i.Type.ToString()).ThenBy(i => i.Name))
     {
         Console.WriteLine($"\n[{it.Type}] \"{it.Name}\"  ({it.StringId})");
+        // Para facciones y personajes, volcamos tambien las propiedades (Values): ahi estan
+        // flags como "is player faction" y la raza/facccion por defecto.
+        if (it.Type == ItemType.Faction || it.Type == ItemType.Character)
+            foreach (var kv in it.Values)
+                Console.WriteLine($"    val {kv.Key} = {kv.Value}");
         foreach (var cat in it.ReferenceCategories)
             foreach (var r in cat.References)
-                Console.WriteLine($"    {cat.Name} -> {NameOf(r.TargetId)}  ({r.TargetId})");
+                Console.WriteLine($"    {cat.Name} -> {NameOf(r.TargetId)}  ({r.TargetId})  [v0={r.Value0} v1={r.Value1} v2={r.Value2}]");
     }
     return;
 }
@@ -117,6 +122,28 @@ Console.WriteLine($"Created {created} new Player records. Total items now {data.
             ? $"  FIX perro: game start Multiplayer 'squad' 22- (Bonedog) -> 11- (Player 1 squad). Refs cambiadas: {fixedRefs}"
             : "  [WARN] no se encontro la referencia squad 22- en el game start Multiplayer (ya arreglado?)");
     }
+}
+
+// ── FIX de facciones (Onyx 2026-06-17) ──
+// Las facciones del jugador (Player 1/2) tenian "fundamental type" = 9 (OT_ADVENTURER), lo que
+// hace que el motor trate a tus personajes como NPCs errantes: los enemigos huyen en vez de pelear
+// y no puedes provocar/enemistarte normal. La faccion del jugador vanilla ("Nameless") usa 0
+// (OT_NONE). Lo corregimos a 0 preservando el tipo del valor. (Diagnostico: game-reverse-engineer,
+// confirmado en KenshiLib Faction.h / Enums.h.)
+{
+    int facFixed = 0;
+    foreach (var fac in data.Items.Where(i => i.Type == ItemType.Faction
+                                              && (i.Name == "Player 1" || i.Name == "Player 2")))
+    {
+        if (fac.Values.ContainsKey("fundamental type"))
+        {
+            var cur = fac.Values["fundamental type"];
+            fac.Values["fundamental type"] = Convert.ChangeType(0, cur.GetType()); // 0 = OT_NONE (jugador)
+            facFixed++;
+            Console.WriteLine($"  FIX faccion: {fac.Name} 'fundamental type' {cur} -> 0 (OT_NONE, jugador)");
+        }
+    }
+    if (facFixed == 0) Console.WriteLine("  [WARN] no se encontraron facciones Player 1/2 para corregir el tipo");
 }
 
 var dst = new ModFile(OutPath);
