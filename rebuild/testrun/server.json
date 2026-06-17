@@ -1,0 +1,12 @@
+{
+  "serverName": "KMP Local Test",
+  "port": 27800,
+  "maxPlayers": 16,
+  "password": "",
+  "savePath": "world.kmpsave",
+  "tickRate": 20,
+  "pvpEnabled": true,
+  "gameSpeed": 1.0,
+  "masterServer": "127.0.0.1",
+  "masterPort": 27801
+}

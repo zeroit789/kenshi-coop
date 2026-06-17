@@ -1,0 +1,1056 @@
+{
+  "summary": "Read-only parallel audit of the Kenshi-Online multiplayer mod: map every subsystem, find the broken sync-loop gaps, propose clean reorg",
+  "agentCount": 18,
+  "logs": [],
+  "result": {
+    "synthesis": {
+      "executiveSummary": "The sync loop is bugged today because it is mathematically deadlocked at the \"game loaded\" gate, not because of any networking or protocol flaw. ENet connects, handshakes, and streams 4,900+ packets reliably, but the client never transitions out of ClientPhase::Connected/GameReady because OnGameLoaded() is triggered almost exclusively by the CharacterCreate hook's loading-burst detector (core.cpp:1346-1362: needs GetLoadingCreateCount()>0 then 3s quiet). At init, GameWorldSingleton resolved UNRESOLVED and ~30 patterns failed, so the global-pointer fallback (core.cpp:1381, gated on playerBaseValid||gameWorldValid) also cannot fire. With the gate stuck closed, packet_handler.cpp:576-580 drops every S2C_EntitySpawn (0x31) with a TODO-\"queue for later\" that was never implemented, and the deferred-spawn queue is never drained. So remote characters never appear — not even via the fragile NPC-hijack/squad-bypass fallback, which itself sits downstream of the same gate. On top of this single fatal blocker sit a pile of half-built and duplicate subsystems (three spawn mechanisms, two position pipelines, an SDK abstraction that is initialized but never queried, four to seven overlapping \"orchestrators,\" combat that only syncs death/KO because C2S_AttackIntent is never sent, and a server with a HandlePlayerReady that references a non-existent struct and won't compile), which collectively make the data flow impossible to reason about. The good news: the network, protocol, registry, interpolation, hooking/MovRaxRsp infrastructure, and UI are genuinely solid and salvageable.",
+      "topGapsBlockingFullLoop": [
+        {
+          "gap": "Client never reaches GameLoaded state; every entity spawn (0x31) is dropped, never queued/replayed. The full sync loop cannot start.",
+          "rootCause": "OnGameLoaded() is gated on the CharacterCreate loading-burst detector (core.cpp:1346-1362) OR a global-pointer fallback (core.cpp:1381) that requires playerBaseValid||gameWorldValid. At runtime GameWorldSingleton was UNRESOLVED and PlayerBase failed, so neither path fires. packet_handler.cpp:576-580 drops spawns with an unimplemented 'TODO: Queue for later spawn'.",
+          "fixApproach": "(1) Make game-load detection robust and source-independent: poll CharacterIterator count directly each tick as the PRIMARY signal (it already works as a fallback at core.cpp:1382) rather than depending on the CharacterCreate hook or unresolved globals. Trigger OnGameLoaded() the moment iterator count>0 and stable for ~1-2s. (2) Implement the missing deferred-spawn queue: when a spawn arrives before GameReady, push it into a real buffer and replay the whole buffer in OnGameLoaded(). Apply the same to all state messages (position/health) keyed by entity. (3) Add a hard time-based ultimate fallback that does NOT require any global pointer.",
+          "effort": "M"
+        },
+        {
+          "gap": "Critical game-function resolution is unreliable: GameWorldSingleton + ~30 patterns unresolved, SaveGame/LoadGame nulled on signature mismatch, ApplyDamage deliberately skipped.",
+          "rootCause": "Pattern scanner's FindGlobalNearString uses a 512B-4KB window inadequate for 6-9KB functions (patterns.cpp:65-75); FindFunctionStart fragility; signature-mismatch nulling. These feed the load gate and combat directly.",
+          "fixApproach": "Harden global-pointer discovery (extend scan window to 8KB using .pdata bounds), and crucially decouple the game-loaded decision from these globals (see gap 1) so resolution failures degrade gracefully instead of deadlocking. Verify GameWorldSingleton offset against current Steam binary.",
+          "effort": "M"
+        },
+        {
+          "gap": "Server HandlePlayerReady does not compile / references non-existent struct, breaking the ready handshake that gates spawning.",
+          "rootCause": "server.cpp:2405-2451 implements against an undefined 'Player&' type and calls BroadcastReliable()/fields (.connected) that don't exist on ConnectedPlayer (server.h:17-29, declared as ConnectedPlayer&).",
+          "fixApproach": "Rewrite HandlePlayerReady to take ConnectedPlayer&, iterate m_players using real fields (lobbyReady/isReady), and use existing broadcast helpers. Add a single authoritative ready/lobby state machine on the server.",
+          "effort": "S"
+        },
+        {
+          "gap": "Lobby coordination is missing: clients never auto-send C2S_LobbyReady, so there is no 'all players loaded before first spawn' barrier.",
+          "rootCause": "C2S_LobbyReady is only sent via manual /ready command (builtin_commands.cpp:1770); HandleAllPlayersReady is stubbed (packet_handler.cpp:1773). Faction assignment never closes the lobby phase.",
+          "fixApproach": "Auto-send C2S_LobbyReady once faction is patched + game is loaded; server waits for all, broadcasts S2C_LobbyStart; clients then transition to spawning. Collapse scattered ready flags into one client-side phase enum.",
+          "effort": "M"
+        },
+        {
+          "gap": "Remote character spawn pipeline is non-deterministic and fragile (depends on game spawning a nearby NPC to hijack).",
+          "rootCause": "Primary path is in-place NPC hijack via Hook_CharacterCreate (entity_hooks.cpp:918-954) + squad-spawn flag flipping; direct FactoryCreate is only a 15s fallback. In safe zones/interiors no NPC is created, so nothing fires.",
+          "fixApproach": "Make FactoryCreate-with-mod-template the PRIMARY, deterministic path (mod ships Player 1-16 CHARACTER templates with stable factions). Delete NPC-hijack and squad bypass, or keep only as a last resort. Add spawn timeout + cap-slot release on disconnect (fixes the cap-saturation bug at sync_orchestrator.cpp:797).",
+          "effort": "L"
+        },
+        {
+          "gap": "Cross-player combat only syncs death/KO, not damage; intermediate health invisible; server combat resolver is dead.",
+          "rootCause": "C2S_AttackIntent is never sent (ApplyDamage hook disabled for crash risk, combat_hooks.cpp:270-278), so server ResolveCombat()/HandleAttackIntent are unreachable. C2S_LimbHealth only piggybacks death/KO.",
+          "fixApproach": "Choose ONE model: add a periodic remote-health poll (e.g. 200-500ms) so limb/health states stream continuously, and keep death/KO event hooks authoritative for end-states. Delete the unreachable server-side ResolveCombat path unless attack intent is actually wired.",
+          "effort": "M"
+        },
+        {
+          "gap": "Equipment/appearance never applied to remote characters; they spawn with hijacked-NPC gear; faction write disabled.",
+          "rootCause": "S2C_EntitySpawn carries no equipment payload (server.cpp:1181); SetEquipment() requires the item already in inventory (game_inventory.cpp:129-179); faction write on remotes disabled due to use-after-free (player_controller.cpp:159-167).",
+          "fixApproach": "Include an appearance/equipment block in the spawn payload; on the client, materialize items into inventory then equip. For faction, replicate a server-assigned player faction id per entity and have the client resolve it to a persistent local faction (mod-template faction) instead of writing captured NPC pointers.",
+          "effort": "L"
+        },
+        {
+          "gap": "Two position pipelines and an unused SDK run simultaneously, causing double-sends and unclear data flow.",
+          "rootCause": "Legacy PollLocalPositions/ApplyRemotePositionsDirect (core.cpp:2879-3039) and SyncOrchestrator stages both active under a feature flag; movement hooks also send when resolved. KenshiSDK snapshot/diff methods have zero callers.",
+          "fixApproach": "Pick SyncOrchestrator as the single driver, delete the legacy core.cpp position path, and either route reads through the SDK or delete the SDK's unused query surface. Position write Method 3 (cached field) drifts — restrict to Methods 1/2.",
+          "effort": "M"
+        }
+      ],
+      "orchestratorVerdict": "Keep SyncOrchestrator as THE single sync driver (rename to SyncPipeline — it is the pipeline, it does not orchestrate other orchestrators). It is the only component actively ticked every frame that owns the real read→send→interpolate→write loop and its sub-engines (EntityResolver, ZoneEngine, PlayerEngine). DELETE or demote everything overlapping it: (1) DELETE the legacy in-core sync path (PollLocalPositions / ApplyRemotePositionsDirect / SendCachedPackets in core.cpp) — it duplicates SyncOrchestrator stages and causes double-sends. (2) DELETE zone_interest.cpp (ZoneInterestManager singleton) — dead clone of ZoneEngine, never called. (3) DEMOTE PipelineOrchestrator to a diagnostics module (rename PipelineMonitor, move to sys/diagnostics) — it is 1Hz telemetry, not sync; keep but clearly outside the sync path. (4) DELETE SyncFacilitator and OwnershipManager — pure facades that delegate straight back to the registry/engines; callers should hit those directly. (5) KEEP LoadingOrchestrator but reduce it to one job: game-load detection + spawn gating, feeding the single SyncPipeline (and fix it to not depend on unresolved globals). (6) PatternOrchestrator (Scanner) is unrelated (pattern discovery) — keep, it is not a sync orchestrator. (7) TaskOrchestrator (UI/worker threads) is unrelated — keep. Net result: ONE sync driver (SyncPipeline), ONE load/spawn gate (LoadingOrchestrator), ONE diagnostics tap (PipelineMonitor), and no facades.",
+      "proposedArchitecture": [
+        {
+          "module": "kmp_protocol (Common)",
+          "responsibility": "Wire format: message enums, packed structs with EXPLICIT variable-length payload schemas (spawn appearance/equipment/health inline), channel assignment, version. Remove dead S2C_ZoneData/C2S_EntityAck; dedicate combat-stance msg; bounds-checked string read.",
+          "builtFrom": "KenshiMP.Common (messages.h, protocol.h, serialization.cpp) — keep, refactor"
+        },
+        {
+          "module": "NetworkClient",
+          "responsibility": "ENet lifecycle, channelized send/recv, keepalive using the constant, adaptive session timeout set BEFORE connect returns (fixes timeout cliff).",
+          "builtFrom": "KenshiMP.Core/net/client.cpp — keep, minor fixes"
+        },
+        {
+          "module": "PacketRouter",
+          "responsibility": "Decode S2C, route to subsystem appliers, and queue-while-not-ready (real deferred buffer replayed on GameLoaded) with per-entity locking on snapshot writes.",
+          "builtFrom": "KenshiMP.Core/net/packet_handler.cpp — keep, fix deferral + locking"
+        },
+        {
+          "module": "EntityRegistry",
+          "responsibility": "Authoritative net-id<->game-object map, ownership, generation field (actually implemented), spawn-state with timeout cleanup.",
+          "builtFrom": "KenshiMP.Core/sync/entity_registry.cpp — keep, add generation+timeout"
+        },
+        {
+          "module": "Interpolation",
+          "responsibility": "Per-entity 8-snapshot ring buffer, jitter-adaptive delay, slerp/lerp, snap correction. Skip entities with no game object.",
+          "builtFrom": "KenshiMP.Core/sync/interpolation.cpp — keep as-is"
+        },
+        {
+          "module": "SyncPipeline",
+          "responsibility": "THE single per-tick driver: poll+send local positions, drive interpolation, write remote positions, poll+send equipment/health diffs, drive zone interest. Owns EntityResolver/ZoneEngine/PlayerEngine.",
+          "builtFrom": "KenshiMP.Core/sync/sync_orchestrator.cpp — keep, rename, absorb legacy core path"
+        },
+        {
+          "module": "LoadGate",
+          "responsibility": "Detect game-loaded via CharacterIterator polling (not unresolved globals), drain deferred spawn buffer, gate first spawn, run lobby ready barrier.",
+          "builtFrom": "KenshiMP.Core/game/loading_orchestrator.cpp — keep, decouple from globals"
+        },
+        {
+          "module": "SpawnService",
+          "responsibility": "Deterministic remote-char creation via FactoryCreate + mod Player templates; per-player cap with disconnect release; spawn timeout. NPC-hijack only as optional last resort.",
+          "builtFrom": "merge spawn_manager.cpp + entity_hooks spawn path; delete asset_facilitator/squad_spawn_hooks"
+        },
+        {
+          "module": "AppearanceSync",
+          "responsibility": "Apply equipment/appearance/faction to spawned remote chars from spawn payload; faction via server-assigned id resolved to persistent local faction (no NPC-pointer writes).",
+          "builtFrom": "new (pulls from game_inventory/game_faction/player_controller)"
+        },
+        {
+          "module": "CombatSync",
+          "responsibility": "Death/KO event hooks (authoritative end-states) + periodic remote health/limb poll for intermediate damage. One model, server validates.",
+          "builtFrom": "KenshiMP.Core/hooks/combat_hooks.cpp — keep events, add health poll; delete dead server ResolveCombat path"
+        },
+        {
+          "module": "GameMemory (SDK)",
+          "responsibility": "Single low-level read/write primitive layer (CharacterAccessor/iterator/offsets). One access pattern, no duplicate WorldAccessor.",
+          "builtFrom": "KenshiMP.Core/game/game_types.h + sdk/kenshi_sdk.cpp — consolidate, drop unused query surface or wire it as the source of truth"
+        },
+        {
+          "module": "HookKit (Scanner)",
+          "responsibility": "Pattern scan, .pdata function bounds, MinHook + MovRaxRsp detour, global-pointer discovery with 8KB window.",
+          "builtFrom": "KenshiMP.Scanner — keep, harden FindGlobalNearString + reentrancy"
+        },
+        {
+          "module": "ServerAuthority",
+          "responsibility": "Per-tick authoritative hub: validated position/combat/state, entity ids, lobby+ready state machine, broadcast, JSON persistence.",
+          "builtFrom": "KenshiMP.Server/server.cpp — keep, fix HandlePlayerReady compile + ready FSM"
+        },
+        {
+          "module": "UI/Overlay",
+          "responsibility": "MyGUI HUD, menu, chat, slash commands, connection state machine (explicit enum).",
+          "builtFrom": "KenshiMP.Core/ui/* — keep, minor polish"
+        },
+        {
+          "module": "PipelineMonitor (diagnostics)",
+          "responsibility": "1Hz telemetry/anomaly snapshots, OUTSIDE the sync path.",
+          "builtFrom": "KenshiMP.Core/sync/pipeline_orchestrator.cpp — keep, rename, isolate"
+        }
+      ],
+      "salvage": [
+        "KenshiMP.Common protocol/serialization (channels, core messages wired and working)",
+        "NetworkClient ENet integration (handshake, channelized send/recv, server browser query)",
+        "EntityRegistry bidirectional net-id<->game-object mapping",
+        "Interpolation 8-snapshot ring buffer (jitter-adaptive, slerp, snap correction)",
+        "SyncOrchestrator per-tick pipeline (the keeper — becomes SyncPipeline)",
+        "KenshiMP.Scanner: pattern scanner, .pdata validation, HookManager, MovRaxRspFix (solid infra)",
+        "CharacterDeath/CharacterKO hooks + deferred event ring buffer + echo suppression",
+        "Position read/write CharacterAccessor Methods 1 and 2 (setPosition fn, physics chain)",
+        "KenshiMP.Server authoritative loop: dispatch, position/ownership validation, broadcast, JSON persistence, auto-save, master-server integration",
+        "Faction string .rdata patching (lobby_manager) — elegant use-after-free avoidance",
+        "time_hooks (TimeUpdate + SetServerTime game-speed sync)",
+        "UI stack: MyGuiBridge, NativeHud, NativeMenu, Overlay, CommandRegistry + 20 builtins (production-ready)",
+        "LoadingOrchestrator burst detection + spawn gating (keep, but fix load-trigger source)",
+        "Mod template approach: kenshi-online.mod Player 1-16 CHARACTER templates with persistent factions"
+      ],
+      "rewriteOrDelete": [
+        "DELETE legacy in-core sync path: PollLocalPositions / ApplyRemotePositionsDirect / SendCachedPackets (core.cpp ~2879-3039) — duplicates SyncOrchestrator, causes double-sends",
+        "DELETE zone_interest.cpp (ZoneInterestManager singleton) — dead clone of ZoneEngine, never instantiated",
+        "DELETE OwnershipManager (ownership.cpp) — pure facade delegating to EntityRegistry",
+        "DELETE SyncFacilitator (sync_facilitator.h/cpp) — pure facade, no load-bearing logic",
+        "DELETE asset_facilitator.cpp — 62-line dead pass-through to LoadingOrchestrator",
+        "DELETE/QUARANTINE squad_spawn_hooks.cpp — fragile flag-flipping; spawn_manager already marks the queue path it feeds as deprecated",
+        "DELETE building_hooks.cpp (all 5 hooks) — Install() never called, 350 lines unreachable; defer building sync post-MVP",
+        "DELETE save_hooks.cpp — disabled no-op; local saves work without it",
+        "DELETE world_hooks BuildingPlace hook — unverified signature, disabled",
+        "DELETE dead spawn paths spawn_manager::ProcessSpawnQueue (marked DO-NOT-USE) and ProcessSpawnQueueFromHook (no caller)",
+        "DELETE server-side combat_resolver.cpp / HandleAttackIntent path unless C2S_AttackIntent is actually sent — currently unreachable dead code",
+        "DELETE compression.h/cpp utilities (DeltaPosition/PackedVelocity/float16) — defined, instantiated nowhere — or wire them; do not leave dangling",
+        "DELETE WorldAccessor singleton in game_world.cpp — duplicate of GameWorldAccessor",
+        "DELETE manual /ready command once C2S_LobbyReady is auto-sent",
+        "DELETE install.bat — superseded by Injector.exe (both modify Plugins_x64.cfg)",
+        "DELETE or implement VisualProxy ProxyData.sceneNode/ogreEntity fields — currently zombie (Phase 2 rendering never reachable)",
+        "REMOVE dead enums S2C_ZoneData (0x12) and C2S_EntityAck (0x15) — never sent/handled",
+        "DELETE movement_hooks Hook_SetPosition/Hook_MoveTo bodies — never installed (mov rax,rsp); keep polling"
+      ],
+      "mvpSequence": [
+        "Fix server compile: rewrite GameServer::HandlePlayerReady (server.cpp:2405-2451) to use ConnectedPlayer& and real fields; add one authoritative lobby/ready state machine. Without this the server build is broken.",
+        "Break the load deadlock: make LoadGate trigger OnGameLoaded() from CharacterIterator polling (already proven as fallback at core.cpp:1382) instead of depending on the CharacterCreate burst detector or unresolved GameWorldSingleton/PlayerBase. Add a time-based ultimate fallback with no global-pointer dependency.",
+        "Implement the real deferred-spawn buffer in PacketRouter: replace the TODO at packet_handler.cpp:579 with an actual queue; replay ALL buffered spawns (and queued position/health) in OnGameLoaded(). Verify a remote S2C_EntitySpawn is no longer dropped.",
+        "Pick ONE sync driver: enable SyncOrchestrator unconditionally, delete the legacy core.cpp position path, delete zone_interest/OwnershipManager/SyncFacilitator/asset_facilitator. Confirm exactly one read→send and one write per entity per tick.",
+        "Make spawning deterministic: route SpawnService to FactoryCreate using mod Player templates as the primary path; remove dependence on NPC hijack. Add spawn timeout + cap-slot release on disconnect. Goal: remote char reliably appears within ~1-2s of join.",
+        "Wire the lobby barrier: auto-send C2S_LobbyReady after faction patch + game loaded; server broadcasts S2C_LobbyStart; clients spawn only after barrier. Both players see each other before first spawn.",
+        "Verify the 2-player vertical slice: two clients connect, both reach GameLoaded, exchange C2S/S2C_PositionUpdate, each spawns the other's character via FactoryCreate, positions interpolate smoothly. This is the working slice.",
+        "Layer in continuous remote health/limb poll (200-500ms) + keep death/KO event hooks so cross-player combat shows intermediate damage and consistent kills. Delete the unreachable server ResolveCombat path.",
+        "Add appearance/equipment to the spawn payload and apply on the client (materialize-then-equip); resolve faction via server-assigned id to a persistent local faction. Remotes now look correct and are non-hostile.",
+        "Defer/strip non-MVP: building sync, master-server polish, packet compression, endianness — explicitly out of the vertical slice."
+      ]
+    },
+    "findingsCount": 17,
+    "rawFindings": [
+      {
+        "subsystem": "KenshiMP.Common Protocol Layer",
+        "whatItActuallyDoes": "Defines a 58-message multiplayer protocol with 3 ENet channels (reliable ordered, reliable unordered, unreliable sequenced). Implements message types for connection handshake, entity spawn/despawn, position updates, combat hits/death/KO, stats/health/equipment, inventory/trade, buildings, squads, factions, chat, admin, and server queries. Uses fixed-size packed structures with variable-length string payloads (uint16_t length prefix). Includes Quat smallest-three compression (32 bits) and float16 position delta codecs, but these compression utilities are defined but never used. Protocol version is hardcoded to 1; no backwards compatibility path exists.",
+        "wiringStatus": "Core messages are wired and functioning: C2S/S2C_Handshake, C2S/S2C_PositionUpdate, S2C_CombatHit/Death/KO, S2C_EntitySpawn/Despawn, S2C_HostAssignment, C2S_ChatMessage, S2C_HealthUpdate, S2C_EquipmentUpdate, S2C_LimbHealth, S2C_StatusEffect, S2C_BuildPlaced/Destroyed/Progress, S2C_SquadCreated/MemberUpdate, S2C_FactionRelation, Master Server MS_Register/Heartbeat/QueryList, and Pipeline Debug messages all have callers in server.cpp and handlers in packet_handler.cpp. DEAD: S2C_ZoneData (0x12) and C2S_EntityAck (0x15) are defined but never sent or handled anywhere. Compression utilities (DeltaPosition, PackedVelocity, float16 codecs) are defined in compression.h but instantiated nowhere—actual CharacterPosition struct uses full float32 positions.",
+        "brokenForSync": [
+          {
+            "symptom": "Message type aliasing creates ambiguity",
+            "suspectedCause": "S2C_CombatBlock (0x42) reused to carry MsgCombatStance data instead of using a dedicated message type",
+            "location": "packet_handler.cpp:1088, protocol.h:46, messages.h:95-263",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Variable-length payloads lack schema definition",
+            "suspectedCause": "MsgEntitySpawn, MsgChatMessage, MsgSquadCreate declare data but struct is incomplete; real encoding (name, equipment, health) documented only in comments, not in type definition",
+            "location": "messages.h:116-125, 340-343, 239-243; packet_handler.cpp:520-545 (real deserialization)",
+            "severity": "major"
+          },
+          {
+            "symptom": "PacketHeader.flags compression bit never used",
+            "suspectedCause": "WriteHeader() always sets flags=0; no packet compression despite 30-40% potential bandwidth savings",
+            "location": "protocol.h:145-151 (WriteHeader never sets bit 0); server.cpp (1397-1434 Broadcast functions never compress)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Hardcoded string length limit vs protocol capacity mismatch",
+            "suspectedCause": "ReadString() has 1024 char hardcoded maxLen, but struct uses uint16_t length (capacity 65535). Chat messages silently truncated without error reporting.",
+            "location": "protocol.h:203-211; used in HandleChatMessage packet_handler.cpp",
+            "severity": "minor"
+          },
+          {
+            "symptom": "No endianness conversion for network byte order",
+            "suspectedCause": "All structures use native byte order (little-endian x86). htons/ntohl never called. Fails on big-endian systems.",
+            "location": "All protocol.h, messages.h files — no byte-order conversions anywhere",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Input validation gaps in message handlers",
+            "suspectedCause": "MsgStatUpdate not bounds-checked for stat index 0-23; MsgEntitySpawn doesn't validate templateId; MsgCombatHit relies on entity lookup to catch missing entities",
+            "location": "server.cpp case handlers (~379-500+)",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/types.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/constants.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/messages.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/protocol.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/compression.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/config.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/string_convert.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/src/protocol.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/src/serialization.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/src/compression.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/src/config.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/packet_handler.cpp (lines 1-1254 read)",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.MasterServer/main.cpp (first 100 lines)"
+        ],
+        "reorgNote": "KEEP: The protocol foundation is sound—channel assignments are correct, core messages are wired and working, serialization is fundamentally correct. Version checking exists. REFACTOR: (1) Remove dead S2C_ZoneData and C2S_EntityAck enums. (2) Formalize variable-length payload schemas—define explicit structs for MsgEntitySpawn extended fields (health, alive flag) and make string payloads explicit in the struct. (3) Activate packet compression: set PacketHeader.flags bit 0 for messages larger than 128 bytes; implement lightweight payload compression (even simple zlib or LZ4 achieves 30%+ savings). (4) Add string length validation: replace hardcoded 1024 limit with proper bounds checks aligned to uint16_t capacity. (5) Dedicate S2C_CombatStance as its own message type (reuse 0x0C or nearby) instead of aliasing S2C_CombatBlock. (6) Add endianness safety: wrap all multi-byte fields with platform-portable conversions (htons-style) or document x86-only assumption. (7) Tighten input validation: stat index bounds, templateId existence, entity lookup failures. This is NOT a \"delete and rewrite\"—the protocol scales and is extensible. These are maturation refinements for 1.0 shipping."
+      },
+      {
+        "subsystem": "KenshiMP.Core/net - Client-side network layer (connection, messaging, dispatching)",
+        "whatItActuallyDoes": "The net subsystem manages the complete client-server lifecycle: ENet connection initialization (blocking and async modes), message packet reading/writing, dispatch to game-world handlers via PacketHandler, and keepalive/disconnect management. NetworkClient (client.h/cpp) wraps ENet with a callback-based receive system and separate threadsafe send methods per channel (reliable ordered, reliable unordered, unreliable sequenced). PacketHandler (packet_handler.cpp) decodes 40+ S2C message types and applies state to game world or entity registry, with game-thread queueing for unsafe operations. ServerQueryClient (server_query.cpp) implements separate lightweight server browser queries without blocking gameplay.",
+        "wiringStatus": "Fully wired in live path: NetworkClient.Update() called every ~1ms from Core::NetworkThreadFunc (core.cpp:1789), which pumps ENet events and triggers PacketCallback set at initialization (packet_handler.cpp:114). Handshake → EntitySpawn → PositionUpdate → combat/state sync forms the main player-visible loop. Keepalive sent every 5s from OnGameTick (core.cpp:2131-2135). ServerQueryClient is optional (not blocking game).",
+        "brokenForSync": [
+          {
+            "symptom": "S2C_ZoneData and S2C_ServerInfo defined in protocol but never handled in PacketHandler",
+            "suspectedCause": "Message types appear in protocol.h (0x12, 0xA1) but no case statement or Handle* function exists — will fall through to unknown message log (line 330) and be silently dropped",
+            "location": "packet_handler.cpp:209-332, protocol.h:24,103",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Keepalive interval is 5 seconds in code but KMP_KEEPALIVE_INTERVAL constant is 1000ms — semantic mismatch",
+            "suspectedCause": "core.cpp line 2131 hardcodes `>= 5` seconds while constants.h defines KMP_KEEPALIVE_INTERVAL=1000. Code doesn't use the constant, so timeout tuning is fragile",
+            "location": "core.cpp:2131, constants.h:42",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Async connect timeout (5s) set during ConnectAsync but session timeout bumped to 30-60s only AFTER connection established — during load/gameplay with no position updates for 5+ seconds, client gets booted",
+            "suspectedCause": "enet_peer_timeout called at line 86 with 5s, then changed to 30-60s at line 141. Between those points (when game is loading or player standing still with no position sends), server may timeout and disconnect",
+            "location": "client.cpp:86,141, constants.h:41-43",
+            "severity": "major"
+          },
+          {
+            "symptom": "S2C_HandshakeAck handler calls entity_hooks::ResumeForNetwork() only if game already loaded (line 366), defers to OnGameLoaded if not — but OnGameLoaded isn't called immediately after connect if player connects before load",
+            "suspectedCause": "Two-phase initialization (connect → load → hooks resume) creates race: if server sends entity spawns before OnGameLoaded fires, HandleEntitySpawn logs warning at 577 and returns early. Spawn queue orphaned until game loaded",
+            "location": "packet_handler.cpp:362-372, 576-581",
+            "severity": "major"
+          },
+          {
+            "symptom": "No error handling if PacketHandler's SEH-wrapped game thread commands (combat hits, deaths, position writes) fail — failures logged but state not rolled back",
+            "suspectedCause": "Commands pushed to m_commandQueue with SEH __try/__except, but if write fails (e.g., bad pointer), registry still updated and character left in inconsistent state",
+            "location": "packet_handler.cpp:875-914, 949-1004",
+            "severity": "major"
+          },
+          {
+            "symptom": "Position updates and snapshots from packets received on network thread (PacketHandler context) — no per-entity locking vs game thread reading from interpolation",
+            "suspectedCause": "HandlePositionUpdate (line 783) calls interp.AddSnapshot() without locking; game thread calls interp.GetInterpolated() — classic reader/writer race. Works by luck if snapshots don't corrupt per-limb pointers",
+            "location": "packet_handler.cpp:807-808, likely interpolation.h",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/client.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/client.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/packet_handler.cpp (full: 1795 lines, read offset 0-1254 then 1254-1795)",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/server_query.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/server_query.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/constants.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Common/include/kmp/protocol.h (header section: 200 lines)",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.cpp (sections: 1620-1680, 1784-1806, 1808-1923, 1949-2062, 2085-2265)"
+        ],
+        "reorgNote": "The net layer is architecturally sound (ENet integration clean, callback pattern clear, message dispatch systematic). Three critical issues block multiplayer reliability: (1) **Timeout cliff** — session timeout only raised after connect succeeds; during load/idle, 5s timeout causes silent disconnect. Fix: set session timeout in ConnectAsync before returning, or use adaptive timeout that ramps up after first position update. (2) **Early spawn loss** — S2C_EntitySpawn during game load are deferred with TODO (line 579) but never reprocessed. Fix: queue deferred packets in a buffer, replay after OnGameLoaded. (3) **Race on position updates** — packets arrive on network thread, interp updates happen locklessly while game thread reads them. Fix: add per-entity spinlock around snapshot add/get or use atomic compare-and-swap for individual fields. Secondary: Use KMP_KEEPALIVE_INTERVAL constant (not hardcoded 5s). Missing S2C_ZoneData/ServerInfo handlers are not in the critical path (zone system unused, ServerInfo is query-only) so lower priority."
+      },
+      {
+        "subsystem": "sync-registry-interp (entity lifecycle, net ID mapping, interpolation, ownership)",
+        "whatItActuallyDoes": "This subsystem implements the core entity tracking loop: (1) EntityRegistry maintains bidirectional maps (net ID ↔ game pointer) with thread-safe read/write access for local and remote entities, distinguishing ownership (server=0, player>0). (2) EntityResolver wraps Registry with interest-set caching (3x3 zone grid), dirty-flag tracking, and compound queries. (3) Interpolation maintains per-entity ring buffers (8 snapshots) with jitter estimation, snap correction, and position/rotation lerp for rendering. (4) OwnershipManager singleton delegates all queries back to Registry (pure facade, zero actual logic). (5) The update loop: network S2C_PositionUpdate packets call AddSnapshot() (raw timestamp + pos/rot), then BackgroundInterpolate() reads remote entities and calls GetInterpolated() at render time. Snapshots are enqueued from packet_handler.cpp:~line 807, consumed by sync_orchestrator.cpp line 932-954. (6) Entity lifecycle: Register(local) → Register/RegisterRemote(netId) → SetGameObject() (transitions Spawning→Active) → Unregister on despawn.",
+        "wiringStatus": "FULLY WIRED, linear happy path. EntityRegistry is instantiated in Core (core.h:75) and passed to: SyncOrchestrator (ctor), Interpolation (indirect via calls), EntityResolver (ctor), packet_handler (implicit via Core::GetEntityRegistry()). AddSnapshot is called from packet_handler.cpp:807 in HandlePositionUpdate. GetInterpolated is called from SyncOrchestrator::BackgroundInterpolate (line 944). SetGameObject is called from packet_handler.cpp in HandleEntitySpawn (indirect via SpawnManager), and from sync_orchestrator.cpp:774 (direct spawn fallback). SyncFacilitator (sync_facilitator.h) is a thin facade that holds references to all pieces but just delegates. OwnershipManager singleton is instantiated but only called from a few places and immediately delegates back to Registry—pure cruft.",
+        "brokenForSync": [
+          {
+            "symptom": "RegisterRemote creates entity in Spawning state but SetGameObject only called after NPC hijack or direct spawn succeeds. If hijack/direct spawn fails, entity remains in Spawning state indefinitely with no game object, blocking interpolation (GetInterpolated returns false). No cleanup/timeout.",
+            "suspectedCause": "No failure handling for async spawn attempts. NPC hijack relies on hook firing (unreliable per audit notes). Direct spawn only attempted after 15s wait + 5 attempts. If all fail, entity is orphaned.",
+            "location": "entity_registry.cpp:41-78 (RegisterRemote), sync_orchestrator.cpp:714-808 (spawn retry logic)",
+            "severity": "major"
+          },
+          {
+            "symptom": "BackgroundInterpolate iterates GetRemoteEntities() at line 935, but GetRemoteEntities filters isRemote=true AND gameObject!=nullptr check is deferred to interpolation GetInterpolated. If entity is Spawning with no gameObject, interpolation still reserves space in ring buffer, wasting memory and CPU on entities that can never be rendered.",
+            "suspectedCause": "GetInterpolated checks (entityId in m_entities) but does not validate gameObject exists before adding snapshots. No guard in AddSnapshot.",
+            "location": "interpolation.cpp:7-61, sync_orchestrator.cpp:935-953",
+            "severity": "minor"
+          },
+          {
+            "symptom": "EntityRegistry::IsValidGeneration (line 374) checks generation field which is declared (entity_registry.h:13) but NEVER set anywhere. All new entities have generation=0 forever. Any check against generation will silently pass/fail unpredictably.",
+            "suspectedCause": "Field added in spec comment (§2.2 ghost control prevention) but never implemented in Register or RegisterRemote.",
+            "location": "entity_registry.h:13, entity_registry.cpp:374-379",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "duplicatesOrOverlap": [
+          "OwnershipManager (ownership.cpp:17-58) is pure facade—delegates all queries back to EntityRegistry. Can be deleted; callers should use Registry directly. SyncFacilitator (sync_facilitator.h/cpp) holds references to Registry, Interpolation, etc. and delegates all operations to them. Useful as a single-point-of-call facade for hooks/packet handlers, but not load-bearing—every operation can be done by calling the subsystems directly."
+        ],
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/entity_registry.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/entity_registry.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/entity_resolver.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/entity_resolver.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/interpolation.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/interpolation.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/ownership.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_orchestrator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_orchestrator.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_facilitator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/pipeline_orchestrator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/packet_handler.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.cpp"
+        ],
+        "reorgNote": "REFACTOR priorities: (1) Remove OwnershipManager singleton—it's pure boilerplate. Have packet handlers and combat hooks call Registry directly. (2) Add spawn timeout/cleanup: if RegisterRemote entity remains in Spawning state > 60s with no gameObject, auto-Unregister and log failure. (3) Implement generation field: increment on RemapEntityId, set in Register/RegisterRemote, validate in critical paths (combat, equipment writes). (4) BackgroundInterpolate should pre-filter by (gameObject != nullptr) to avoid wasting CPU on orphaned spawns. (5) Consider flattening SyncFacilitator into core.h as inline wrappers—it's purely a naming convenience and doesn't reduce coupling. (6) Document the sync loop contract clearly: packets → AddSnapshot (timestamp from SessionTime()) → GetInterpolated (at current SessionTime()) → UpdatePosition (write back to Registry). The 8-snapshot ring buffer is good; document why 8 (covers ~400ms @ 20Hz)."
+      },
+      {
+        "subsystem": "sync-orchestrators (SyncOrchestrator, PipelineOrchestrator, SyncFacilitator, PlayerEngine, ZoneEngine, zone_interest)",
+        "whatItActuallyDoes": "SyncOrchestrator is the actively-driven main sync pipeline that ticks every game frame (Core::OnGameTick step 3). It owns three sub-engines (EntityResolver, ZoneEngine, PlayerEngine), manages double-buffered frame data with background workers, polls/sends local entity positions every 50ms, applies interpolated remote positions, and handles spawn queue with fallback direct-spawn after 15s. PipelineOrchestrator (step 11) is a separate diagnostics/monitoring system that collects 1Hz state snapshots, broadcasts pipeline events, and runs anomaly detection—wired but NOT part of the main sync path. SyncFacilitator is a thin facade that delegates to SyncOrchestrator's engines. PlayerEngine tracks remote player state machines + session info. ZoneEngine implements 3x3 zone-based interest culling. zone_interest.cpp defines an unused singleton ZoneInterestManager that duplicates ZoneEngine's logic but is never instantiated or called.",
+        "wiringStatus": "SyncOrchestrator: actively driven every tick via SEH_SyncOrchestratorTick(). PipelineOrchestrator: actively driven every tick (step 11, post-main-pipeline). SyncFacilitator: bound at init, used by hooks/commands to query/update engines. PlayerEngine: owned by SyncOrchestrator, called during Tick() for AFK checks (every 10s). ZoneEngine: owned by SyncOrchestrator, called every tick in StageUpdateZones(). zone_interest.cpp: DEAD CODE — ZoneInterestManager is defined but never called anywhere; Get() is never invoked.",
+        "brokenForSync": [
+          {
+            "symptom": "Remote character equipment/appearance not updating on remote players",
+            "suspectedCause": "StagePollAndSendEquipment() runs every 2s and sends diffs correctly, but remote write path disabled (per comments: 'DISABLED (use-after-free)'); faction write on remote chars DISABLED",
+            "location": "sync_orchestrator.cpp:591-634 (poll), core.cpp:2459-2504 (faction validation only reads, never writes to fix broken faction)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Zone interest overlaps: ZoneEngine duplicates zone logic that should be in EntityResolver; zone_interest.cpp singleton is unused code clone",
+            "suspectedCause": "zone_interest.cpp (lines 28-60) reimplements GetInterestZones() and zone tracking identical to ZoneEngine, but never wired to Core",
+            "location": "zone_interest.cpp:16-81 (dead ZoneInterestManager) vs zone_engine.cpp:47-56 (active GetInterestZones())",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Multiple overlapping orchestrators (sync_orchestrator, pipeline_orchestrator, old PatternOrchestrator for pattern scanning) without clear ownership",
+            "suspectedCause": "SyncOrchestrator is the live main sync path; PipelineOrchestrator is diagnostics-only; PatternOrchestrator in Scanner is for initial pattern discovery (separate subsystem)",
+            "location": "core.h:336 (SyncOrchestrator), core.h:340 (PipelineOrchestrator), kmp/orchestrator.h:153 (PatternOrchestrator for pattern scanning)",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_orchestrator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_orchestrator.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/pipeline_orchestrator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/pipeline_orchestrator.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_facilitator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_facilitator.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/player_engine.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/player_engine.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/zone_engine.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/zone_engine.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/zone_interest.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/pipeline_state.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Scanner/include/kmp/orchestrator.h"
+        ],
+        "reorgNote": "RECONCILIATION NEEDED: (1) Delete zone_interest.cpp entirely — ZoneInterestManager singleton is dead code that reimplements ZoneEngine logic. (2) Rename SyncOrchestrator to SyncPipeline for clarity (it's not orchestrating other orchestrators, it IS the pipeline). (3) Clarify that PipelineOrchestrator is a DIAGNOSTICS layer, not part of the sync path — rename to PipelineMonitor or move to sys/diagnostics. (4) Confirm equipment/appearance broken-for-sync status: StagePollAndSendEquipment() polls and sends correctly (line 591-634), but remote character writes are disabled due to use-after-free on faction. Fix requires either: (a) use proper faction assignment (not local player's), or (b) defer equipment writes until character is fully spawned + safe. (5) Zone rebuild every 500ms (StageUpdateZones:428) is correct; no overlap here."
+      },
+      {
+        "subsystem": "Remote Character Spawn Pipeline (spawn_manager, entity_hooks, squad_spawn_hooks, asset_facilitator)",
+        "whatItActuallyDoes": "The spawn pipeline orchestrates remote player character creation through three mechanisms: (1) In-place NPC hijack: when the game creates an NPC via Hook_CharacterCreate, if a spawn request is pending, the hook takes over the freshly-created game object, registers it, teleports it to the remote player's position, and suppresses AI (entity_hooks.cpp:918-954). (2) Mod template factory spawn: if mod templates exist (loaded from kenshi-online.mod during post-load heap scan), SpawnWithModTemplate calls RootObjectFactory::create with the template's GameData*, creating a fully-initialized character (spawn_manager.cpp:776-820). (3) Fallback direct spawn: after 15+ seconds if in-place hijack hasn't fired, SyncOrchestrator calls SpawnCharacterDirect which uses a cloned pre-call struct and FactoryCreate (spawn_manager.cpp:130-160). Squad spawn bypass hooks into the squad spawning check to flip flags, forcing NPC creation for hijack (squad_spawn_hooks.cpp:70-136). AssetFacilitator is a thin facade delegating to LoadingOrchestrator for spawn safety checks (asset_facilitator.cpp, mostly pass-through).",
+        "wiringStatus": "HALF-WIRED / PARTIALLY BROKEN. Entry point: packet_handler.cpp:505-725 (HandleEntitySpawn) queues spawns via SpawnManager::QueueSpawn. In-place hijack path is WIRED: entity_hooks.cpp:918-954 pops spawn requests and calls SEH_HijackNPC. Mod template path is WIRED: spawn_manager.cpp:276-284 queues, 303-474 (ProcessSpawnQueueFromHook) attempts mod templates first then falls back. Squad spawn bypass is INSTALLED but unclear if actually helping: squad_spawn_hooks.cpp:70-136 flips checks, but spawn_manager comments (line 287-301) say spawn queue is now \"EXCLUSIVELY\" handled by in-place replay, not squad bypass. Fallback direct spawn is WIRED in sync_orchestrator but requires pre-call data from a recent game NPC creation (15s+ wait). AssetFacilitator is BOUND in core.cpp but only referenced by sync_orchestrator and entity_hooks for CanSpawn() checks — mostly dead (asset_facilitator.cpp is 62 lines, no substantial logic). Actual live paths: (A) NPC hijack in-place replay (entity_hooks.cpp:927-943), (B) mod template from POST-LOAD heap scan (spawn_manager.cpp:698-774 FindModTemplates, called from Core::OnGameLoaded line 1557), (C) fallback to FactoryCreate if hijack queue is empty. DEAD CODE: ProcessSpawnQueue (spawn_manager.cpp:286-301) is explicitly marked \"DO NOT USE\" and intentionally does nothing. ProcessSpawnQueueFromHook exists but entry point unclear — appears to be designed for hook context but never called from Hook_CharacterCreate.",
+        "brokenForSync": [
+          {
+            "symptom": "Remote player spawn is unreliable and fragile: depends on game-generated NPC creation near the remote player's location, which may not happen if they are isolated or in a safe zone. If no NPC is created within a few seconds, spawn queue sits in SpawnManager indefinitely until SyncOrchestrator's 15+ second fallback timer fires.",
+            "suspectedCause": "In-place NPC hijack (the primary path) only works when Hook_CharacterCreate fires, which requires the game to naturally spawn NPCs. If the zone has no spawning logic active (e.g., building interiors, safe houses), no NPC created = no hijack opportunity. Squad spawn bypass attempts to force NPC creation via flag flipping but is only one trigger; documented to be unreliable ('fragile NPC hijack' + 'squad spawn bypass' in notes).",
+            "location": "entity_hooks.cpp:918-954 (hijack only works if character exists), squad_spawn_hooks.cpp:70-136 (bypass logic), spawn_manager.cpp:303-474 (ProcessSpawnQueueFromHook never called from main path)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Mod template spawn path requires kenshi-online.mod to be loaded and working. If the mod is not installed or corrupted, FindModTemplates returns 0 templates and FactoryCreate path fails. Fallback to legacy template search (characterTemplates map) but those may be non-character GameData (buildings, items) causing factory crashes.",
+            "suspectedCause": "FindModTemplates (spawn_manager.cpp:698-774) scans heap for 'Player 1'-'Player 16' entries, picks highest numId per player assuming character has highest ID. If mod not loaded or FCS database is corrupted, candidates list is empty. OnGameLoaded (core.cpp:1405-1771) calls ScanGameDataHeap + FindModTemplates but if mod not present, m_modTemplateCount stays 0 and mod spawn path disabled. Fallback to characterTemplates from heap scan but no guarantee they are characters (could be factions, buildings with zero faction ptr).",
+            "location": "spawn_manager.cpp:698-774 (FindModTemplates), core.cpp:1555-1566 (called post-load), spawn_manager.cpp:347-363 (mod template spawn attempt)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Position offset detection relies on fuzzy matching of float triplets in pre-call struct. If position is (0,0,0) or very small, detection may fail, leaving s_positionOffsetInStruct = -1. Remote positions won't be written correctly.",
+            "suspectedCause": "entity_hooks.cpp:873-890 detects position offset by reading character's spawned position and scanning pre-call struct for matching float triplets within 2.0 unit tolerance. If position is 0 or near origin, scan may match wrong offset (e.g., uninitialized data). Also, fuzzy matching may collide with other float data in struct. Only 10 attempts (s_positionDetectAttempts < 10) then gives up.",
+            "location": "entity_hooks.cpp:873-890",
+            "severity": "minor"
+          },
+          {
+            "symptom": "GameData offset detection uses same approach but searches 8-byte aligned offsets. Rarely used (mod template path does not need it) but if spawning via legacy template, this offset is needed to swap GameData pointers in request struct. Fallback template path may not work if offset not detected.",
+            "suspectedCause": "entity_hooks.cpp:895-916 detects by reading character's backpointer and scanning pre-call struct. Only 10 attempts. If detection fails, m_gameDataOffsetInStruct = -1 and spawn_manager cannot customize template in pre-call struct clone.",
+            "location": "entity_hooks.cpp:895-916",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Faction write removed ('DISABLED') due to use-after-free on faction+0x250. Mod template factions may not exist in local save, but code tries not to write them (except via local player's faction in ApplyFactionFix). Remote spawned characters may have wrong faction appearance/squad membership.",
+            "suspectedCause": "ModTemplate approach (spawn_manager.cpp:776-820, line 807-811) explicitly skips faction write ('DO NOT call ApplyFactionFix here'). Non-mod template path writes local player's faction (spawn_manager.cpp:449, ApplyFactionFix) which causes remote chars to appear in squad panel. Faction write is fundamentally broken — mod factions unsafe, local player faction breaks squad panel UI. No solution implemented.",
+            "location": "spawn_manager.cpp:807-811 (skipped), spawn_manager.cpp:449 (writes wrong faction), spawn_manager.cpp:115-128 (ApplyFactionFix)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Equipment and appearance write incomplete. RemoteCharacter spawned via hijack has whatever model/gear the NPC happened to have. No code path syncs appearance from remote player to local character.",
+            "suspectedCause": "entity_hooks.cpp:354-373 (SEH_HijackNPC) only teleports, renames, and disables AI. No equipment/appearance sync. packet_handler.cpp:726-815 (HandleEntitySpawn mod char link) also does not write appearance. Only player_controller.cpp handles appearance but only for local player (OnRemoteCharacterSpawned does not write equipment). Known broken per KNOWN STATE: 'equipment/appearance write to remote chars incomplete'.",
+            "location": "entity_hooks.cpp:354-373, packet_handler.cpp:726-815",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "merge-into-other",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/spawn_manager.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/spawn_manager.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/squad_spawn_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/squad_spawn_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/entity_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/entity_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/asset_facilitator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/asset_facilitator.cpp"
+        ],
+        "confidence": "high",
+        "reorgNote": "The spawn pipeline has THREE competing mechanisms layered on top of each other: (1) In-place NPC hijack (primary, entity_hooks.cpp:918-954) — pops spawn queue, calls SEH_HijackNPC on freshly created NPC. (2) Mod template factory spawn (ProcessSpawnQueueFromHook, spawn_manager.cpp:303-474) — attempts mod templates via FactoryCreate, falls back to generic character template. (3) Direct spawn fallback (sync_orchestrator, 15s timer) — calls SpawnCharacterDirect using cloned pre-call struct. Squad spawn bypass (squad_spawn_hooks.cpp:70-136) flips activePlatoon flags to force NPC creation, but spawn_manager comments (lines 287-301) mark ProcessSpawnQueue as DEPRECATED and note queue is handled EXCLUSIVELY by in-place replay. Architecture is fragile because it depends on NPC creation events that may not fire in safe zones or building interiors. Code quality is HIGH (extensive SEH safety, faction validation, detailed diagnostics via VerifyReadiness) but fragmented across four modules. RECOMMENDATION: (1) Delete asset_facilitator.cpp (62-line dead facade). (2) Merge squad_spawn_hooks into sync_orchestrator (optional NPC bypass). (3) Consolidate spawn_manager and entity_hooks into single spawn orchestrator module. (4) Fix broken paths: use FactoryCreate exclusively (no NPC hijack), use mod template factions directly (skip ApplyFactionFix), implement appearance/equipment sync via protocol extension. (5) Clear spawn queue AND reset per-player counters on disconnect in one place. Current spawn_manager::VerifyReadiness (lines 822-875) provides excellent diagnostics — keep and expand. ProcessSpawnQueueFromHook and ProcessSpawnQueue are dead/deprecated code — delete. Keep SEH patterns, faction validation, and pre-call data capture logic — these are what prevent crashes."
+      },
+      {
+        "subsystem": "Position/Movement Sync (local→net→remote loop)",
+        "whatItActuallyDoes": "The system implements a polling-based position sync loop: (1) **Local position read**: `PollLocalPositions()` (core.cpp:2956) reads local player's entity positions every ~50ms via `CharacterAccessor::GetPosition()`, computes movement speed from position delta, and sends `C2S_PositionUpdate` unreliable packets. (2) **Network transport**: packets arrive and are parsed in `HandlePositionUpdate()` (packet_handler.cpp:783), which feeds snapshots into the `Interpolation` system (8-snapshot ring buffer with jitter-adaptive delay and snap correction). (3) **Remote position write**: `ApplyRemotePositionsDirect()` (core.cpp:2879) runs each tick, queries interpolated position from `Interpolation::GetInterpolated()`, and writes via `SEH_WritePositionRotation()` (core.cpp:2572) using three fallback methods: (a) direct `CharacterAccessor::setPosition()` function call (best), (b) physics chain memory write (animClass→charMovement→writable position), (c) cached position field fallback (drifts due to physics engine). Movement hooks are intentionally NOT hooked due to `mov rax,rsp` trampoline corruption; instead, position is polled and remotely-controlled characters have `MoveTo` calls suppressed via `IsRemoteControlled()` flag.",
+        "wiringStatus": "FULLY WIRED and ACTIVE in both code paths. `OnGameTick()` (core.cpp:2097) drives the main loop: sync orchestrator path (step 2-9) calls interpolation+position write; legacy path (step 4-6) calls `PollLocalPositions()` then `ApplyRemotePositionsDirect()` explicitly. All three position-write methods are implemented and fallback correctly. Network path is complete: `C2S_PositionUpdate` sent from hook (movement_hooks.cpp:118) and poll (core.cpp:3016), `S2C_PositionUpdate` received and feeds interpolation (packet_handler.cpp:807).",
+        "brokenForSync": [
+          {
+            "symptom": "Position hooks declared but not installed: `movement_hooks::Install()` explicitly does NOT hook `CharacterSetPosition` or `CharacterMoveTo`",
+            "suspectedCause": "`mov rax, rsp` instruction at function prologue corrupts MinHook trampoline (corrupts stack frame); `CharacterMoveTo` also has undeclared 5th parameter that crashes when forwarded",
+            "location": "KenshiMP.Core/hooks/movement_hooks.cpp:203-224",
+            "severity": "major"
+          },
+          {
+            "symptom": "Hook_SetPosition and Hook_MoveTo defined but never installed; they become dead code after `Install()` returns",
+            "suspectedCause": "The hook installation was intentionally abandoned due to the trampoline issue; code was left as fallback/documentation but is unreachable",
+            "location": "KenshiMP.Core/hooks/movement_hooks.cpp:35-195 (unused hook implementations)",
+            "severity": "minor"
+          },
+          {
+            "symptom": "`CharacterAccessor::WritePosition()` Method 3 (fallback) writes to cached read-only position field that physics engine overwrites each frame, causing drift on remote characters",
+            "suspectedCause": "Method 1 (setPosition fn) not always available; Method 2 (physics chain) requires offset discovery; fallback is unreliable but used when others fail",
+            "location": "KenshiMP.Core/game/game_character.cpp:486-507",
+            "severity": "major"
+          },
+          {
+            "symptom": "Remote character position updates may be missed if `GetGameObject()` returns null in `ApplyRemotePositionsDirect()` — no fallback spawn, positions silently dropped",
+            "suspectedCause": "Remote characters must be spawned before network positions arrive; `HandleSpawnQueue()` runs after position write step, so new remote entities in frame N have no game object until frame N+1",
+            "location": "KenshiMP.Core/core.cpp:2879-2941",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/movement_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/movement_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/game_tick_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/game_tick_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/char_tracker_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/char_tracker_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/player_controller.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/player_controller.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.cpp (lines 2097-2941, 2956-3039, 2572-2624)",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/interpolation.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/interpolation.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/packet_handler.cpp (lines 783-825)",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_character.cpp (lines 439-507)"
+        ],
+        "reorgNote": "**LOCAL POSITION READ** (WORKING): `PollLocalPositions()` correctly polls each tick at ~50ms throttle, reads via `CharacterAccessor::GetPosition()` (respects offset chain), computes speed from delta, sends `C2S_PositionUpdate` unreliable. Throttling prevents spam; change-threshold avoids network churn. **POSITION WRITE (3 METHODS, CASCADING FALLBACK)**: (1) **Method 1** – `setPosition()` function call (best, ~53ms/call on local chars) is available when pattern scan succeeds but NOT always present. (2) **Method 2** – physics chain follow (animClass+0x???→charMovement+0x???→writable position) requires offset discovery; reliable once offsets are known. (3) **Method 3** (fallback) – cached position field write drifts immediately due to physics engine overwrite; should only be used for remote entities receiving continuous updates from interpolation. **REMOTE POSITION WRITE** (STABLE): `ApplyRemotePositionsDirect()` calls `Interpolation::GetInterpolated()` to fetch smoothed position from 8-snapshot buffer, then calls `SEH_WritePositionRotation()` to write via Method 1/2/3. Wrapped in SEH to catch freed objects; marks bad game objects as null to stop crashing. **INTERPOLATION** (8-snapshot ring buffer): `AddSnapshot()` validates NaN/Inf, computes velocity from delta, detects snaps (>threshold triggers blending), stores in ring. `GetInterpolated()` uses jitter-adaptive delay (20-200ms), brackets interpolation time with bisect, linear-lerps position, slerps quaternion, applies snap correction blending. **ISSUES**: (a) Hooks not installed due to trampoline corruption; position polling is correct fallback but means missed optimization opportunities. (b) Method 3 fallback is unreliable for read-only position; remote chars should exclusively use Methods 1/2 if possible. (c) Spawn latency: remote entities' positions arrive before game objects exist; frame N has position→no-obj, frame N+1 has game object. Consider queuing snapshots until spawn completes. (d) No detection of local player's own position change via third-party code (setPosition called directly outside polling)—could cause sync lag. **REFACTOR PATH**: Consolidate three write methods into a single `WritePositionPhased()` that tries 1→2→3 cleanly; add snapshot pre-queuing for entities arriving before spawn; add optional late-binding position sync for missed frames; consider removing Method 3 unless remote char is confirmed continuously updating (vs. spawned-but-idle)."
+      },
+      {
+        "subsystem": "Combat Sync (C2S attack intent → server resolution → S2C broadcast)",
+        "whatItActuallyDoes": "The combat sync system relies on server-authoritative resolution rather than client-side damage application. Client-side: CharacterDeath and CharacterKO hooks capture events into a lock-free ring buffer, then ProcessDeferredEvents() (called from OnGameTick) sends C2S_CombatDeath/C2S_CombatKO messages with health snapshots via C2S_LimbHealth. Server-side: HandleCombatDeath accepts and validates reports from either victim or killer owner, broadcasts S2C_CombatDeath, and marks entity as dead. HandleCombatKO validates and broadcasts S2C_CombatKO with chest health. However, attack intent (C2S_AttackIntent) is defined in protocol.h and has HandleAttackIntent on the server but is NEVER sent from the client — ApplyDamage hook is deliberately disabled due to crash risk (mov rax,rsp prologue corruption). Thus cross-player combat (A hits B) flows only through death/KO hooks, not damage/hit events, making intermediate damage states unreliable without constant health polling.",
+        "wiringStatus": "Half-wired. C2S_AttackIntent protocol path is dead on client side (not sent from hooks). C2S_CombatDeath/KO are sent from combat_hooks.cpp:ProcessDeferredEvents() and wired to server HandleCombatDeath/KO. Server broadcasts S2C_CombatDeath/KO. Client receives via packet_handler.cpp:HandleCombatDeath/KO which queues game thread execution via CommandQueue and applies via native CharacterDeath function with echo suppression. C2S_LimbHealth is sent as piggyback after death/KO for health state snapshot. C2S_AttackIntent caller: none found (dead code on client); server handler exists at server.cpp:844 HandleAttackIntent with full server-side combat resolution via ResolveCombat() that broadcasts S2C_CombatHit, but no client ever sends C2S_AttackIntent.",
+        "brokenForSync": [
+          {
+            "symptom": "Client never sends C2S_AttackIntent; cross-player damage application relies only on death/KO hooks",
+            "suspectedCause": "ApplyDamage hook disabled due to mov rax,rsp crash risk (combat_hooks.cpp:270-278). No alternative attack intent hook implemented. Damage visibility is purely event-driven (death/KO only), not damage-driven",
+            "location": "KenshiMP.Core/hooks/combat_hooks.cpp:270-278 (commented-out ApplyDamage hook); KenshiMP.Core/net/packet_handler.cpp (no C2S_AttackIntent send)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Health polling incomplete; intermediate limb damage not synced. Only death/KO health snapshots sent",
+            "suspectedCause": "C2S_LimbHealth sent only after death/KO (piggyback in ProcessDeferredEvents), not continuously. No periodic health polling thread. Limb damage between knockouts invisible to other players",
+            "location": "KenshiMP.Core/hooks/combat_hooks.cpp:180-192, 237-239, 257-259 (SendLimbHealthUpdate called only after death/KO)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Echo suppression flags (s_serverSourcedDeath/KO) prevent infinite loops but create sync gaps on cross-player kills",
+            "suspectedCause": "When player A's character kills player B's character, only A's client detects the death hook and sends C2S_CombatDeath. B's death hook is suppressed by the S2C_CombatDeath echo. If A's death message arrives out-of-order or is dropped, B won't know they're dead until next KO event. No cross-reporting fallback",
+            "location": "KenshiMP.Core/hooks/combat_hooks.cpp:34-35 (flags), 107 (death check), 135 (KO check); KenshiMP.Core/net/packet_handler.cpp:961, 1040 (SetServerSourced)",
+            "severity": "major"
+          },
+          {
+            "symptom": "Combat hit visual feedback missing. S2C_CombatHit broadcast by server but never applied to client",
+            "suspectedCause": "Server.cpp:844-885 HandleAttackIntent builds MsgCombatHit and broadcasts S2C_CombatHit, but packet_handler.cpp:850-926 HandleCombatHit only logs and applies damage via native ApplyDamage (if attacker exists) or direct health write. No visual effect, sound, or animation playback. No acknowledgment that the hit landed",
+            "location": "KenshiMP.Server/server.cpp:844-914 (HandleAttackIntent creates S2C_CombatHit); KenshiMP.Core/net/packet_handler.cpp:850-926 (HandleCombatHit does not apply effects)",
+            "severity": "minor"
+          },
+          {
+            "symptom": "ResolveCombat server-side resolution unused. Client controls combat outcome via death hook order",
+            "suspectedCause": "ResolveCombat at combat_resolver.cpp:59-119 computes damage, KO/death, and body part selection on server. HandleAttackIntent at server.cpp:865 calls it but no C2S_AttackIntent ever arrives. Thus server resolution never executes. Client death hooks are authoritative instead",
+            "location": "KenshiMP.Server/combat_resolver.cpp:59-119 (ResolveCombat never called); KenshiMP.Server/server.cpp:844-914 (HandleAttackIntent unreachable from client)",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "rewrite",
+        "confidence": "high",
+        "duplicatesOrOverlap": [
+          "combat_resolver.cpp is dead code — server can compute combat but never receives C2S_AttackIntent from client to trigger it",
+          "HandleAttackIntent server handler is dead — wired to protocol but client never sends the message",
+          "ApplyDamage hook is deliberately disabled (not a mistake, a known crash vector per comments)"
+        ],
+        "reorgNote": "Combat sync is in a broken half-state. The architecture decision to NOT hook ApplyDamage (due to crash risk) left a gap: without damage events, only death/KO hooks fire, so intermediate damage states are invisible. The server-side combat resolver exists but is unreachable because C2S_AttackIntent is never sent. To fix: (1) Either hook attacks at a safer point (not ApplyDamage) and send C2S_AttackIntent+client-side prediction with server validation, OR (2) Use continuous health polling on a timer for remote characters and disable local damage application. Current system is worse than either: it's event-driven but only for end states (death/KO), creating ambiguity on who killed whom in multi-player melee. The echo suppression flags work but don't solve the fundamental issue that intermediate damage is invisible. combat_resolver.cpp should be deleted if C2S_AttackIntent remains unsent, or the entire client damage-hook layer should be redesigned if we want server-authoritative combat.",
+        "filesRead": [
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Core\\hooks\\combat_hooks.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Core\\hooks\\combat_hooks.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Core\\game\\game_stats.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\combat_resolver.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Core\\net\\packet_handler.cpp (lines 1-1254, 1255-1405)",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\server.cpp (lines 1-300, 844-1005, 1834-1967)"
+        ]
+      },
+      {
+        "subsystem": "inventory-equipment sync (item pickup/drop/equipment slots for remote character appearance)",
+        "whatItActuallyDoes": "The inventory/equipment subsystem hooks three game functions (ItemPickup, ItemDrop, BuyItem) to detect when local players add/remove/trade items. These hooks send C2S_ItemPickup/C2S_ItemDrop/C2S_TradeRequest to the server, which broadcasts S2C_InventoryUpdate to all other clients. The sync orchestrator polls local character equipment every 2 seconds and sends C2S_EquipmentUpdate for any changes. The server broadcasts these equipment changes as S2C_EquipmentUpdate messages. Client packet handler applies incoming equipment updates and inventory updates by writing to the item stack counts or calling SetEquipment(). Resource hooks exist as a stub for future Ogre3D resource manager hooking (not yet implemented).",
+        "wiringStatus": "HALF-WIRED. Hooks installed and firing (inventory_hooks.cpp:199-220). Local→server works. Server→remote client wired (packet_handler.cpp:1424-1443, 1474-1498). But equipment NOT synced on spawn (no equipment in S2C_EntitySpawn, only on zone request at server.cpp:1366-1384). SetEquipment() incomplete (game_inventory.cpp:129-179): requires items in inventory first, fails on remote chars. No proactive remote equipment sync.",
+        "brokenForSync": [
+          {
+            "symptom": "Remote players spawn without equipped items visible",
+            "suspectedCause": "S2C_EntitySpawn does not include initial equipment array. Equipment sent separately only via HandleZoneRequest (server.cpp:1366-1384), never during HandleEntitySpawn. New spawns never receive their equipped state.",
+            "location": "server.cpp:1181-1190, packet_handler.cpp:505-735",
+            "severity": "blocks-full-loop"
+          },
+          {
+            "symptom": "SetEquipment() fails if item not already in inventory",
+            "suspectedCause": "InventoryAccessor::SetEquipment scans inventory list, finds matching template ID, writes pointer to equipment slot. If no match, returns false silently. Cannot equip items that haven't been picked up.",
+            "location": "game_inventory.cpp:129-179",
+            "severity": "major"
+          },
+          {
+            "symptom": "Equipment changes via UI (drag, swap, unequip) never sync to other players",
+            "suspectedCause": "inventory_hooks only intercepts ItemPickup/ItemDrop/BuyItem game functions. UI-only equipment operations bypass these hooks entirely. Sync orchestrator only polls LOCAL player equipment (sync_orchestrator.cpp:600).",
+            "location": "inventory_hooks.cpp:1-241, sync_orchestrator.cpp:591-634",
+            "severity": "major"
+          },
+          {
+            "symptom": "Resource hooks unimplemented, gracefully degrade",
+            "suspectedCause": "TryDiscoverOgreManagers() placeholder returns false always (resource_hooks.cpp:49-77). TODO comment: need runtime Ogre VTable index discovery.",
+            "location": "resource_hooks.cpp:49-92",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high"
+      },
+      {
+        "subsystem": "faction & building sync",
+        "whatItActuallyDoes": "Faction sync captures relation changes via Hook_FactionRelation, broadcasts them through the server (HandleFactionRelation), and applies them to remote characters by resolving faction pointers via CharacterIterator. Building sync has 5 hooks (Place, Destroyed, Dismantle, Construct, Repair) that are DEFINED but NEVER INSTALLED; the code exists but remains unreachable. Faction writes to remote characters are intentionally DISABLED due to use-after-free: writing an NPC faction pointer causes crashes when that faction's zone unloads (dereferenced at game+0x927E94). Faction strings are patched in .rdata at known Steam/GOG offsets to match the server-assigned mod faction, allowing player factions to persist across zones without dangling pointers.",
+        "wiringStatus": "Faction relation hook IS called live: Hook_FactionRelation fires when local player changes faction relations, sends C2S_FactionRelation, server broadcasts S2C_FactionRelation to all players, packet_handler::HandleFactionRelation applies it. Faction write to remotes is intentionally DEAD: code exists (WriteFaction in game_character.cpp:385) but never called on remote characters after spawn — OnRemoteCharacterSpawned skips it (player_controller.cpp:159-167). Building hooks are completely DEAD CODE: building_hooks.cpp defines all 5 hook functions (Place, Destroyed, Dismantle, Construct, Repair) but building_hooks::Install() is never called from anywhere. No caller found in core.cpp hook initialization sequence — building_hooks included as header but never invoked.",
+        "brokenForSync": [
+          {
+            "symptom": "Faction write disabled on remote characters — they retain factory-assigned faction instead of capturing player's faction",
+            "suspectedCause": "use-after-free crash: writing NPC faction pointers fails when source zone unloads (faction object freed but still referenced)",
+            "location": "KenshiMP.Core/game/player_controller.cpp:159-167",
+            "severity": "major"
+          },
+          {
+            "symptom": "Building sync hooks defined but never installed — building placement/destruction/repair not synced to other players",
+            "suspectedCause": "building_hooks::Install() unreachable from Core initialization; hook infrastructure exists but integration missing",
+            "location": "KenshiMP.Core/hooks/building_hooks.cpp:311-352 (Install function never called)",
+            "severity": "blocks-full-loop"
+          },
+          {
+            "symptom": "BuildingConstruct and BuildingRepair hooks log but do not send packets — construction progress and repair amounts not synced",
+            "suspectedCause": "Incomplete implementation: hooks defined but packet sending code omitted (only logging present)",
+            "location": "KenshiMP.Core/hooks/building_hooks.cpp:253-279, 281-307",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/faction_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/faction_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/building_hooks.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/building_hooks.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_faction.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_building.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Server/zone_manager.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Server/zone_manager.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/net/packet_handler.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/player_controller.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/spawn_manager.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/lobby_manager.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_character.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Server/server.cpp"
+        ],
+        "reorgNote": "FACTION: Keep Hook_FactionRelation (faction_hooks.cpp:36-70) and packet path — it works. Keep faction string patching (lobby_manager.cpp) — elegant solution to avoid use-after-free. DOCUMENT the intentional skip of remote faction writes (player_controller.cpp:159-167): use-after-free is real (zone-unload → freed faction object). For MVP, remotes retain factory faction (mod templates have guaranteed persistent factions). If MVP needs player factions on remotes, must use SERVER-ASSIGNED player faction (not captured NPC pointers), but this requires protocol changes (server tracks player faction per entity). BUILDING: Delete dead hooks code from building_hooks.cpp (entire file) OR stub it out and defer to post-MVP. The hook infrastructure works (see entity_hooks, combat_hooks working fine) but building data model is incomplete: (1) buildings not materialized on remote clients (S2C_BuildPlaced only registers ghost entity, no game object call), (2) no building ownership/permission sync, (3) construct/repair progress incomplete. Building sync is safely deferrable for MVP — buildings sync as position entities only. Complete rewrite post-MVP: define ServerEntity building payload, add BuildingAccessor read/write, populate GameDataTemplate for remote buildings, then revisit hooks. Current code pollutes the codebase with 350 lines of unreachable plumbing.\""
+      },
+      {
+        "subsystem": "Lobby/Loading/Save-Sync: End-to-end multiplayer load coordination",
+        "whatItActuallyDoes": "The system manages initial player connection, faction assignment, and multiplayer save loading. LobbyManager patches a faction string into game memory based on server assignment. Loading_orchestrator tracks game load phases via burst detection and gates spawn timing. Shared_save_sync discovers pre-existing \"Player N\" characters in the shared save by name and syncs their positions via unreliable position updates. Save_hooks, world_hooks, and time_hooks provide supporting infrastructure but are partially disabled or incomplete.",
+        "wiringStatus": "PARTIALLY WIRED: (1) LobbyManager.OnFactionAssigned() called from S2C_FactionAssignment handler (packet_handler.cpp:1758), ApplyFactionPatch() called at game-ready phase. (2) LoadingOrchestrator wired into OnGameTick (core.cpp lines 2326, 2409), burst detection calls OnBurstDetected/Ended. (3) shared_save_sync::Update() called every tick (core.cpp:2357, 2439), lazily calls Init() when faction arrives. (4) C2S_PlayerReady sent from OnGameLoaded (core.cpp:1653), server responds with S2C_AllPlayersReady (server.cpp:2425). MISSING WIRING: C2S_LobbyReady is defined and handled (server.cpp:2089) but NEVER SENT by client — only available via manual /ready command. No coordination layer ensures both players have loaded the save before spawning mod characters.",
+        "brokenForSync": [
+          {
+            "symptom": "C2S_LobbyReady message protocol is defined but never auto-sent by client",
+            "suspectedCause": "Lobby-phase handshake (faction assignment → ready confirmation → start game) was planned but incomplete. Only game-ready phase (C2S_PlayerReady/S2C_AllPlayersReady) is wired. C2S_LobbyReady exists only in /ready builtin command.",
+            "location": "KenshiMP.Core/net/packet_handler.cpp:1773-1786 (HandleAllPlayersReady stubbed), KenshiMP.Core/sys/builtin_commands.cpp:1770-1781 (manual /ready command)",
+            "severity": "blocks-full-loop"
+          },
+          {
+            "symptom": "No guarantee both players have loaded their save game before character spawning begins",
+            "suspectedCause": "S2C_AllPlayersReady fires when all players send C2S_PlayerReady (after game load), but if player 2's save-load is slow, player 1 may spawn characters before player 2's 'Player N' mod characters are loaded from disk.",
+            "location": "KenshiMP.Core/core.cpp:1648-1657 (C2S_PlayerReady sent without load coordination), KenshiMP.Server/server.cpp:2405-2436 (HandlePlayerReady does not track actual save load completion)",
+            "severity": "major"
+          },
+          {
+            "symptom": "shared_save_sync::Init() is never explicitly called; relies on lazy init inside Update()",
+            "suspectedCause": "Init() is deferred until Update() detects faction assignment (shared_save_sync.cpp:188-193). This works but is fragile: if Update() is called before faction arrives, it will retry every tick. No explicit initialization hook.",
+            "location": "KenshiMP.Core/game/shared_save_sync.cpp:69-104 (Init function), shared_save_sync.cpp:181-194 (lazy init in Update)",
+            "severity": "minor"
+          },
+          {
+            "symptom": "save_hooks are disabled; Save/Load functions never instrumented",
+            "suspectedCause": "Function signatures unverified; calling through bad trampolines caused crashes during save load. Disabled to pass-through (save_hooks.cpp:42-49).",
+            "location": "KenshiMP.Core/hooks/save_hooks.cpp:42-50 (Install returns true but does nothing)",
+            "severity": "minor"
+          },
+          {
+            "symptom": "world_hooks BuildingPlace hook DISABLED; no building sync on zone load",
+            "suspectedCause": "Signature unverified, zone-load crashes (world_hooks.cpp:153-154)",
+            "location": "KenshiMP.Core/hooks/world_hooks.cpp:139-156 (Install skips BuildingPlace)",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "duplicatesOrOverlap": [
+          "sync_orchestrator (KenshiMP.Core/sync/sync_orchestrator.*) also tracks pipeline events and phase transitions; LoadingOrchestrator duplicates burst-to-phase logic",
+          "player_engine (if exists) may overlap with LobbyManager faction tracking",
+          "Multiple overlapping 'ready' state: LobbyManager.HasFaction(), LoadingOrchestrator.IsGameLoaded(), shared_save_sync.s_initialized, Core.m_gameLoaded"
+        ],
+        "reorgNote": "\nMISSING PIECE: A clean lobby-coordination layer. Current design splits across three separate systems:\n1. **Faction Assignment** (LobbyManager): patches memory on S2C_FactionAssignment. No acknowledgment sent.\n2. **Game Load Handshake** (LoadingOrchestrator + Core::OnGameLoaded): fires C2S_PlayerReady when game loads.\n3. **Character Discovery** (shared_save_sync): lazily scans for \"Player N\" by name after faction assigned.\n\nPROBLEMS:\n- Lobby phase (faction setup) never closes: no C2S_LobbyReady sent automatically.\n- shared_save_sync is ONLY for 2-player shared-save mod, not for general multiplayer.\n- No orchestrated \"all players loaded\" event before first character spawn.\n- ApplyFactionPatch() called reactively (when S2C_FactionAssignment arrives) vs. proactively (before save load).\n\nSOLUTION FOR CLEAN REBUILD:\n1. **Lobby Phase** (0xF1/0xF2): Auto-send C2S_LobbyReady once faction received + memory patched. Server waits for all, broadcasts S2C_LobbyStart. Clients transition to \"Loading\" phase.\n2. **Load Phase**: Game loads. LoadingOrchestrator tracks via burst + OnGameLoaded event.\n3. **Ready Phase** (0x09/0x0A): After game loaded, send C2S_PlayerReady. Server broadcasts S2C_AllPlayersReady. Clients spawn.\n4. **Character Discovery** (mod-agnostic): Use entity spawn protocol (C2S_EntitySpawnReq) for all remote players, not name-matching hacks.\n\nKEEP:\n- LobbyManager.OnFactionAssigned() + ApplyFactionPatch() (faction string injection is necessary).\n- LoadingOrchestrator phase machine and spawn gating (robust burst detection + settle timers).\n- shared_save_sync.Update() for 2-player mod sync (low-level position polling).\n- time_hooks: TimeUpdate hook + SetServerTime (game speed synced from server).\n\nREFACTOR:\n- Remove lazy Init() from shared_save_sync; call Init() explicitly when S2C_FactionAssignment lands.\n- Replace C2S_LobbyReady manual command with auto-send after ApplyFactionPatch succeeds.\n- Unify ready-state tracking: one state machine, not scattered atomics.\n- Add S2C_GameLoadNotification (server tells clients when peer entered \"Loading\" phase).\n\nDELETE:\n- save_hooks (disabled anyway; local saves work fine without hooks).\n- BuildingPlace hook (unverified signature; no building sync implemented).\n- Manual /ready command (replace with auto-send or UI prompt).\n",
+        "filesRead": [
+          "/KenshiMP.Core/game/lobby_manager.h",
+          "/KenshiMP.Core/game/lobby_manager.cpp",
+          "/KenshiMP.Core/game/loading_orchestrator.h",
+          "/KenshiMP.Core/game/loading_orchestrator.cpp",
+          "/KenshiMP.Core/game/shared_save_sync.h",
+          "/KenshiMP.Core/game/shared_save_sync.cpp",
+          "/KenshiMP.Core/hooks/save_hooks.h",
+          "/KenshiMP.Core/hooks/save_hooks.cpp",
+          "/KenshiMP.Core/hooks/world_hooks.h",
+          "/KenshiMP.Core/hooks/world_hooks.cpp",
+          "/KenshiMP.Core/hooks/time_hooks.h",
+          "/KenshiMP.Core/hooks/time_hooks.cpp",
+          "/KenshiMP.Core/net/packet_handler.cpp (sections)",
+          "/KenshiMP.Core/core.cpp (sections: OnGameLoaded, OnGameTick, FindAndClaimModCharacters)",
+          "/KenshiMP.Core/sys/builtin_commands.cpp (sections)",
+          "/KenshiMP.Server/server.cpp (sections: HandlePlayerReady, HandleLobbyReady)",
+          "/KenshiMP.Common/include/kmp/protocol.h"
+        ]
+      },
+      {
+        "subsystem": "Hooking Infrastructure (KenshiMP.Scanner)",
+        "whatItActuallyDoes": "The hooking subsystem provides pattern scanning, function resolution, MinHook integration, and the MovRaxRsp fix for x64 MSVC functions. Core components: (1) PatternScanner (scanner.cpp) — IDA-style byte pattern matching on .text section with RIP resolution, (2) RuntimeStringScanner (patterns.cpp) — fallback string-xref analysis with .pdata validation for function boundaries, (3) HookManager (hook_manager.cpp) — MinHook wrapper with per-hook MovRaxRsp naked detour + trampoline wrapper generation, (4) MovRaxRspFix (mov_rax_rsp_fix.cpp) — two runtime-generated ASM stubs to fix RBP/RSP aliasing corruption in hooked functions. Also includes: (5) PatternOrchestrator (orchestrator.cpp) — multi-phase discovery pipeline (PE analysis, strings, vtables, patterns, fallbacks, call graph), (6) ScannerEngine — SIMD/batch scanning wrapper, (7) PDataEnumerator — .pdata enumeration for function boundaries, (8) FunctionAnalyzer — prologue analysis, (9) VTableScanner, StringAnalyzer, CallGraphAnalyzer — supporting RE tools.",
+        "wiringStatus": "HEAVILY WIRED but architecturally complex. Core wiring: (A) patterns.cpp::ResolveGameFunctions() is called at startup by core.cpp::InitializeHooks(), uses patterns + RuntimeStringScanner fallback. (B) HookManager is wired to patterns.cpp — each pattern result becomes a hook target via HookManager::Install(). (C) MovRaxRspFix is AUTOMATICALLY applied per hook in HookManager::InstallRaw() — detects \"mov rax,rsp\" prologue and wraps with naked detour + wrapper. (D) PatternOrchestrator is REGISTERED but appears underutilized — initialized in core.cpp but most hooks use direct ResolveGameFunctions() instead. (E) VTable discovery (RTTI) is wired to SquadAddMember resolution in orchestrator.cpp::RegisterBuiltinPatterns() — uses fuzzy \"ActivePlatoon|Platoon|Squad\" matching. (F) Dispatcher: core.cpp calls ResolveGameFunctions(scanner, funcs) which populates GameFunctions pointers, then HookManager installs each.",
+        "brokenForSync": [
+          {
+            "symptom": "MovRaxRsp reentrancy guard assumes single-threaded game logic but uses global depth counter at OFF_DEPTH offset in allocated page",
+            "suspectedCause": "If the game ever calls a hooked mov-rax-rsp function recursively or from multiple call sites in parallel, the depth counter corruption will cause the 2nd call to see depth>1, skip normal path, and JMP to raw trampoline — bypassing the C++ hook entirely. This breaks all multiplayer sync for recursive calls.",
+            "location": "mov_rax_rsp_fix.cpp:305-308, hook_manager.cpp:232-323",
+            "severity": "major"
+          },
+          {
+            "symptom": "FindFunctionStart walks back 16384 bytes (line 224) but only after .pdata fails",
+            "suspectedCause": "For a 100KB function, the 2048->16384 increase helps, but the 16-byte alignment rejection (patterns.cpp:386-400) was supposed to be removed — it's now only warning-level. However, the 16-byte alignment check WILL still reject some valid vtable-discovered functions if .pdata returns no match, causing hook installation to fail silently.",
+            "location": "patterns.cpp:205-243, patterns.cpp:386-400, hook_manager.cpp:193-197",
+            "severity": "minor"
+          },
+          {
+            "symptom": "ApplyDamage is a 6925-byte function — the 4KB scan window in patterns.cpp::FindGlobalNearString (line 68) is inadequate",
+            "suspectedCause": "FindGlobalNearString scans [funcStart, xref+512] which assumes globals are loaded early. For a 6925-byte function where the global is loaded at +6000, this scan misses it. The .pdata fallback (line 619-624) extends to 4KB but still may miss late loads. PlayerBase discovery could fail or return wrong address.",
+            "location": "patterns.cpp:65-75, 615-625, 972-985",
+            "severity": "major"
+          },
+          {
+            "symptom": "Three validator bugs noted but code has partial mitigations: (1) FindFunctionStart 2048→16384 walk-back increased; (2) 16-byte alignment check demoted to warning for .pdata-confirmed entries; (3) ApplyDamage marked broken",
+            "suspectedCause": "The mitigations are incomplete — they address symptoms but not the root problem (pattern scanner's FindFunctionStart is fragile). SquadAddMember 16-byte alignment rejection persists at line 386 check even though it's now warning-only. The overlap check (offset <= 0x10) is reasonable but the reject (line 397) happens before the warning.",
+            "location": "patterns.cpp:364-400, hook_manager.cpp:175-198",
+            "severity": "minor"
+          },
+          {
+            "symptom": "HookManager::Enable/Disable use MH_EnableHook/MH_DisableHook for non-MovRaxRsp hooks, which re-patches function bytes + suspends ALL threads",
+            "suspectedCause": "This is architecturally unsafe during game loop — mid-frame Enable/Disable can corrupt the call stack if a thread is mid-call. The bypass flag (for MovRaxRsp) avoids this, but standard hooks remain unsafe. No thread-safety wrapper exists for dynamic hook enable/disable.",
+            "location": "hook_manager.cpp:433-511",
+            "severity": "major"
+          },
+          {
+            "symptom": "HookManager::Shutdown only DISABLES hooks, never calls MH_RemoveHook or MH_Uninitialize (comment at line 34-37)",
+            "suspectedCause": "Rationale is correct (game atexit handlers may call freed trampolines), but this leaks MinHook's internal state — all hook structs remain in MinHook's hook list. On hot-reload or module re-init, MH_Initialize would fail or MH_CreateHook calls on same addresses would collide.",
+            "location": "hook_manager.cpp:30-72",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\scanner.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\src\\scanner.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\src\\patterns.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\hook_manager.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\src\\hook_manager.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\mov_rax_rsp_fix.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\src\\mov_rax_rsp_fix.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\scanner_engine.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\function_analyzer.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\pdata_enumerator.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\orchestrator.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\src\\orchestrator.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Scanner\\include\\kmp\\patterns.h"
+        ],
+        "reorgNote": "REFACTORING RECOMMENDATIONS: (1) **Reentrancy Safety**: The MovRaxRsp depth counter (OFF_DEPTH at line 305) must become thread-local or per-call-context to survive reentrant calls. Current code will silently drop hooks on recursion. Alternative: use per-function depth counter, not global page-wide. (2) **Validator Robustness**: Consolidate the three FindFunctionStart codepaths (.pdata + 16KB walk-back + alignment check) into a single coherent validator that reports decision rationale. Remove the 0x10 offset limit check before the warning (patterns.cpp:364-400) — demote to info-level diagnostic, not a rejection. (3) **Dynamic Hook Enable/Disable Safety**: Add a spinlock/wait around MH_EnableHook/MH_DisableHook to prevent thread collision, or migrate all dynamic hooks to the bypass-flag approach (like MovRaxRsp). For now, document that Enable/Disable are NOT safe mid-frame. (4) **PatternOrchestrator Integration**: The orchestrator is well-designed but underused. Migrate core.cpp to use RegisterBuiltinPatterns() + Run() instead of calling ResolveGameFunctions() directly. This will enable multi-method fallback chains and better diagnostics. (5) **Global Pointer Discovery**: Extend FindGlobalNearString scan window from 512 to 8KB for large functions (use .pdata for accurate function bounds). Test against ApplyDamage (6925B) to ensure globals are found. (6) **MinHook State Leakage**: Consider adding a hook deregistration API for testing/reload scenarios, but document that it's unsafe during live gameplay.\""
+      },
+      {
+        "subsystem": "SDK Layer - Game Memory Abstraction",
+        "whatItActuallyDoes": "The SDK layer consists of two main components: (1) KenshiSDK provides polling-based world snapshots via CharacterIterator + CharacterAccessor, computing per-frame diffs of entity positions/health/rotations. (2) VisualProxy manages interpolation state for remote players (Phase 1 state-only, Phase 2 Ogre rendering pending). Both are initialized at game load but SDK snapshot/diff methods are never queried — the live code bypasses SDK and directly uses CharacterAccessor within hooks and sync orchestrator instead.",
+        "wiringStatus": "KenshiSDK is wired for initialization (core.cpp:1760) and Update() (core.cpp:2351, 2433) but none of its query methods (GetCurrentSnapshot, GetLastDiff, GetEntityState) are called anywhere in the codebase. VisualProxy is partially wired: initialized (core.cpp:1767), Update() called (core.cpp:2354, 2436), and CreateProxy called from packet_handler (net/packet_handler.cpp) for remote entities, but rendering is explicitly deferred (Phase 2, comment at visual_proxy.h:19-25). The actual sync path uses CharacterAccessor directly in hooks (movement_hooks.cpp:88, combat_hooks.cpp) and sync_orchestrator (sync_orchestrator.cpp:24, 78) for position/health reads/writes.",
+        "brokenForSync": [
+          {
+            "symptom": "SDK polling data never used for multiplayer sync",
+            "suspectedCause": "KenshiSDK.Update() populates snapshots/diffs but GetCurrentSnapshot/GetLastDiff/GetEntityState methods have zero callers. Sync instead reads via CharacterAccessor directly per-hook.",
+            "location": "sdk/kenshi_sdk.cpp:113-129 (query methods) vs core.cpp:2351/2433 (Update calls)",
+            "severity": "major"
+          },
+          {
+            "symptom": "VisualProxy rendering layer permanently deferred with no Ogre integration path",
+            "suspectedCause": "visual_proxy.h:19-25 document Phase 1 (state tracking only) vs Phase 2 (Ogre rendering), but no code path exists to transition. ProxyData.sceneNode and ogreEntity pointers are allocated (line 108-109) but never populated or written to.",
+            "location": "sdk/visual_proxy.h:106-110 / visual_proxy.cpp:199-221",
+            "severity": "major"
+          },
+          {
+            "symptom": "No unified sync entry point — mixed paths (CharacterAccessor direct + SDK polling)",
+            "suspectedCause": "Architecture shift to SDK abstraction (2026-03-26) is incomplete. Code still scattered: hooks use CharacterAccessor directly, core.cpp has hand-rolled position polling in PollLocalPositions (2956-3039), movement_hooks has position send throttle (35-100). SDK was built as abstraction but real sync continues ad-hoc.",
+            "location": "core.cpp:2956 (PollLocalPositions) vs sdk/kenshi_sdk.cpp:194-217 (SDK polling) vs hooks/movement_hooks.cpp:87-100",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sdk/kenshi_sdk.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sdk/kenshi_sdk.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sdk/visual_proxy.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sdk/visual_proxy.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_types.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_offset_prober.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_offset_prober.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_world.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_character.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game/game_squad.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/core.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sync/sync_orchestrator.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/movement_hooks.cpp"
+        ],
+        "duplicatesOrOverlap": [
+          "game_world.cpp (WorldAccessor singleton)",
+          "core.cpp (hand-rolled PollLocalPositions)",
+          "sync_orchestrator.cpp (SEH_ReadPosition wrapper)"
+        ],
+        "reorgNote": "The SDK layer is well-designed structurally (clean offset abstraction, proper diff computation, thread-safe snapshots) but is incomplete-to-orphaned in integration. Recommendation: (1) **Unify sync path**: Route all character reads through KenshiSDK.GetCurrentSnapshot() → GetLastDiff() in core.cpp, replacing PollLocalPositions hand-rolled polling. (2) **Wire SDK diffs to network**: Make KenshiSDK the source-of-truth for what changed, feed diffs directly to packet builder rather than per-hook updates. (3) **Phase in VisualProxy rendering**: Either complete Phase 2 (discover Ogre::SceneManager, attach nodes) or delete ProxyData.sceneNode/ogreEntity fields if rendering is permanently deferred. Currently it's zombie code. (4) **Consolidate duplicates**: Remove WorldAccessor singleton from game_world.cpp (duplicate of GameWorldAccessor), standardize on one memory-access pattern. The game_types.h CharacterAccessor/SquadAccessor/etc. are correct — keep those as low-level primitives; SDK should be the high-level orchestrator.\""
+      },
+      {
+        "subsystem": "UI & Command System (Native MyGUI HUD, Menu, Chat, Slash Commands)",
+        "whatItActuallyDoes": "KenshiMP implements a 3-layer native MyGUI UI: (1) NativeHud — in-game HUD with connection status bar, debug/loading log, chat panel (10 lines), player list (8 rows), auto-hiding after 15s game-load; (2) NativeMenu — main menu panel (F1 toggle) with JOIN/HOST/SETTINGS/SERVER BROWSER tabs, EditBox-based IP/port/name input, server browser with query client for favorites; (3) Slash commands via CommandRegistry — 20+ builtins (/tp, /sync, /players, /time, /status, /connect, etc.) that tunnel through native chat (Enter key opens NativeHud's chat input, \"/\" prefix routes to command handler, result becomes system message). WndProc hook (render_hooks.cpp:73–223) drives all input: F1 toggles menu, Enter toggles chat, Tab toggles playerlist, Backtick toggles debug, Escape closes UI, Alt+chars/backspace/return handled modally per active widget. MyGuiBridge (mygui_bridge.cpp) is a thin dllexport resolver to MyGUIEngine_x64.dll (layout load, widget find, caption/property set via GetProcAddress). Overlay manages connection state machine (auto-connect on game load with 2s delay, retry 6x over 30s, detect server loss, teleport remote entities underground on disconnect). TaskOrchestrator runs 2 worker threads with SEH protection for background entity reads/interpolation — frame-work commands block game thread. FrameData is double-buffered position cache (local entity reads, interpolated remote results, pre-built packet bytes).",
+        "wiringStatus": "FULLY WIRED. WndProc hooks at render_hooks.cpp:73–223, dispatches to NativeHud/NativeMenu. NativeHud::Init() called every frame in Update() with retry backoff (1s×10, then 10s); nativeMenu.Init() called on demand when F1 pressed. CommandRegistry::RegisterBuiltins() called once in Core::Initialize(). Chat message handler in SendChatMessage (native_hud.cpp:577–613) checks \"/\" prefix, executes command, displays result. Overlay.Update() handles connection state, auto-connect gate, retry logic (50 frame throttle, 5s retry interval). All inputs consumed modally via WndProc to prevent double-input from OIS. No dead code detected — every component is called.",
+        "brokenForSync": [
+          {
+            "symptom": "Chat input capture may conflict with game OIS input if WndProc hook fires AFTER OIS has already consumed keystroke. Modal gates (chatActive/menuVisible check) happen in WndProc but rely on state flags that may not be synced if OIS event loop runs in parallel.",
+            "suspectedCause": "WndProc hook order relative to OIS event pump is implicit; no explicit lock ensures WndProc-set flags are visible before OIS re-fires.",
+            "location": "render_hooks.cpp:152–188",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Server browser query results populated every 30 frames (native_menu.cpp:229–260, overlay.cpp:228–260) but query client may be slow or stalled on lossy network. No timeout to show 'TIMEOUT' or auto-fallback to manual entry.",
+            "suspectedCause": "ServerQueryClient lacks deadline or result expiry; slow server query never times out visually.",
+            "location": "overlay.cpp:230–250",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Chat panel auto-hides after 30s with no activity (native_hud.cpp:353–361) but does NOT re-show when new message arrives while hidden. Player may miss incoming messages.",
+            "suspectedCause": "UpdateChatDisplay() does not re-show chat panel if new message arrives (only checks m_chatHistory.empty()). System messages arrive but panel stays hidden.",
+            "location": "native_hud.cpp:363–367",
+            "severity": "major"
+          },
+          {
+            "symptom": "NativeHud::Init() retries every 1–10s until MyGuiBridge ready, but MyGuiBridge::Init() can hang if MyGUIEngine_x64.dll loads but singletons are not yet alive (LayoutManager/Gui return null). Entire HUD remains invisible until MyGUI fully initializes, with only debug log visible.",
+            "suspectedCause": "Startup race: Kenshi's MyGUI initialization is asynchronous. NativeHud tries to init before MyGUI singletons exist, fails silently, logs 'Singletons not ready' every 10s.",
+            "location": "native_hud.cpp:247–275, mygui_bridge.cpp:263–270",
+            "severity": "major"
+          },
+          {
+            "symptom": "Menu 'MULTIPLAYER' button on main menu only clickable between 15–∞ seconds after startup (IsMainMenuReady gate at render_hooks.cpp:62–68). If user clicks during logo/splash (~0–15s), nothing happens. No visual feedback that button is 'not ready'.",
+            "suspectedCause": "Hard 15s delay to let Kenshi load resources. If Kenshi's logo is quick or slow, timing mismatch causes user confusion.",
+            "location": "render_hooks.cpp:62–68, 81–91",
+            "severity": "minor"
+          },
+          {
+            "symptom": "Auto-connect in Overlay only fires if m_autoConnectPending=true AND game loads in Loading phase AND 2s elapses (overlay.cpp:58–93). No UI message if auto-connect fails silently (rare edge case).",
+            "suspectedCause": "Auto-connect only visible if user set it explicitly or via server-browser row selection. If config.autoConnect=false (hardcoded in overlay.cpp:30), auto-connect never triggers even if set.",
+            "location": "overlay.cpp:30, 58–93",
+            "severity": "minor"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/native_hud.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/native_hud.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/native_menu.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/native_menu.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/mygui_bridge.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/mygui_bridge.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/overlay.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/ui/overlay.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sys/frame_data.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/game_command_queue.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sys/command_registry.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sys/command_registry.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sys/builtin_commands.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sys/task_orchestrator.h",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/sys/task_orchestrator.cpp",
+          "C:/Program Files (x86)/Steam/steamapps/common/Kenshi/KenshiMP/KenshiMP.Core/hooks/render_hooks.cpp"
+        ],
+        "reorgNote": "**ARCHITECTURE ASSESSMENT:**\n\nThe UI system is **clean and well-separated**, with clear responsibilities:\n\n1. **MyGuiBridge** — Pure abstraction layer (no business logic), wraps MyGUI via GetProcAddress + SEH. Solid for ABI isolation. No changes needed.\n\n2. **NativeHud** — In-game HUD (status bar, chat, player list, debug log). Well-designed modular state machine. MINOR ISSUE: chat panel should re-show on new message even if hidden.\n\n3. **NativeMenu** — Main menu (F1 panel). Solid layout navigation, EditBox focus tracking, button hit-detection via normalized screen coords. Works well.\n\n4. **Overlay** — Connection orchestration (auto-connect, retry, disconnect, server browser query). Layered cleanly with NativeMenu but could benefit from explicit state machine enum (currently scattered bools).\n\n5. **CommandRegistry + Builtin Commands** — Excellent extensibility. 20+ debug/player commands well-implemented. No duplication. ✓\n\n6. **WndProc Hook** — Modal input dispatch is correct: F1/Tab/Enter/Backtick/Escape key handlers, then modal gate (chatActive/menuVisible) consume all WM_CHAR/WM_KEYDOWN. Good design. Slight timing risk if OIS fires after hook.\n\n7. **TaskOrchestrator** — Worker thread pool with frame-work gating. SEH protection on workers is correct. Frame-blocking strategy is solid.\n\n**RECOMMENDED REFACTORS:**\n\n1. **Chat panel auto-hide bug** (native_hud.cpp:363–367): Change `hasContent = !m_chatHistory.empty() || m_chatInputActive` to also show panel if system messages just arrived. Track a flag per frame.\n\n2. **Overlay connection state** (overlay.cpp:20–180): Replace scattered bools (m_autoConnectPending, m_autoConnectDone, m_connecting, m_retryPending, m_gameLoadedTimerStarted) with explicit enum:\n   ```cpp\n   enum class ConnectionState { Disconnected, WaitingForGameLoad, Connecting, Connected, Reconnecting };\n   ```\n   Reduces bugs from state combinations.\n\n3. **MyGuiBridge init race** (mygui_bridge.cpp:263–270): Instead of silently retrying, log when singletons are null. Consider a 'stale' flag to avoid retry spam.\n\n4. **Server query timeout** (overlay.cpp:228–260): Add 10s timeout to query results. Show \"TIMEOUT\" for servers that don't respond.\n\n5. **Main menu button readiness** (render_hooks.cpp:62–68): Instead of hard 15s delay, detect when MyGUI is actually ready (check MyGuiBridge::IsReady()). Or dim the button visually until ready.\n\n6. **Command execution logging**: builtin_commands.cpp already logs all commands to spdlog, which is good. Consider also logging to NativeHud system messages for user visibility (e.g., \"/connect 127.0.0.1:27800\" should show \"Connecting...\" in-chat).\n\n**QOL IMPROVEMENTS (NOT BUGS):**\n\n- Auto-complete for command names (tab-key while typing \"/p\" suggests \"/players\", \"/pos\", \"/ping\").\n- History for chat/console (up/down arrow in chat input).\n- Copy/paste support in EditBoxes (Ctrl+C/V).\n- Player ping display in player list or hover tooltip.\n- Server browser sort by ping/player count.\n\n**SUMMARY:** The UI stack is **production-ready** with only minor polish needed. The architecture is sound: clear layers, good input handling, no dead code, proper thread safety. Main bug is chat panel not re-showing on new messages (easy fix). Connection state could be more explicit (enum refactor, low risk). No reorganization needed; focus on the 1–2 identified bugs and optional QOL features."
+      },
+      {
+        "subsystem": "KenshiMP.Server (Dedicated Server Core)",
+        "whatItActuallyDoes": "The dedicated server is a complete authority hub for multiplayer state synchronization. It operates a per-tick server loop (main.cpp:119-132, 50-200ms ticks), manages 16 player slots via ConnectedPlayer structs (server.h:17-29), maintains an authoritative entity registry in m_entities (server.h:146), broadcasts positions every tick (BroadcastPositions), syncs time every 5s (BroadcastTimeSync), and detects/cleans orphan entities (30s cleanup). It validates all client-reported actions (ownership, distance, NaN checks), resolves combat server-side, persists world state to JSON (world_persistence.cpp), auto-saves every 60s, and registers with optional master server for listing.",
+        "wiringStatus": "WELL-WIRED. The server is the live authority: HandlePacket (server.cpp:310) dispatches 25+ message types from clients, HandlePositionUpdate validates and stores (server.cpp:789), HandleAttackIntent delegates to ResolveCombat and broadcasts results (server.cpp:844), HandleEntitySpawnReq creates server-authoritative IDs (server.cpp:1094), HandleLobbyReady checks all-ready condition (server.cpp:2088), master connection polls events and heartbeats (UpdateMasterConnection server.cpp:2344). The main loop (main.cpp:115-132) calls server.Update() every tick, which pumps ENet events, broadcasts, and flushes packets. All message handlers are called via the packet dispatch (server.cpp:340-529). Master server integration is optional but fully implemented.",
+        "brokenForSync": [
+          {
+            "symptom": "HandlePlayerReady has wrong parameter type and calls undefined methods",
+            "suspectedCause": "Copy-paste error: declared as 'ConnectedPlayer& player' in header (server.h:119) but implemented as 'Player& player' (server.cpp:2405). Calls GetReadyPlayerCount()/GetConnectedPlayerCount() (server.cpp:2438-2451) which iterate p.connected and p.isReady on m_players, but ConnectedPlayer has no .connected field (struct at server.h:17-29 uses lobbyReady and isReady).",
+            "location": "server.cpp:2405,2425,2429,2438-2451; server.h:119",
+            "severity": "blocks-full-loop"
+          },
+          {
+            "symptom": "Compilation failure in HandlePlayerReady and companion methods",
+            "suspectedCause": "Methods reference undefined struct 'Player' and undefined methods BroadcastReliable(), and iterate m_players with fields that don't exist on ConnectedPlayer. Implementation does not match the server.h header declaration (signature mismatch).",
+            "location": "server.cpp:2405-2436,2438-2451",
+            "severity": "blocks-full-loop"
+          },
+          {
+            "symptom": "Zone-based interest culling disabled in BroadcastPositions",
+            "suspectedCause": "Code comment at server.cpp:1001-1003 states 'zone filtering disabled for small player counts — 16-slot server doesn't need spatial culling, and zone mismatch was preventing players from ever seeing each other'. Sends all non-owned entities to each player without zone filtering. This breaks proper zone interest model.",
+            "location": "server.cpp:994-1037",
+            "severity": "major"
+          },
+          {
+            "symptom": "Master server heartbeat only sent if m_masterConnected",
+            "suspectedCause": "At server.cpp:2269, SendMasterHeartbeat() returns early if !m_masterConnected. But m_masterConnected is only set to true on ENET_EVENT_TYPE_CONNECT (server.cpp:2352). If connection succeeds but the event is missed or races, heartbeats never send. No retry on timeout.",
+            "location": "server.cpp:2305-2327,2372-2377",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "filesRead": [
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\main.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\server.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\server.cpp (partial: lines 1-2236)",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\game_state.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\game_state.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\player_manager.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\player_manager.cpp (partial: lines 1-100)",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\entity_manager.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\entity_manager.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\zone_manager.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\zone_manager.cpp",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\world_persistence.cpp (partial: lines 1-200)",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\upnp.h",
+          "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\KenshiMP.Server\\upnp.cpp (partial: lines 1-150)"
+        ],
+        "duplicatesOrOverlap": [
+          "GameStateManager (game_state.h/cpp) — duplicates simple time/weather logic that is already in GameServer.m_timeOfDay/m_weatherState (server.h:155-156). GameStateManager is declared but never instantiated or called by the server.",
+          "EntityManager (entity_manager.h/cpp) — pure utility statics (GetEntitiesByOwner, GetEntitiesInZone, etc.) that duplicate queries GameServer performs inline (e.g., server.cpp:1005-1008 iterates entities itself). These could be called but are not used.",
+          "ZoneManager (zone_manager.h/cpp) — zone population tracking and interest helpers (GetRelevantEntities, ShouldReceiveUpdates) are implemented but BroadcastPositions (server.cpp:994) does not use them — ignores zone filtering intentionally (comment at 1001-1003).",
+          "PlayerManager (player_manager.h/cpp) — name lookup, banning, AFK detection, rate limiting utilities are defined but never called from GameServer. Server uses inline checks (e.g., peer address parsing in IsLoopbackAddress, server.cpp:15-17)."
+        ],
+        "reorgNote": "VERDICT: The server core IS the authoritative sync hub and should be kept. The per-tick loop, message dispatch, entity validation, and broadcasting are correctly wired. HOWEVER, fix the HandlePlayerReady compilation error (lines 2405-2451) immediately: correct parameter type and remove calls to non-existent methods, or refactor to use inline checks on m_players. The zone-filtering disabling (comment at 1001-1003) is intentional for a 16-player server but should be documented as a deliberate tradeoff. The master server integration is optional but complete. CLEANUP: Delete or consolidate GameStateManager (use server.m_timeOfDay directly), EntityManager (fold into inline queries or lazy-instantiate), ZoneManager (not called, but leave as optional interest-mgmt layer for future optimization), and PlayerManager (not called, keep for future ban/AFK/rate-limit features). The server fundamentally works — it validates ownership, broadcasts positions, resolves combat, persists state, and maintains player slots. Focus refactoring on fixing the compilation error and consolidating utility classes into lazy/optional imports.\""
+      },
+      {
+        "subsystem": "KenshiMP Injector & Packaging",
+        "whatItActuallyDoes": "Win32 GUI launcher with 5-step installation: copy KenshiMP.Core.dll to Kenshi root, append Plugin=KenshiMP.Core to Plugins_x64.cfg, deploy kenshi-online.mod to data/ and mods/, write client.json to AppData, launch Kenshi via Steam. .mod contains 16 Player CHARACTER GameData templates for remote player spawning.",
+        "wiringStatus": "Fully wired. Plugins_x64.cfg + Ogre at startup. client.json read at Core init. InstallModFile() called from main:79. SpawnManager discovers templates post-load via FindModTemplates() scanning for Player 1-16 GameData entries.",
+        "brokenForSync": [
+          {
+            "symptom": "kenshi-online.mod is pre-compiled FCS binary, not generated",
+            "suspectedCause": "Created with FCS editor, checked in. No build step. User needs FCS GUI to author fresh mod.",
+            "location": "injector.cpp:116",
+            "severity": "major"
+          },
+          {
+            "symptom": "ModTemplate selection uses numeric ID at offset 0x08 to pick character vs faction",
+            "suspectedCause": "spawn_manager sorts by numId, picks highest. Wrong IDs cause wrong template selection.",
+            "location": "spawn_manager.cpp:730-759",
+            "severity": "major"
+          }
+        ],
+        "reorgVerdict": "keep-but-refactor",
+        "confidence": "high",
+        "duplicatesOrOverlap": [
+          "install.bat duplicates Injector.exe. Both copy DLL, modify Plugins_x64.cfg. Delete install.bat.",
+          "injector.cpp and spawn_manager.cpp both manage .mod: injector deploys, spawn_manager discovers objects."
+        ],
+        "reorgNote": "REFACTOR: (1) Delete install.bat (superseded by Injector.exe). (2) Ship kenshi-online.mod in source root with FCS editor docs. (3) Add validation to InstallModFile() to log HUD errors. (4) Document numeric ID requirements in README: Player N CHARACTER must have HIGHEST numId among Player N entries. (5) Optional: create .mod verification tool to validate custom mods before deployment.",
+        "filesRead": [
+          "KenshiMP.Injector/main.cpp",
+          "KenshiMP.Injector/injector.cpp",
+          "KenshiMP.Injector/process.cpp",
+          "build.bat",
+          "install.bat",
+          "CMakeLists.txt",
+          "README.md",
+          "KenshiMP.Core/core.cpp",
+          "KenshiMP.Core/game/spawn_manager.cpp"
+        ]
+      },
+      {
+        "summary": "KenshiMP client loops indefinitely in Connected phase, never transitioning to GameLoaded. The multiplayer loop breaks at runtime due to: (1) critical hook failures at initialization (GameWorldSingleton, 30 unresolved patterns); (2) spawn deferral indefinitely (PacketHandler repeatedly drops entity spawn 0x31 due to \"game not loaded\" gate, thousands of consecutive drops); (3) entity messages 0x31 (type 49) silently discarded throughout connection lifetime instead of being queued; (4) phase gate (phase=Connected, gameLoaded=false) never transitions to InGame, leaving all entity sync deadlocked. Network connectivity and handshake complete successfully, but the game-ready state machine is broken. Runtime shows: 4,900+ packets received, 0% processed on entity sync, only time sync (0x14) accepted. Disconnection at 4min 34sec is non-fatal (graceful shutdown), but MyGuiBridge::setVisible crashes during cleanup—symptom of dangling pointer after entity system never initialized.",
+        "loopBreakingEvidence": [
+          {
+            "observation": "[2026-06-02 00:14:18.505] [kenshi_online] [warning] PacketHandler: Deferring entity spawn 6 - game not ready (phase=Connected)",
+            "frequency": "Every ~50ms for 4+ minutes (thousands of times)",
+            "whatItImplies": "Entity spawn messages are queued but never dequeued because phase state is stuck in Connected, never advancing to InGame. The game-ready gate never opens."
+          },
+          {
+            "observation": "[2026-06-02 00:14:18.505] [kenshi_online] [debug] PacketHandler: pkt #4900 type=49 size=37 ch=2 ... [2026-06-02 00:17:42.080] [kenshi_online] [debug] PacketHandler: Dropping message 0x31 (game not loaded)",
+            "frequency": "Continuously from packet #1 to #4,900+ (100% of messages after handshake for entire session duration)",
+            "whatItImplies": "Message type 0x31 (entity updates, type code 49 decimal) are silently dropped due to game-not-loaded gate. Loop condition never satisfied. Spawn fallback never fires; deferred spawns pile up silently."
+          },
+          {
+            "observation": "[2026-06-02 00:01:43.112] [kenshi_online] [error]   CRITICAL ENTRY 'GameWorldSingleton' UNRESOLVED — hook will NOT be installed",
+            "frequency": "Single fatal miss during pattern scan phase (init)",
+            "whatItImplies": "GameWorldSingleton hook failed to install, blocking access to game world state needed to set gameLoaded flag. 30 additional patterns also failed to resolve (CharAnimUpdate, crafting, dialogue, pathfind, etc.)."
+          },
+          {
+            "observation": "[2026-06-02 00:17:42.080] [kenshi_online] [debug] PacketHandler: pkt #4900 type=49 size=37 ch=2 ... [2026-06-02 00:18:17.656] [kenshi_online] [debug] PacketHandler: Dropping message 0x31 (game not loaded)",
+            "frequency": "Every 50ms for 274 consecutive seconds (entire connected session) with zero variation",
+            "whatItImplies": "Hardcoded phase gate is never unlocked. PipelineOrchestrator or SyncOrchestrator never calls gameLoaded=true transition. The loop is mathematically deadlocked."
+          },
+          {
+            "observation": "[2026-06-02 00:18:17.910] [kenshi_online] [info] NetworkClient: Disconnected (state reset) ... [2026-06-02 00:18:17.946] [kenshi_online] [error] MyGuiBridge: setVisible crashed",
+            "frequency": "Single occurrence at session end",
+            "whatItImplies": "Disconnect triggers safe shutdown, but MyGUI widget visibility toggle crashes during cleanup (likely NaN/nullptr in entity or UI state that was never initialized because game never loaded)."
+          },
+          {
+            "observation": "[2026-06-02 00:13:25.983] [kenshi_online] [warning] Core: SIGNATURE MISMATCH for 'SaveGame' — hook expects 2 params, analysis suggests ~5 params — NULLED",
+            "frequency": "2 hooks nulled (SaveGame, LoadGame) at init",
+            "whatItImplies": "Game state hooks are disabled due to signature mismatch, blocking load/save interception and state synchronization."
+          },
+          {
+            "observation": "[2026-06-02 00:13:26.243] [kenshi_online] [info] combat_hooks: ApplyDamage at 0x7FF7007833A0 — NOT hooked (mov rax,rsp crash risk)",
+            "frequency": "Single decision at init",
+            "whatItImplies": "Damage hook deliberately skipped due to crash risk (mov rax,rsp pattern), leaving combat damage sync disabled."
+          }
+        ],
+        "spawnOutcome": "Remote character spawning is **blocked before fallback can fire**. No spawn fallback or hijack attempts logged. Reason: entity spawn messages (type 0x31/49) are deferred on packet arrival, queued in memory, but the dequeue gate (phase=InGame AND gameLoaded=true) is never satisfied. PacketHandler::Deferring is called once per remote entity (entity spawn 6 was first deferred packet), but Deferring appears only once in logs—subsequent entity updates (type 0x31) are simply Dropped, not re-deferred. This indicates either (a) spawn queue is checked only once at game load (which never happens), or (b) subsequent entity updates are a different packet type that's also dropped. Network keepalive and time sync packets are accepted (0x14 TimeSync), confirming network loop is active but entity loop is dead. Spawn fallback never invoked = remote characters never appear at all (not even as wrong appearance, just absent).\"",
+        "netOutcome": "**Connection stable, messages flow, loop is mathematically deadlocked.** ENet TCP connection established and maintained for 4+ minutes (274 seconds from connect at 00:14:18.505 to disconnect at 00:18:17.910). Total packets received: 4,900+ (pkt #4,950 logged at 00:17:44.458, disconnected ~40 seconds later). No connection drops or keepalive failures logged. Time sync tick periodically received (13994, 14693, etc.), proving network heartbeat works. **But entity sync loop never activates**: of 4,900+ packets, type 0x31 (entity updates) rejected ~4,850+ times (every 50ms log shows \"Dropping message 0x31\"), type 0x14 (time) accepted ~50 times. Message queue grows unbounded in memory but is never consumed. No keepalive timeout (30-60s set). Graceful shutdown triggered by game exit (not network failure), indicating client treated connection as failed after 4min+ of waiting for game-ready state that never arrived.\""
+      },
+      {
+        "summary": "KENSHI-ONLINE MULTIPLAYER MOD AUDIT\n\nThe KenshiMP codebase implements a 16-player co-op multiplayer system by injecting KenshiMP.Core.dll (an Ogre3D plugin) into kenshi_x64.exe, hooking game functions via MinHook + pattern scanner, and syncing game state over ENet to a dedicated KenshiMP.Server.exe.\n\nCURRENT STATE (as of April 2026):\n\n✓ WORKS / HALF-WIRED:\n- Pattern scanner + hook installation framework (solid infrastructure)\n- ENet handshake, position/chat/entity sync over 55+ message protocol (operational)\n- EntityRegistry + entity tracking (core data structure working)\n- 8-snapshot interpolation system for position smoothing (implemented, used)\n- Server-authoritative combat + entity destruction hooks (CharacterDeath/CharacterKO enabled)\n- Zone interest culling (ZoneEngine tracking 3x3 zones around player)\n- JSON persistence layer (SaveConfig/LoadConfig working)\n- Character death/KO synchronization hooks (functional)\n- Movement hooks for local position updates (when CharacterMoveTo resolves, falls back to polling)\n- Equipment polling + sync every 2 seconds (working, conservative approach)\n- Faction bootstrap via multi-source voting during loading (complex but implemented)\n- LoadingOrchestrator + burst detection (spawning is gated during loading)\n- PipelineOrchestrator for network-replicated diagnostics (1Hz snapshot exchange)\n- SyncOrchestrator main tick with 7-stage pipeline (integrated, partially active based on feature flag)\n\n✗ BROKEN/HALF-WIRED:\n- Remote character spawning: relies on fragile \"NPC hijack\" (Hook_CharacterCreate in-place replay) + \"squad spawn bypass\" (unreliable, fallback to direct spawn after 15s with pre-call struct clone — faction pointer rewrite needed, causing use-after-free crashes if not fixed)\n- Equipment/appearance write on remote chars INCOMPLETE: apparel reading works (polling), but appearance/equipment apply to spawned character is limited to name + faction write\n- Faction write on remote chars DISABLED due to use-after-free risk (player_controller.cpp line ~160): writes NPC faction pointer which crashes at game+0x927E94 when it tries faction+0x250\n- Building hooks COMPLETELY DISABLED (not installed in core.cpp) — no building sync at all\n- Lobby C2S_LobbyReady / S2C_LobbyStart coordination MISSING in code (lobby_manager only handles faction string patch, no ready/start handshake)\n- Movement hooks (CharacterSetPosition/CharacterMoveTo) NOT hooked on Steam (null function pointers), polling-based fallback instead\n- Squad/inventory/AI hook behavior partially disabled (squad hooks fire 30-40+ times during zone load, causing burst)\n- Multiple overlapping orchestrators: sync_orchestrator, pipeline_orchestrator, loading_orchestrator, player_engine — likely several layered attempts at sync coordination\n\nDEAD CODE / NOT WIRED:\n1. building_hooks.cpp (Build 100+ lines, 5 hook types prepared — Install() NEVER called from core.cpp)\n2. movement_hooks.cpp partially DISABLED on Steam (no CharacterMoveTo, position updates polled instead every 50ms)\n3. squad_hooks for SquadAddMember/SquadCreate (skipped during burst detection)\n4. faction_hooks equation write on non-primary characters DISABLED (OnRemoteCharacterSpawned does NOT call it due to crash risk)\n5. Legacy pipeline code path (ApplyRemotePositionsDirect, PollLocalPositions, SendCachedPackets in core.cpp) — still in code but SyncOrchestrator replaces it when m_useSyncOrchestrator=true\n6. ProcessSpawnQueueFromHook in render_hooks — DEPRECATED, now replaced by sync_orchestrator::StageProcessSpawns\n\n\nKEY ARCHITECTURAL ISSUES:\n\n1. SPAWN PIPELINE TOO FRAGILE:\n   - Requires game's Hook_CharacterCreate to fire (NPC hijack) to capture factory + request struct\n   - Direct spawn fallback (after 15s) requires pre-call struct clone with faction pointer rewrite\n   - Faction pointer rewrite (SEH_FixFactionAndSetup) overwrites char+0x10 with local player faction to prevent use-after-free\n   - If factory returns null, spawn is re-queued up to 200 times (10 seconds at 20 ticks/sec)\n   - Spawn cap: 4 per player to prevent runaway spawning, but cap slot not released on disconnect if retry limit hit (BUG FIX in sync_orchestrator.cpp:797)\n\n2. POSITION SYNC DUAL APPROACH CAUSES CONFUSION:\n   - SyncOrchestrator tick reads positions every 50ms, sends throttled updates (KMP_TICK_INTERVAL_MS)\n   - Movement hooks (CharacterSetPosition/CharacterMoveTo) ALSO send position updates (when installed, null on Steam)\n   - Both paths are active — can cause double-sends or stale data ordering issues\n\n3. EQUIPMENT/APPEARANCE INCOMPLETE:\n   - Equipment slots are polled every 2 seconds (StagePollAndSendEquipment)\n   - Remote equipment written ONLY if offsets are discovered (game::GetOffsets().equipment)\n   - Appearance (name, faction, etc.) NOT synced for remote characters after spawn (only at creation time)\n\n4. FACTION USE-AFTER-FREE RISK:\n   - Remote character faction pointer points to spawned NPC's faction (can be freed on zone load)\n   - Fix: overwrite with local player's faction (always valid) on spawn\n   - But this breaks game faction logic (remote chars show wrong faction)\n   - Solution (not implemented): server-replicate faction state separately\n\n5. LOBBY COORDINATION MISSING:\n   - LobbyManager handles faction string patch but NOT C2S_LobbyReady / S2C_LobbyStart handshake\n   - No code in packet_handler.cpp for these messages (search found none)\n   - Lobby gate likely enforced on server side only, not client-side orchestration\n\n\nSYNC LOOP RELIABILITY:\n\nFrom server log (April 19, 2026):\n- Server starts up, sets up UPnP port 27800, waits for clients\n- No connected clients or error logs showing (log ends at line 9)\n- Suggests server is running but no test session data available\n\nRecurring patterns (from code analysis):\n1. Zone rebuild every 500ms + spawn queue polling every 50-100ms = tight loop overhead\n2. Interpolation tick runs on game thread, position applies checked for NaN/Inf (guards against corruption)\n3. SEH wrappers protect all game memory reads/writes (10 calls logged on first 50 ticks, then every 100th)\n4. Crash breadcrumb writes to disk every N ticks (configurable) — diagnostic infrastructure in place\n5. Per-player spawn cap (4) + per-session retry limit (200) prevents runaway spawning\n\nWHAT SHOULD BE DELETED / NOT IN CLEAN REBUILD:\n\n1. building_hooks.* — completely disabled, not called\n2. Legacy pipeline code (core.cpp ApplyRemotePositionsDirect, PollLocalPositions, SendCachedPackets when SyncOrchestrator active)\n3. movement_hooks for CharacterMoveTo (Steam nulls it, polling works fine)\n4. squad_hooks bursting logic (fires 30-40+ times per zone load)\n5. faction_hooks write path for remote characters (causes use-after-free)\n6. Duplicate frame data + buffer swap in both Core and SyncOrchestrator (dual buffering confusion)\n\n\nRECOMMENDED REORGANIZATION:\n\n1. UNIFY ORCHESTRATORS: Replace (legacy + sync_orchestrator + pipeline_orchestrator) with single coherent pipeline\n2. SEPARATE CONCERNS: Split spawn lifecycle (factory capture → queue → retry → succeeded/failed) from sync tick\n3. FIX FACTION: Server replicates faction state per-entity, client applies without write\n4. COMPLETE LOBBY: Add C2S_LobbyReady / S2C_LobbyStart handshake (server waits for all players ready)\n5. REMOVE DEAD CODE: Delete building_hooks, legacy pipeline, disabled hooks\n6. MOVE EQUIPMENT: Integrate equipment into core entity state machine, not polling side-task",
+        "loopBreakingEvidence": [
+          {
+            "observation": "remote character spawning relies on fragile 'NPC hijack' (Hook_CharacterCreate in-place replay) + 'squad spawn bypass' (unreliable, fallback to direct spawn after 15s with pre-call struct clone)",
+            "frequency": "every session with remote player join",
+            "whatItImplies": "spawn is non-deterministic: if game's Hook_CharacterCreate doesn't fire (no NPC creation nearby), direct spawn fallback kicks in after 15s. Direct spawn requires factory.process(preCallStruct) which needs struct clone with faction pointer rewrite, causing use-after-free crash if faction points to freed NPC object. Sync loop stalls 15+ seconds per remote player."
+          },
+          {
+            "observation": "faction_hooks write on remote chars DISABLED (player_controller.cpp ~160, entity_hooks.cpp DecrementSpawnCount + cleanup); instead, local player faction is copied to remote char to prevent immediate use-after-free at game+0x927E94",
+            "frequency": "every remote character spawn",
+            "whatItImplies": "all remote characters show wrong faction (local player's faction), breaking game faction logic, diplomacy, and team detection. Server replicates faction state but client never applies it. Root cause: spawned NPC's faction pointer is ephemeral, freed on zone load or character despawn."
+          },
+          {
+            "observation": "building_hooks.cpp contains 100+ lines of hook code (Place, Destroyed, Dismantle, Construct, Repair) but Install() is NEVER called from core.cpp InitHooks()",
+            "frequency": "entire mod lifetime (100% dead code)",
+            "whatItImplies": "building creation/destruction/modification is not synced across network. Building state is never replicated. This is either an abandoned feature or intentional (server handles it). Code bloat, confusion risk, likely security hole if activated without testing."
+          },
+          {
+            "observation": "movement_hooks (CharacterSetPosition/CharacterMoveTo) are not installed on Steam (m_gameFuncs.CharacterMoveTo is null), falls back to position polling every 50ms via StagePollAndSendPositions",
+            "frequency": "every position update on Steam version",
+            "whatItImplies": "Steam version uses polling-based position sync (less responsive, ~50ms latency floor). GOG version would use hook-based if function resolved. Polling scales poorly: O(N*M) where N=local entities, M=ticks/second."
+          },
+          {
+            "observation": "sync_orchestrator, pipeline_orchestrator, loading_orchestrator, player_engine all exist independently; pipeline_orchestrator is a diagnostic wrapper (network-replicated), not the primary sync loop; sync_orchestrator is feature-flagged (m_useSyncOrchestrator) and may not be active",
+            "frequency": "active during every connected session",
+            "whatItImplies": "two possible sync pipelines active simultaneously (legacy + new), causing duplicate reads/writes, buffer confusion, and unclear data flow. Pipeline orchestrator adds 1Hz network overhead for diagnostics but doesn't drive sync. Recommendation: retire legacy pipeline, make sync_orchestrator mandatory."
+          },
+          {
+            "observation": "equipment sync uses 2-second polling interval (EQUIPMENT_POLL_INTERVAL_MS=2000) in StagePollAndSendEquipment, then applies via SEH_ReadEquipmentSlot; offsets may not be discovered (=-1), falling back to no-op",
+            "frequency": "every 2 seconds for each local entity",
+            "whatItImplies": "equipment changes are 0-2 seconds delayed on remote clients. If offsets not discovered, remote equipment never updates visually. Polling overhead: ~10 equipment slot reads per entity per session (50+ equipment slots on full squad)."
+          },
+          {
+            "observation": "per-player spawn cap is 4, retry limit is 200 (10 seconds at 20 ticks/sec); if retries exhausted, spawn cap slot is NOT released on disconnect (BUG FIX at sync_orchestrator.cpp:797 marks this issue)",
+            "frequency": "when player disconnects after spawn retries exhausted",
+            "whatItImplies": "spawn cap slot can saturate permanently (4 remote players x 4 slots = 16, then one discon with stuck retry = cap slot lost). Next remote player cannot spawn until session restart. This is a critical bug that requires explicit decrement on entity unregister."
+          },
+          {
+            "observation": "entity_hooks.cpp has multi-source faction voting during load (voting on first N=8 characters, picking most common faction with name-match bonus). If all voting sources are stale (save/load), RevalidateFaction() re-scans local squad. But early-faction is only used during loading, post-load faction unverified.",
+            "frequency": "once per game load",
+            "whatItImplies": "faction election is deterministic but fragile: if player renames, or hires new squad member before server assigns faction, voting picks wrong faction. Recovery via RevalidateFaction() only if all candidates stale. Sync loop must wait for server S2C_FactionAssigned before spawning remote players, or faction will be wrong."
+          },
+          {
+            "observation": "lobby_manager handles faction string patch (OnFactionAssigned -> ApplyFactionPatch) but no C2S_LobbyReady or S2C_LobbyStart message handlers exist in packet_handler.cpp. Lobby gate (waiting for all players ready before start) not implemented client-side.",
+            "frequency": "every session start (missing)",
+            "whatItImplies": "lobby coordination is server-only. Client joins, waits for handshake ACK, then immediately starts sync. No explicit 'I am ready' → 'everybody ready, start' handshake. If server has start gate, client is not aware, causing confusion."
+          }
+        ]
+      }
+    ]
+  }
+}

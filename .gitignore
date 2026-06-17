@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+bin/
+lib/Release/
+lib/Debug/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.vcxproj.filters
+.vs/
+
+# Temp files
+*.log
+*.tmp
+*.bak
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Script de deploy local (ruta personal)
+deploy-onyx.ps1
+KenshiOnline*.log
+*.kmpsave
