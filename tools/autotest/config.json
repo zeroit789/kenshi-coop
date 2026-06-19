@@ -1,0 +1,76 @@
+{
+  "_comentario": "Configuracion del autotest de Kenshi Co-op. v2: el flujo ya NO depende de esperas ciegas (time.sleep), sino que LEE EL LOG EN VIVO y avanza cuando detecta cada fase (render_hooks: phase=MainMenu/Loading/Connecting/Connected). Eso lo hace mucho mas fiable. Las coordenadas del boton MULTIPLAYER salen del codigo del mod (render_hooks.cpp) y son relativas (0..1).",
+
+  "rutas": {
+    "_comentario": "Rutas absolutas de los ejecutables. game_dir es la carpeta del juego donde tambien viven KenshiMP.Server.exe y los logs KenshiOnline_<PID>.log. VERIFICADO 2026-06-18: el juego esta en E:\\SteamLibrary, NO en la ruta antigua.",
+    "game_dir": "E:\\SteamLibrary\\steamapps\\common\\Kenshi",
+    "kenshi_exe": "E:\\SteamLibrary\\steamapps\\common\\Kenshi\\kenshi_x64.exe",
+    "server_exe": "E:\\SteamLibrary\\steamapps\\common\\Kenshi\\KenshiMP.Server.exe",
+    "settings_cfg": "E:\\SteamLibrary\\steamapps\\common\\Kenshi\\settings.cfg",
+    "save_dir": "C:\\Users\\Zero\\AppData\\Local\\kenshi\\save"
+  },
+
+  "save": {
+    "_comentario": "Save que cargara el boton CONTINUE del menu de Kenshi. Debe ser el NOMBRE de la carpeta dentro de save_dir. El script escribe 'continue=<este_valor>' en settings.cfg antes de lanzar. VERIFICADO 2026-06-18: autosave1 es el save mas reciente y funcional (entra al mundo, genera DIAG-PAUSE/DIAG-FAC).",
+    "continue_save": "autosave1"
+  },
+
+  "red": {
+    "_comentario": "IP y puerto del server MP local. El mod auto-conecta a 127.0.0.1:27800 por defecto.",
+    "server_ip": "127.0.0.1",
+    "server_port": 27800
+  },
+
+  "launcher_config": {
+    "_comentario": "VENTANA DE CONFIGURACION INICIAL de Kenshi (el launcher). Al lanzar kenshi_x64.exe SIEMPRE aparece primero un dialogo pequeno (~488x572) con Direct3D 11 / Resolucion 1920x1080 / RTX 4070 Ti / Idioma, y un boton OK abajo a la derecha. El render loop del juego (y por tanto phase=MainMenu en el log) NO arranca hasta que se pulsa ese OK. Por eso hay que clicarlo ANTES de buscar el menu. VERIFICADO 2026-06-18: el launcher comparte el MISMO titulo que el juego ('Kenshi 1.0.68 - x64 (Newland)') pero se distingue por el ancho (launcher ~488px, juego ~1920px). El boton OK se localiza por imagen (boton_ok.png) y, si falla, por coords relativas dentro de la ventana del launcher.",
+    "habilitado": true,
+    "plantilla_ok": "boton_ok.png",
+    "confianza_match": 0.8,
+    "ancho_max_launcher": 800,
+    "ok_rel_x": 0.7398,
+    "ok_rel_y": 0.9633,
+    "timeout_aparece_launcher": 30,
+    "espera_tras_ok": 3
+  },
+
+  "coordenadas_boton_multiplayer": {
+    "_comentario": "Coordenadas RELATIVAS (0..1) del boton MULTIPLAYER. CORREGIDAS 2026-06-18 por medicion visual real del menu a 1920x1080: el boton esta en rel_y~0.404, NO en 0.582 que decia render_hooks.cpp (esas eran del hitbox interno del mod, no del menu nativo de Kenshi). OJO: corregir esto NO hace que el clic funcione — el menu nativo de Kenshi (OIS) IGNORA el raton sintetico (ver README, seccion EL MURO). Coords dejadas correctas por si se resuelve el input o para calibrar.py. rel_x centrado en el texto del boton.",
+    "rel_x": 0.322,
+    "rel_y": 0.388,
+    "rel_w": 0.156,
+    "rel_h": 0.032
+  },
+
+  "coordenadas_boton_continue": {
+    "_comentario": "Coordenadas RELATIVAS (0..1) del boton CONTINUAR (primer item del menu). CORREGIDAS 2026-06-18 por medicion visual: rel_y~0.082 (estaba 0.40, muy desviado). MISMO AVISO: el menu nativo ignora el raton sintetico, asi que este clic no entra al mundo por automacion. Ver README.",
+    "rel_x": 0.322,
+    "rel_y": 0.082
+  },
+
+  "tiempos_segundos": {
+    "_comentario": "v2: La mayoria de estos tiempos son ahora SOLO timeouts maximos de espera por log; el flujo real avanza en cuanto detecta la fase en el log. espera_server_arranque sigue siendo ciego (el server no escribe en el log de Kenshi).",
+    "espera_server_arranque": 5,
+    "timeout_menu_principal": 200,
+    "timeout_entrar_mundo": 150,
+    "timeout_conexion": 40,
+    "espera_tras_continue_fallback": 60,
+    "espera_antes_ataque": 5,
+    "poll_intervalo": 1.5
+  },
+
+  "deteccion_log": {
+    "_comentario": "Patrones (regex) que el autotest busca EN VIVO en el log KenshiOnline_<PID>.log para saber en que fase esta el juego sin depender de time.sleep. Vienen de render_hooks.cpp. Esto es lo que hace el autotest fiable.",
+    "patron_menu_principal": "phase=MainMenu",
+    "patron_mundo_cargado": "gameLoaded=true",
+    "patron_conectado": "connected=true",
+    "patron_diag_pause": "\\[DIAG-PAUSE\\]",
+    "patron_diag_fac": "\\[DIAG-FAC\\]"
+  },
+
+  "ataque": {
+    "_comentario": "Tras entrar al mundo, el script mueve la camara y hace clic para intentar atacar a un NPC. clic_rel_x/y es donde clica. El veredicto real lo da el log (hooks de combate), no el script.",
+    "habilitado": true,
+    "clic_rel_x": 0.5,
+    "clic_rel_y": 0.45
+  }
+}

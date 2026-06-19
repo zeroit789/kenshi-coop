@@ -184,6 +184,20 @@ public:
         m_spawnQueue.swap(empty);
     }
 
+    // ── FIX CRASH 2º JUGADOR: reset de plantillas en reconexión ──
+    // En una reconexión sin recargar el juego, las plantillas capturadas en la
+    // sesión anterior (m_factory, m_modPlayerTemplates, m_factoryInputTemplates)
+    // pueden apuntar a GameData liberado por el motor -> use-after-free al
+    // re-spawnear. Limpiarlas fuerza una recaptura limpia. Bajo m_templateMutex
+    // porque ProcessSpawnQueue (game thread) las lee concurrentemente.
+    void ResetForReconnect() {
+        std::lock_guard lock(m_templateMutex);
+        m_factory = nullptr;                 // se recapturará vía OnGameCharacterCreated/SetFactory
+        m_factoryInputTemplates.clear();     // plantillas validadas por el factory (pueden estar liberadas)
+        for (int i = 0; i < MAX_MOD_TEMPLATES; i++) m_modPlayerTemplates[i] = nullptr;
+        m_modTemplateCount.store(0);
+    }
+
     // Remove pending spawn requests for a specific player (call on player leave)
     int ClearSpawnsForOwner(PlayerID owner) {
         std::lock_guard lock(m_queueMutex);

@@ -60,6 +60,35 @@ inline const char* ClientPhaseToString(ClientPhase p) {
 // Defined in core.cpp — resets keepalive timer on reconnect
 void ResetKeepaliveTimer();
 
+// Defined in core.cpp — re-arma el fix de facción del host en disconnect / nueva carga
+void ResetHostFactionFix();
+
+// Defined in core.cpp — re-arma el SEED de char+0xD0 (lastProcessed) del host
+// (Fase 4: desbloqueo del AI tick de combate) en disconnect / nueva carga.
+void ResetHostSimSeedFix();
+
+// Defined in core.cpp — re-arma el FIX-CONTROL (SetControlledChar 0x802520: vincula la
+// facción del host como "controlada por el jugador", faction+0x250=PI → el gate de la rama
+// viva 0x5CD1E3 exime al char del host del umbral 0.75 → su "think" de combate/cura corre
+// siempre). CAUSA 2 del combate congelado. Se re-arma en disconnect / nueva carga.
+void ResetHostControlledCharFix();
+
+// Defined in core.cpp — re-arma el [FIX-COMBATCLASS] (CharBody::create 0x621460: crea la
+// CombatClass = *(CharBody+0x8) del host si nació NULL porque el spawn del mod saltó
+// giveBirth). CAUSA RAÍZ del combate (el char camina pero no ataca). Detrás de toggle
+// kEnableCombatClassFix (OFF por defecto). Se re-arma en disconnect / nueva carga.
+void ResetHostCombatClassFix();
+
+// Defined in core.cpp — re-arma el [AUTOTEST] de combate (dispara attackTarget 0x5CB0A0 sobre
+// el host contra un NPC enemigo cercano, una vez por carga) en disconnect / nueva carga.
+void ResetHostCombatAutotest();
+
+// Defined in core.cpp — re-arma el [FIX-PLATOON] (setActivePlatoon 0x6213F0: re-enlaza el
+// ActivePlatoon del host (char+0x658) registrando AI+0x10=platoon->me, que el spawn del clon
+// del mod omite → su Tasker queda huérfano y el AI tick no consume las órdenes de combate).
+// CAUSA RAÍZ Fase 4 (orden encolada pero amIdle=1). Se re-arma en disconnect / nueva carga.
+void ResetHostPlatoonFix();
+
 class Core {
 public:
     static Core& Get();
@@ -111,7 +140,13 @@ public:
             if (m_gameLoaded) {
                 HookManager::Get().Enable("CharacterDeath");
                 HookManager::Get().Enable("CharacterKO");
-                spdlog::info("Core: Combat hooks ENABLED (game loaded)");
+                // [DIAG-PUSHORDER] Activa el hook de diagnóstico en Tasker::pushOrder 0x674300
+                // (encolado real de órdenes; RE byte a byte 2026-06-19). Confirma si la orden de
+                // ataque del HOST entra en su Tasker (char+0x658→+0x98). El slot "StartAttack"
+                // (0x722EF0 UI/MyGUI) quedó refutado y su hook NO se instala — su Enable sería
+                // no-op, así que ya no se invoca.
+                HookManager::Get().Enable("PushOrder");
+                spdlog::info("Core: Combat hooks ENABLED (game loaded, incl. PushOrder DIAG)");
             } else {
                 spdlog::info("Core: Combat hooks DEFERRED (game not loaded — will enable on load)");
             }
@@ -167,6 +202,15 @@ public:
             // Clear stale spawn queue from previous session
             m_spawnManager.ClearSpawnQueue();
 
+            // ── FIX CRASH 2º JUGADOR ──
+            // Vaciar comandos de game thread pendientes: capturan punteros a
+            // chars/entidades de la sesión que muere -> si se drenan tras el
+            // disconnect tocarían memoria liberada (use-after-free).
+            m_commandQueue.Clear();
+            // Soltar plantillas/factory cacheados: en reconexión sin recarga
+            // del juego apuntarían a GameData liberado por el motor.
+            m_spawnManager.ResetForReconnect();
+
             // Signal HandleSpawnQueue to reset its static timers on next call
             m_needSpawnQueueReset = true;
 
@@ -207,6 +251,13 @@ public:
 
     // Find a specific mod character by slot number (returns game object or nullptr).
     void* FindModCharacterBySlot(int slot);
+
+    // Reclama el personaje PRIMARIO del host por la cadena directa del motor
+    // (GameWorld+0x580 -> +0x2B0 playerCharacters -> data[0]), SIN depender del nombre
+    // "Player N". Imprescindible en el flujo "connected-then-load", donde el char del host
+    // conserva el nombre del save (no "Player N") y el hook CharacterCreate estaba en
+    // passthrough durante la carga. Devuelve true si quedó reclamado/registrado.
+    bool ClaimHostPrimaryCharacter();
 
     // Called by entity_hooks after faction bootstrap to trigger a re-scan of existing characters
     void RequestEntityRescan() { m_needsEntityRescan.store(true); }

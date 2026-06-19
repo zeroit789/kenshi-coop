@@ -10,6 +10,10 @@ namespace kmp {
 
 #pragma pack(push, 1)
 
+// Base del handshake — tamaño fijo, compatible con clientes existentes.
+// El campo 'password' se envía OPCIONALMENTE a continuación de este struct
+// (ver lectura tolerante a tamaño en GameServer::HandleHandshake): los clientes
+// que no lo envían siguen funcionando; el server solo lo exige si tiene contraseña.
 struct MsgHandshake {
     uint32_t protocolVersion;
     char     playerName[KMP_MAX_NAME_LENGTH + 1];
@@ -18,6 +22,9 @@ struct MsgHandshake {
     uint8_t  gameVersionPatch;
     uint8_t  reserved;
 };
+
+// Longitud máxima de la contraseña de servidor (campo opcional del handshake).
+constexpr int KMP_MAX_PASSWORD_LENGTH = 63;
 
 struct MsgHandshakeAck {
     PlayerID playerId;

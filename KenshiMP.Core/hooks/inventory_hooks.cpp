@@ -14,7 +14,15 @@ namespace kmp::inventory_hooks {
 // ── Function typedefs ──
 using ItemPickupFn = void(__fastcall*)(void* inventory, void* item, int quantity);
 using ItemDropFn   = void(__fastcall*)(void* inventory, void* item);
-using BuyItemFn    = void(__fastcall*)(void* buyer, void* seller, void* item, int quantity);
+// CORRECCIÓN crash (2026-06-18): la firma real de buyItem (RVA 0x0074A630, 1.0.68)
+// verificada por RE es __fastcall de SOLO 3 punteros en orden rcx=buyer, rdx=item, r8=seller.
+// Retorna un valor (bool/int en eax), no void. La firma anterior tenía:
+//   (a) un 4º param fantasma `int quantity` (r9 NUNCA se lee como entrante en la función), y
+//   (b) seller e item CRUZADOS (el hook ponía seller en rdx e item en r8, al revés del binario).
+// El cruce hacía que el trampoline reconstruyera la llamada con los punteros intercambiados;
+// la función desreferenciaba el "item" como tienda (mov rax,[rdi]; call [rax+0x58]) -> vtable
+// en offset basura -> CALL a puntero inválido -> Access Violation -> SEH -> auto-disable.
+using BuyItemFn    = char(__fastcall*)(void* buyer, void* item, void* seller);
 
 // ── State ──
 static ItemPickupFn s_origItemPickup = nullptr;
@@ -44,12 +52,17 @@ static bool SEH_ItemDrop(void* inventory, void* item) {
                                  inventory, item, &s_dropHealth);
 }
 
-// void fn(void*, void*, void*, int) — BuyItem (buyer, seller, item, qty)
+// char fn(void*, void*, void*) — BuyItem en orden real del binario: (buyer, item, seller)
+// Llama al trampoline con EXACTAMENTE la firma de la función original para no corromper
+// la reconstrucción de la llamada. Envuelto en SEH por seguridad (igual que SafeCall_*).
+// Devuelve true si la original se ejecutó sin excepción; el valor de retorno real de la
+// función (eax) se escribe en *outResult para poder propagarlo al juego sin alterar semántica.
 __declspec(noinline)
-static bool SEH_BuyItem(void* buyer, void* seller, void* item, int quantity) {
+static bool SEH_BuyItem(void* buyer, void* item, void* seller, char* outResult) {
     if (!s_origBuyItem || s_buyHealth.trampolineFailed.load()) return false;
     __try {
-        s_origBuyItem(buyer, seller, item, quantity);
+        char r = s_origBuyItem(buyer, item, seller);  // orden rcx=buyer, rdx=item, r8=seller
+        if (outResult) *outResult = r;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         s_buyHealth.trampolineFailed.store(true);
@@ -89,7 +102,10 @@ static void __fastcall Hook_ItemPickup(void* inventory, void* item, int quantity
     if (!core.IsConnected()) return;
 
     // Registry maps CHARACTER pointers, not inventory pointers.
-    // Read the inventory owner at inventory+0x28 (InventoryOffsets::owner).
+    // Lee el dueño del inventario en inventory+0x88 (InventoryOffsets::owner).
+    // CORRECCIÓN audit-02 (2026-06-18): antes el comentario decía +0x28 (offset INCORRECTO);
+    // el owner real está en +0x88 según KenshiLib. El valor se toma de GetOffsets() (dinámico),
+    // así que ya usa el +0x88 corregido en game_types.h.
     auto& registry = core.GetEntityRegistry();
     const int ownerOff = game::GetOffsets().inventory.owner;
     if (ownerOff < 0) return; // Offset not resolved
@@ -155,24 +171,30 @@ static void __fastcall Hook_ItemDrop(void* inventory, void* item) {
     spdlog::debug("inventory_hooks: ItemDrop #{} sent (entity={})", s_dropCount, netId);
 }
 
-static void __fastcall Hook_BuyItem(void* buyer, void* seller, void* item, int quantity) {
+// Firma corregida a 3 punteros en orden real del binario: (buyer=rcx, item=rdx, seller=r8).
+// MinHook desvía la función original aquí, así que la firma del detour DEBE coincidir
+// exactamente con la del juego o los argumentos se reciben corruptos.
+static char __fastcall Hook_BuyItem(void* buyer, void* item, void* seller) {
     s_buyCount++;
 
-    if (!SEH_BuyItem(buyer, seller, item, quantity)) {
+    // Llamamos a la original con el MISMO orden (buyer, item, seller) y capturamos su retorno real.
+    char origResult = 0;
+    if (!SEH_BuyItem(buyer, item, seller, &origResult)) {
         if (s_buyHealth.trampolineFailed.load()) {
             spdlog::error("inventory_hooks: BuyItem trampoline CRASHED — hook auto-disabled");
         }
-        return;
+        // Devolvemos 0 (compra no realizada) como valor seguro por defecto.
+        return 0;
     }
 
-    if (s_loading) return;
+    if (s_loading) return origResult;
 
     auto& core = Core::Get();
-    if (!core.IsConnected()) return;
+    if (!core.IsConnected()) return origResult;
 
     auto& registry = core.GetEntityRegistry();
     EntityID buyerNetId = registry.GetNetId(buyer);
-    if (buyerNetId == INVALID_ENTITY) return;
+    if (buyerNetId == INVALID_ENTITY) return origResult;
 
     PacketWriter writer;
     writer.WriteHeader(MessageType::C2S_TradeRequest);
@@ -180,13 +202,20 @@ static void __fastcall Hook_BuyItem(void* buyer, void* seller, void* item, int q
     msg.buyerEntityId = buyerNetId;
     msg.sellerEntityId = registry.GetNetId(seller);
     msg.itemTemplateId = TryGetItemTemplateId(item);
-    msg.quantity = quantity;
+    // La función del juego no recibe cantidad como parámetro (compra unitaria por defecto
+    // desde la UI de tienda). Enviamos 1; si más adelante se necesita la cantidad real,
+    // habrá que leerla del estado de la UI de comercio, no de la firma de buyItem.
+    msg.quantity = 1;
     msg.price = 0;
     writer.WriteRaw(&msg, sizeof(msg));
     core.GetClient().SendReliable(writer.Data(), writer.Size());
 
-    spdlog::info("inventory_hooks: BuyItem #{} sent (buyer={}, qty={})",
-                  s_buyCount, buyerNetId, quantity);
+    spdlog::info("inventory_hooks: BuyItem #{} sent (buyer={})",
+                  s_buyCount, buyerNetId);
+
+    // Propagamos el valor de retorno REAL de la función original (ya ejecutada en SEH_BuyItem)
+    // para no alterar la semántica que el juego espera (p.ej. "no había sitio" = 0).
+    return origResult;
 }
 
 // ── Install / Uninstall ──

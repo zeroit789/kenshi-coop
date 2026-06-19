@@ -1,11 +1,14 @@
 #include "game_types.h"
 #include "game_offset_prober.h"
+#include "spawn_manager.h"     // SpawnManager::ReadKenshiString (estática) para el volcado [DIAG]
+#include "../hooks/ai_hooks.h" // ai_hooks::IsRemoteControlled — para el volcado [DIAG-COMBAT] del estado del char del jugador
 #include "kmp/memory.h"
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <cmath>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 namespace kmp::game {
 
@@ -431,6 +434,29 @@ void SetGameSetPositionFn(void* fn) {
     s_setPositionFn = reinterpret_cast<SetPositionFn>(fn);
 }
 
+// ── Bridge del setter OFICIAL de pausa GameWorld::setPaused (RVA 0x787D40, 1.0.68) ──
+// Firma: void __fastcall(void* gameWorld /*rcx*/, bool paused /*dl*/).
+// Lo resuelve patterns.cpp por AOB y Core lo enchufa aquí vía SetGameSetPausedFn().
+// game_world.cpp (GameWorldAccessor::SetPaused) lo consume si está disponible.
+using SetPausedFn = void(__fastcall*)(void* gameWorld, bool paused);
+static SetPausedFn s_setPausedFn = nullptr;
+
+void SetGameSetPausedFn(void* fn) {
+    s_setPausedFn = reinterpret_cast<SetPausedFn>(fn);
+    spdlog::info("game_character: SetPaused (setter oficial) bridge set to 0x{:X}",
+                 reinterpret_cast<uintptr_t>(fn));
+}
+
+bool HasGameSetPausedFn() {
+    return s_setPausedFn != nullptr;
+}
+
+// Accessor interno usado por game_world.cpp para invocar el setter oficial bajo SEH.
+// Devuelve true si el puntero existe y la llamada no lanzó excepción.
+SetPausedFn GetGameSetPausedFn_Internal() {
+    return s_setPausedFn;
+}
+
 // Track WritePosition method transitions: log when method changes, not just first call.
 // This ensures we see if characters silently fall back to worse methods.
 static int s_lastWritePosMethod = 0;  // 0=none, 1=setPositionFn, 2=physicsChain, 3=cached
@@ -719,33 +745,54 @@ void CharacterIterator::Reset() {
         return true;
     };
 
+    // ── Strategy 2: GameWorld -> player(+0x580) -> PlayerInterface.playerCharacters(+0x2B0) ──
+    // El +0x888 antiguo (removal queue) NO contiene la lista de personajes del jugador.
+    // La lista REAL del jugador es un lektor<Character*> dentro de PlayerInterface, al que
+    // se llega así: GameWorld -> +0x580 (player) -> +0x2B0 (playerCharacters).
+    // Reutilizamos el mismo tryReadLektor (layout de 24 bytes: size@+0x08, cap@+0x0C, data@+0x10).
     if (m_listBase == 0) {
         uintptr_t gameWorldAddr = GetResolvedGameWorld();
         if (gameWorldAddr != 0) {
             const auto& offsets = GetOffsets();
-            int charListOff = offsets.world.characterList; // 0x0888
+            int playerOff   = offsets.world.player;                   // 0x0580
+            int charsOff    = offsets.playerInterface.playerCharacters; // 0x02B0
 
-            // GameWorldSingleton might be:
-            // (a) The address of a pointer TO GameWorld — dereference once
-            // (b) The address of GameWorld directly (static object)
+            // GetResolvedGameWorld() puede devolver:
+            //   (a) la DIRECCIÓN de un puntero A GameWorld — hay que dereferenciar una vez
+            //   (b) la dirección de GameWorld directamente (objeto estático)
+            // Tomamos el objeto GameWorld real en gameWorld.
             uintptr_t gameWorld = 0;
-            if (Memory::Read(gameWorldAddr, gameWorld) && isValidHeapPtr(gameWorld)) {
-                if (tryReadLektor(gameWorld + charListOff)) {
-                    spdlog::info("CharacterIterator: GameWorld lektor (indirect) — {} characters at 0x{:X}",
+            if (!(Memory::Read(gameWorldAddr, gameWorld) && isValidHeapPtr(gameWorld))) {
+                // Caso (b): la dirección resuelta ES el objeto GameWorld.
+                gameWorld = gameWorldAddr;
+            }
+
+            // GameWorld -> player (PlayerInterface*)
+            uintptr_t playerIface = 0;
+            if (Memory::Read(gameWorld + playerOff, playerIface) && isValidHeapPtr(playerIface)) {
+                // PlayerInterface -> playerCharacters (lektor<Character*>)
+                if (tryReadLektor(playerIface + charsOff)) {
+                    spdlog::info("CharacterIterator: PlayerInterface.playerCharacters — {} characters at 0x{:X}",
                                  m_count, m_listBase);
                     return;
                 }
             }
-            if (tryReadLektor(gameWorldAddr + charListOff)) {
-                spdlog::info("CharacterIterator: GameWorld lektor (direct) — {} characters at 0x{:X}",
-                             m_count, m_listBase);
+
+            // ── Último fallback histórico: GameWorld+0x888 (removal queue, DEPRECADO) ──
+            // Solo se intenta si la cadena del PlayerInterface falló. Mantenido por si
+            // alguna versión/plataforma difiere; en 1.0.68 Steam normalmente da vacío.
+            int charListOff = offsets.world.characterList; // 0x0888 [DEPRECADO]
+            if (tryReadLektor(gameWorld + charListOff)) {
+                spdlog::warn("CharacterIterator: usando fallback DEPRECADO GameWorld+0x{:X} — {} chars at 0x{:X}",
+                             charListOff, m_count, m_listBase);
                 return;
             }
 
             static bool s_loggedFail = false;
             if (!s_loggedFail) {
                 spdlog::warn("CharacterIterator: GameWorld fallback failed — "
-                             "addr=0x{:X}, charListOff=0x{:X}", gameWorldAddr, charListOff);
+                             "addr=0x{:X}, playerOff=0x{:X}, charsOff=0x{:X}",
+                             gameWorldAddr, playerOff, charsOff);
                 s_loggedFail = true;
             }
         }
@@ -757,6 +804,8 @@ void CharacterIterator::Reset() {
             spdlog::warn("CharacterIterator: No character list source available (PlayerBase and GameWorld both failed)");
             s_loggedNone = true;
         }
+        // [DIAG] La sonda v2 YA NO se dispara aquí (timing equivocado). Ahora se bombea
+        // desde DiagTickPump() en OnGameTick cuando el PlayerBase ya es heap válido.
         return;
     }
 
@@ -802,6 +851,545 @@ CharacterAccessor CharacterIterator::Next() {
         return CharacterAccessor(nullptr);
 
     return CharacterAccessor(reinterpret_cast<void*>(charPtr));
+}
+
+// ── GetPlayerFactionDirect ──
+// Resuelve la facción del jugador SIN iterar la lista de personajes:
+//   GameWorld -> +0x580 (player/PlayerInterface*) -> +0x2A0 (participant) = Faction*
+// Cada salto se valida como puntero de heap (mismas guardas que CharacterIterator::Reset).
+// Devuelve 0 si la cadena no es válida. Esta es la fuente PRIMARIA de facción.
+uintptr_t GetPlayerFactionDirect() {
+    uintptr_t gameWorldAddr = GetResolvedGameWorld();
+    if (gameWorldAddr == 0) return 0;
+
+    // Rango de módulo para distinguir punteros de heap de direcciones dentro del binario.
+    uintptr_t modBase = Memory::GetModuleBase();
+    size_t modSize = 0x4000000; // 64MB fallback
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE)
+                modSize = nt->OptionalHeader.SizeOfImage;
+        }
+    }
+    auto isValidHeapPtr = [modBase, modSize](uintptr_t val) -> bool {
+        if (val < 0x10000 || val >= 0x00007FFFFFFFFFFF) return false;
+        if ((val & 0x7) != 0) return false;                    // 8-byte aligned
+        if (val >= modBase && val < modBase + modSize) return false; // fuera del módulo
+        return true;
+    };
+
+    const auto& offsets = GetOffsets();
+
+    // GetResolvedGameWorld() puede devolver la DIRECCIÓN de la variable global (caso a)
+    // o el objeto GameWorld directamente (caso b). Dereferenciamos una vez y validamos.
+    uintptr_t gameWorld = 0;
+    if (!(Memory::Read(gameWorldAddr, gameWorld) && isValidHeapPtr(gameWorld))) {
+        gameWorld = gameWorldAddr; // caso (b)
+    }
+
+    // GameWorld -> player (PlayerInterface*)
+    uintptr_t playerIface = 0;
+    if (!Memory::Read(gameWorld + offsets.world.player, playerIface) || !isValidHeapPtr(playerIface))
+        return 0;
+
+    // PlayerInterface -> participant (Faction*)
+    uintptr_t faction = 0;
+    if (!Memory::Read(playerIface + offsets.playerInterface.participant, faction) || !isValidHeapPtr(faction))
+        return 0;
+
+    return faction;
+}
+
+// ── GetPlayerPrimaryCharacterDirect ──
+// Devuelve el personaje PRIMARIO del jugador (el que controla) SIN iterar por nombre.
+// Cadena (misma que CharacterIterator Strategy 2, pero apuntando directo a data[0]):
+//   GameWorld -> +0x580 (player/PlayerInterface*) -> +0x2B0 (playerCharacters, lektor<Character*>)
+//     layout lektor: size@+0x08, capacity@+0x0C, data@+0x10  ->  data[0] = char primario.
+// Devuelve 0 si la cadena no está poblada (p.ej. justo tras la carga) — el caller reintenta.
+// Esta es la vía ROBUSTA para el flujo connected-then-load: no depende del nombre "Player N"
+// ni de que el hook CharacterCreate capturase la creación durante la carga.
+uintptr_t GetPlayerPrimaryCharacterDirect() {
+    uintptr_t gameWorldAddr = GetResolvedGameWorld();
+    if (gameWorldAddr == 0) return 0;
+
+    uintptr_t modBase = Memory::GetModuleBase();
+    size_t modSize = 0x4000000; // 64MB fallback
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE)
+                modSize = nt->OptionalHeader.SizeOfImage;
+        }
+    }
+    auto isValidHeapPtr = [modBase, modSize](uintptr_t val) -> bool {
+        if (val < 0x10000 || val >= 0x00007FFFFFFFFFFF) return false;
+        if ((val & 0x7) != 0) return false;
+        if (val >= modBase && val < modBase + modSize) return false;
+        return true;
+    };
+
+    const auto& offsets = GetOffsets();
+
+    // Caso (a) puntero a GameWorld vs (b) instancia embebida: deref una vez y valida.
+    uintptr_t gameWorld = 0;
+    if (!(Memory::Read(gameWorldAddr, gameWorld) && isValidHeapPtr(gameWorld))) {
+        gameWorld = gameWorldAddr; // caso (b)
+    }
+
+    // GameWorld -> player (PlayerInterface*)
+    uintptr_t playerIface = 0;
+    if (!Memory::Read(gameWorld + offsets.world.player, playerIface) || !isValidHeapPtr(playerIface))
+        return 0;
+
+    // PlayerInterface -> playerCharacters (lektor<Character*>): size@+0x08, data@+0x10.
+    uintptr_t lektorBase = playerIface + offsets.playerInterface.playerCharacters; // +0x2B0
+    uint32_t size = 0; uintptr_t dataPtr = 0;
+    if (!Memory::Read(lektorBase + 0x08, size))   return 0;
+    if (!Memory::Read(lektorBase + 0x10, dataPtr)) return 0;
+    if (size == 0 || size > 100000)               return 0;  // aún sin poblar / basura
+    if (!isValidHeapPtr(dataPtr))                 return 0;
+
+    // data[0] = primer Character*. Validamos que tenga vtable dentro del módulo.
+    uintptr_t firstChar = 0;
+    if (!Memory::Read(dataPtr, firstChar) || !isValidHeapPtr(firstChar)) return 0;
+    uintptr_t vtable = 0;
+    if (!Memory::Read(firstChar, vtable)) return 0;
+    if (vtable < modBase || vtable >= modBase + modSize) return 0; // no es objeto del juego
+
+    return firstChar;
+}
+
+// ── DiagDumpPlayerFaction — SONDA v2 ──
+// VOLCADO DE DIAGNÓSTICO (solo log, NO cambia comportamiento, NO escribe memoria).
+// Objetivo: localizar el offset REAL de la facción del jugador escaneando en RANGO,
+// y filtrar candidatos con un test de string LEGIBLE (ASCII imprimible). Loguea con "[DIAG]".
+//
+// Resuelve dos objetos al inicio:
+//   - gwObj: objeto GameWorld real (deref de GetResolvedGameWorld() si es heap, si no la addr).
+//   - pbObj: objeto PlayerBase/PlayerInterface real (deref de GetResolvedPlayerBase() si es heap).
+// Tres escaneos:
+//   A) pbObj como PlayerInterface: offsets +0x00..+0x400 buscando Faction* legible.
+//   B) gwObj como GameWorld: offsets +0x400..+0xA00; cada qword se prueba como PlayerInterface*
+//      (sub-offsets +0x2A0/+0x320 -> Faction*) y como Faction* directo.
+//   C) vía Character: char[0].faction (char+0x10, VERIFICADO) = facción del jugador con CERTEZA.
+// Cada Faction* candidato se loguea SIEMPRE en hex para poder cruzarlos entre escaneos.
+//
+// Se limita a un máximo de DIAG_MAX_DUMPS volcados globales para no spamear el log.
+// Se dispara desde DiagTickPump() (game tick), cuando el PlayerBase ya es heap válido.
+//
+// ⚠ DESACTIVADO (=0) 2026-06-18: los escaneos A/B de esta sonda recorren rangos de memoria
+//   (+0x00..+0x400 de PlayerBase, +0x400..+0xA00 de GameWorld) interpretando CADA qword como
+//   Faction* y leyendo +0x1A8 (faction.nameStr) vía ReadKenshiString. Aunque todo va bajo SEH
+//   y NO es fatal, dispara cientos de AVs internos (KenshiOnline_CRASH.log: READ at this+0x1B8
+//   con this basura tipo 0x14...01A8) que ensucian el crash log y el VEH. La facción del player
+//   YA está resuelta de forma fiable por GetPlayerFactionDirect() (GameWorld+0x580 -> +0x2A0),
+//   así que este escaneo bruto de RE ya cumplió su propósito. Para reactivarlo puntualmente en
+//   una sesión de RE, subir DIAG_MAX_DUMPS a 6 de nuevo.
+static std::atomic<int> s_diagDumpCount{0};
+static constexpr int DIAG_MAX_DUMPS = 0;
+
+// ── isHeap compartido a nivel de fichero ──
+// Valida que un qword parece un puntero de heap del juego:
+//   >= 0x10000, < 0x00007FFFFFFFFFFF, 8-byte alineado, y FUERA de la imagen del módulo.
+// Se usa tanto en la sonda como en DiagTickPump. Calcula el rango del módulo una vez.
+static bool DiagIsHeap(uintptr_t v) {
+    static uintptr_t s_modBase = 0;
+    static size_t    s_modSize = 0x4000000; // fallback 64MB
+    if (s_modBase == 0) {
+        s_modBase = Memory::GetModuleBase();
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(s_modBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(s_modBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE)
+                s_modSize = nt->OptionalHeader.SizeOfImage;
+        }
+    }
+    if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+    if ((v & 0x7) != 0) return false;                          // 8-byte alineado
+    if (v >= s_modBase && v < s_modBase + s_modSize) return false; // fuera del módulo
+    return true;
+}
+
+// ── esLegible ──
+// Un string solo cuenta como nombre de facción si NO está vacío, tiene >=3 chars y
+// >=80% de caracteres ASCII imprimibles (letra/dígito/espacio/puntuación visible).
+// ReadKenshiString ya tiene SEH y devuelve "" si falla, pero NO valida ASCII, así que
+// puede colar basura binaria — la filtramos aquí.
+static bool DiagEsLegible(const std::string& s) {
+    if (s.size() < 3) return false;
+    int printable = 0;
+    for (unsigned char c : s) {
+        // ASCII imprimible estándar: 0x20 (espacio) .. 0x7E (~).
+        if (c >= 0x20 && c <= 0x7E) printable++;
+    }
+    return (printable * 100) >= static_cast<int>(s.size()) * 80;
+}
+
+// ── Cuerpo real de la sonda v2 ──
+// Separado en función propia porque DiagDumpPlayerFaction se invoca dentro de un wrapper
+// SEH (__try/__except), y MSVC no permite mezclar SEH con objetos C++ de destructor no
+// trivial (std::string) en la MISMA función. Aquí sí podemos usar std::string libremente.
+static void DiagDumpPlayerFactionBody(int dumpId) {
+    const auto& offsets = GetOffsets();
+    const int facNameOff = offsets.factionExtra.nameStr;            // 0x01A8
+    const int facName2   = offsets.faction.name;                   // 0x01A8 (corregido; antes 0x0010 erroneo)
+    const int charFacOff = offsets.character.faction;              // 0x0010 (VERIFICADO)
+    // Sub-offsets de PlayerInterface a probar como Faction* en el escaneo B (b1).
+    const int piPart1    = offsets.playerInterface.participant;     // 0x02A0
+    const int piPart2    = 0x0320;                                  // candidato alternativo
+
+    // Lee un Faction* candidato, valida heap, y devuelve su nombre legible (o "").
+    // Prueba +0x1A8 (faction.nameStr) y, como respaldo, +0x10 (faction.name).
+    // 'usadoOff' recibe el offset que dio el nombre (para loguearlo). Loguea NADA aquí:
+    // el llamante decide el formato según el escaneo.
+    auto leerNombreFaccion = [&](uintptr_t facPtr, int& usadoOff) -> std::string {
+        usadoOff = -1;
+        if (!DiagIsHeap(facPtr)) return std::string();
+        std::string n1 = SpawnManager::ReadKenshiString(facPtr + facNameOff);
+        if (DiagEsLegible(n1)) { usadoOff = facNameOff; return n1; }
+        std::string n2 = SpawnManager::ReadKenshiString(facPtr + facName2);
+        if (DiagEsLegible(n2)) { usadoOff = facName2; return n2; }
+        return std::string();
+    };
+
+    // ── Resolución de objetos al inicio ──
+    // gwObj: objeto GameWorld real. GetResolvedGameWorld() puede devolver la ADDR de la
+    // global (dentro del módulo) o el objeto directo. Si el deref es heap, usamos el deref.
+    uintptr_t gwAddr = GetResolvedGameWorld();
+    uintptr_t gwDeref = 0;
+    bool gwDerefOk = (gwAddr != 0) && Memory::Read(gwAddr, gwDeref) && DiagIsHeap(gwDeref);
+    uintptr_t gwObj = gwDerefOk ? gwDeref : gwAddr;
+
+    // pbObj: objeto PlayerBase/PlayerInterface real (misma lógica de deref).
+    uintptr_t pbAddr = GetResolvedPlayerBase();
+    uintptr_t pbDeref = 0;
+    bool pbDerefOk = (pbAddr != 0) && Memory::Read(pbAddr, pbDeref) && DiagIsHeap(pbDeref);
+    uintptr_t pbObj = pbDerefOk ? pbDeref : pbAddr;
+
+    spdlog::info("[DIAG] ===== Volcado #{}/{} (sonda v2: escaneo en rango) =====", dumpId, DIAG_MAX_DUMPS);
+    spdlog::info("[DIAG] gwObj=0x{:X} (esHeap={}, deref={})  pbObj=0x{:X} (esHeap={}, deref={})",
+                 gwObj, DiagIsHeap(gwObj), gwDerefOk, pbObj, DiagIsHeap(pbObj), pbDerefOk);
+    spdlog::info("[DIAG] offsets: facName=+0x{:X}/+0x{:X}  char.faction=+0x{:X}  piPart=+0x{:X}/+0x{:X}",
+                 facNameOff, facName2, charFacOff, piPart1, piPart2);
+
+    // ── ESCANEO A — PlayerBase como PlayerInterface ──
+    // Recorre pbObj +0x00..+0x400 de 8 en 8. Cada qword isHeap() se interpreta como Faction*.
+    if (DiagIsHeap(pbObj)) {
+        spdlog::info("[DIAG] A: escaneo PlayerBase(0x{:X}) +0x000..+0x400 como Faction*:", pbObj);
+        for (int off = 0x00; off <= 0x400; off += 8) {
+            uintptr_t cand = 0;
+            if (!Memory::Read(pbObj + off, cand)) continue;
+            if (!DiagIsHeap(cand)) continue;
+            int usadoOff = -1;
+            std::string nm = leerNombreFaccion(cand, usadoOff);
+            if (!nm.empty()) {
+                spdlog::info("[DIAG] A: PlayerBase+0x{:X} -> Faction?=0x{:X} name@+0x{:X}='{}'  <-- CANDIDATO",
+                             off, cand, usadoOff, nm);
+            }
+        }
+    } else {
+        spdlog::info("[DIAG] A: pbObj 0x{:X} no es heap — escaneo A omitido", pbObj);
+    }
+
+    // ── ESCANEO B — GameWorld objeto ──
+    // gwObj +0x400..+0xA00 de 8 en 8. Cada qword isHeap() se prueba de dos formas.
+    if (DiagIsHeap(gwObj)) {
+        spdlog::info("[DIAG] B: escaneo GameWorld(0x{:X}) +0x400..+0xA00:", gwObj);
+        for (int off = 0x400; off <= 0xA00; off += 8) {
+            uintptr_t q = 0;
+            if (!Memory::Read(gwObj + off, q)) continue;
+            if (!DiagIsHeap(q)) continue;
+
+            // (b1) q como PlayerInterface*: probar SU +0x2A0 y +0x320 como Faction*.
+            int piOffs[2] = { piPart1, piPart2 };
+            for (int piOff : piOffs) {
+                uintptr_t facPtr = 0;
+                if (!Memory::Read(q + piOff, facPtr)) continue;
+                if (!DiagIsHeap(facPtr)) continue;
+                int usadoOff = -1;
+                std::string nm = leerNombreFaccion(facPtr, usadoOff);
+                if (!nm.empty()) {
+                    spdlog::info("[DIAG] B(b1): GameWorld+0x{:X} -> PlayerIface?=0x{:X} +0x{:X} "
+                                 "-> Faction?=0x{:X} name@+0x{:X}='{}'  <-- CANDIDATO",
+                                 off, q, piOff, facPtr, usadoOff, nm);
+                }
+            }
+
+            // (b2) q directamente como Faction*: probar su +0x1A8/+0x10.
+            int usadoOff2 = -1;
+            std::string nm2 = leerNombreFaccion(q, usadoOff2);
+            if (!nm2.empty()) {
+                spdlog::info("[DIAG] B(b2): GameWorld+0x{:X} -> Faction?=0x{:X} name@+0x{:X}='{}'  <-- CANDIDATO",
+                             off, q, usadoOff2, nm2);
+            }
+        }
+    } else {
+        spdlog::info("[DIAG] B: gwObj 0x{:X} no es heap — escaneo B omitido", gwObj);
+    }
+
+    // ── ESCANEO C — vía Character (la facción con CERTEZA) ──
+    // Vía 1: pbObj interpretado como array de Character* (pbObj+0 = Character* con vtable módulo).
+    // Vía 2: lektor playerCharacters @ pbObj+0x2B0 (size@+0x08, data@+0x10) -> data[0].
+    uintptr_t modBase = Memory::GetModuleBase();
+    auto esCharacter = [&](uintptr_t p) -> bool {
+        if (!DiagIsHeap(p)) return false;
+        uintptr_t vtable = 0;
+        if (!Memory::Read(p, vtable)) return false;
+        // La vtable de un Character apunta dentro de la imagen del módulo (.rdata).
+        return (vtable >= modBase && vtable < modBase + 0x4000000);
+    };
+
+    uintptr_t firstChar = 0;
+
+    // Vía 1: pbObj+0 como Character* directo.
+    if (firstChar == 0 && DiagIsHeap(pbObj)) {
+        uintptr_t c0 = 0;
+        if (Memory::Read(pbObj, c0) && esCharacter(c0)) {
+            firstChar = c0;
+            spdlog::info("[DIAG] C(via1): pbObj+0 -> Character* 0x{:X} (vtable OK)", firstChar);
+        }
+    }
+
+    // Vía 2: lektor playerCharacters en pbObj+0x2B0.
+    if (firstChar == 0 && DiagIsHeap(pbObj)) {
+        const int charsOff = offsets.playerInterface.playerCharacters; // 0x2B0
+        uint32_t lsize = 0; uintptr_t ldata = 0;
+        Memory::Read(pbObj + charsOff + 0x08, lsize);
+        Memory::Read(pbObj + charsOff + 0x10, ldata);
+        if (DiagIsHeap(ldata) && lsize > 0 && lsize <= 100000) {
+            uintptr_t c0 = 0;
+            if (Memory::Read(ldata, c0) && esCharacter(c0)) {
+                firstChar = c0;
+                spdlog::info("[DIAG] C(via2): pbObj+0x{:X} lektor data[0] -> Character* 0x{:X} (size={})",
+                             charsOff, firstChar, lsize);
+            }
+        }
+    }
+
+    if (esCharacter(firstChar)) {
+        uintptr_t charFac = 0;
+        Memory::Read(firstChar + charFacOff, charFac); // char+0x10 (VERIFICADO)
+        int usadoOff = -1;
+        std::string nm = leerNombreFaccion(charFac, usadoOff);
+        spdlog::info("[DIAG] C: char[0]=0x{:X} faction@+0x{:X}=0x{:X} name='{}'  <-- FACCION DEL JUGADOR (CERTEZA)",
+                     firstChar, charFacOff, charFac, nm);
+        spdlog::info("[DIAG] C: cruza este Faction*=0x{:X} con los CANDIDATOS de A y B para hallar el offset",
+                     charFac);
+
+        // ── DIAG-COMBAT: estado del personaje del jugador (host) ──
+        // Objetivo: confirmar que el char del host está correctamente "controlado por
+        // el jugador" y NO marcado como remote-controlled por el mod (lo que bloquearía
+        // sus órdenes). Si el host apareciese como remote-controlled, ESA sería la causa
+        // de que no pueda atacar (el motor trataría sus decisiones como de red).
+        //
+        // 1) Flag isPlayerControlled (si el offset ya fue descubierto por la sonda de diff).
+        int pcOff = offsets.character.isPlayerControlled;
+        if (pcOff >= 0) {
+            uint8_t pcVal = 0xFF;
+            Memory::Read(firstChar + pcOff, pcVal);
+            spdlog::info("[DIAG-COMBAT] C: char[0]=0x{:X} isPlayerControlled@+0x{:X} = {} "
+                         "(1=jugador controla, 0=IA controla)",
+                         firstChar, pcOff, (int)pcVal);
+        } else {
+            spdlog::info("[DIAG-COMBAT] C: char[0]=0x{:X} isPlayerControlled offset AÚN no descubierto "
+                         "(la sonda de diff necesita comparar player vs NPC primero)", firstChar);
+        }
+
+        // 2) ¿El mod marcó este char del host como remote-controlled? NO debería.
+        //    Si devuelve true, el mod estaría suprimiendo las órdenes/IA del host por error.
+        bool remoteCtl = kmp::ai_hooks::IsRemoteControlled(reinterpret_cast<void*>(firstChar));
+        spdlog::info("[DIAG-COMBAT] C: char[0]=0x{:X} IsRemoteControlled(mod) = {} "
+                     "{}", firstChar, remoteCtl,
+                     remoteCtl ? "<-- ¡¡ANOMALÍA!! El host NO debería estar remote-controlled — "
+                                 "esto BLOQUEARÍA MoveTo/órdenes si esos hooks estuvieran activos"
+                               : "(correcto: el host controla su propio personaje)");
+
+        // 3) Candidato a squad pointer cerca del inicio del Character (+0x08/+0x20/+0x28/+0x30/+0x38).
+        //    Solo log: ayuda a confirmar que el host está en un squad válido (de su facción).
+        const int squadCandOffs[] = {0x08, 0x20, 0x28, 0x30, 0x38};
+        for (int so : squadCandOffs) {
+            uintptr_t sq = 0;
+            if (Memory::Read(firstChar + so, sq) && DiagIsHeap(sq)) {
+                uintptr_t sqVt = 0;
+                bool vtOk = Memory::Read(sq, sqVt) && sqVt >= modBase && sqVt < modBase + 0x4000000;
+                spdlog::info("[DIAG-COMBAT] C: char[0]+0x{:X} -> 0x{:X} (heap, vtableEnModulo={}) "
+                             "candidato squad/objeto", so, sq, vtOk);
+            }
+        }
+    } else {
+        spdlog::info("[DIAG] C: no se encontró Character* válido (via1/via2 fallaron) — sin certeza esta sesión");
+    }
+
+    spdlog::info("[DIAG] ===== Fin volcado #{}/{} =====", dumpId, DIAG_MAX_DUMPS);
+}
+
+// ── Wrapper SEH para el cuerpo de la sonda ──
+// Los escaneos en rango derefencian punteros como Faction* y leen +0x1A8: aunque cada
+// candidato pasa isHeap() y Memory::Read/ReadKenshiString toleran fallos, blindamos el
+// volcado completo contra cualquier access violation residual. Sin objetos C++ aquí.
+static void SEH_DiagDumpPlayerFactionBody(int dumpId) {
+    __try {
+        DiagDumpPlayerFactionBody(dumpId);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        spdlog::warn("[DIAG] Volcado #{} abortado por excepción (SEH) — memoria no mapeada", dumpId);
+    }
+}
+
+void DiagDumpPlayerFaction() {
+    // Límite de volcados (atómico, thread-safe entre hilo de red y de lógica).
+    int n = s_diagDumpCount.fetch_add(1);
+    if (n >= DIAG_MAX_DUMPS) return;
+    int dumpId = n + 1;
+
+    // No tocar memoria del juego mientras carga (el lektor se está redimensionando).
+    if (IsGameLoading()) {
+        spdlog::warn("[DIAG] Volcado #{} abortado — el juego está cargando", dumpId);
+        return;
+    }
+
+    // Cuerpo real bajo SEH (separado por la restricción MSVC: SEH + std::string).
+    SEH_DiagDumpPlayerFactionBody(dumpId);
+}
+
+// ── DiagTickPump ──
+// Bombea la sonda desde el game tick (OnGameTick) con throttle de 2s REALES vía steady_clock
+// (OnGameTick corre a ~framerate, NO asumimos 60fps). CONDICIÓN de disparo: el PlayerBase
+// resuelto debe ser un puntero de HEAP válido y no nulo (así esperamos a que el player exista).
+// Si no es heap válido, NO contamos el tiempo (no reseteamos el reloj, no disparamos).
+// DiagDumpPlayerFaction ya respeta su límite global de 6 volcados.
+void DiagTickPump() {
+    using clock = std::chrono::steady_clock;
+    static clock::time_point s_lastDiag{};   // último volcado (epoch por defecto = nunca)
+    static bool s_armed = false;             // false hasta el primer tick con PlayerBase válido
+
+    // Resolver PlayerBase real (deref si es heap, si no la addr directa).
+    uintptr_t pbAddr = GetResolvedPlayerBase();
+    if (pbAddr == 0) return;
+    uintptr_t pbDeref = 0;
+    uintptr_t pbObj = (Memory::Read(pbAddr, pbDeref) && DiagIsHeap(pbDeref)) ? pbDeref : pbAddr;
+
+    // Condición: el player debe existir ya (PlayerBase resuelto es heap válido).
+    if (!DiagIsHeap(pbObj)) return; // no es heap -> no contamos tiempo ni disparamos.
+
+    auto now = clock::now();
+    if (!s_armed) {
+        // Primer tick con player válido: dispara ya y arma el reloj.
+        s_armed = true;
+        s_lastDiag = now;
+        DiagDumpPlayerFaction();
+        return;
+    }
+    // A partir de ahí, 1 volcado cada ~2 segundos reales.
+    if (now - s_lastDiag >= std::chrono::seconds(2)) {
+        s_lastDiag = now;
+        DiagDumpPlayerFaction();
+    }
+}
+
+// ── FixCharacterFactionTo ──
+// Arregla la FACCIÓN del personaje del HOST: si char+0x10 (faction) no apunta a la
+// player faction válida (la que resuelve GameWorld+0x580 -> +0x2A0 = 'Sinnombre'),
+// la escribe. Esto es lo que el motor usa en Character::isPlayerCharacter()
+//   char.faction(+0x10) == gameWorld.player(+0x580).faction
+// para reconocerte como jugador y aceptar tus órdenes de combate.
+//
+// SEGURIDAD: a diferencia del caso REMOTO (que escribe facciones de NPC que se
+// liberan al descargar su zona -> use-after-free), aquí escribimos la PLAYER
+// faction, propiedad de PlayerInterface, que vive toda la partida y NO se descarga
+// con zonas. Por tanto escribirla en el char del host es seguro (es restaurar el
+// valor correcto), no introduce el UAF documentado en player_controller.cpp.
+//
+// Toda la lectura/escritura va dentro de __try/__except: el char puede haberse
+// liberado entre que el registry lo guardó y este momento. Se valida que el char
+// sea un puntero de heap con vtable dentro del módulo (mismo criterio que el
+// resto del fichero) antes de tocar nada.
+//
+// Loguea SIEMPRE con prefijo [DIAG-FAC]: char, faction ANTES, player faction, y
+// (si escribe) faction DESPUÉS + si coincide. Devuelve el resultado para que el
+// orquestador (core.cpp) sepa cuándo dar por arreglado el host.
+//
+// NOTA: __try no puede coexistir con objetos C++ que requieran unwinding (destructores)
+// en el mismo scope (MSVC C2712). Por eso el bloque __try hace SOLO lectura/escritura
+// cruda en variables POD locales, y TODO el logging (spdlog crea temporales con
+// destructor) se hace FUERA del __try. La parte cruda se aísla en SEH_RawFixFaction.
+
+// Helper SEH puro (sin objetos C++): lee faction antes, escribe si difiere, releé después.
+// Devuelve true si la memoria fue accesible; rellena outBefore/outAfter/outWrote/outVtableOk.
+static bool SEH_RawFixFaction(uintptr_t cp, int factionOff, uintptr_t playerFaction,
+                              uintptr_t modBase, uintptr_t modSize,
+                              uintptr_t& outVtable, uintptr_t& outBefore,
+                              uintptr_t& outAfter, bool& outWrote) {
+    outVtable = 0; outBefore = 0; outAfter = 0; outWrote = false;
+    __try {
+        outVtable = *reinterpret_cast<uintptr_t*>(cp);
+        // Si la vtable no apunta al módulo, no es un objeto de clase del juego: no tocar.
+        if (outVtable < modBase || outVtable >= modBase + modSize)
+            return true; // memoria accesible pero char inválido (lo decide el caller)
+
+        outBefore = *reinterpret_cast<uintptr_t*>(cp + factionOff);
+        if (outBefore != playerFaction) {
+            *reinterpret_cast<uintptr_t*>(cp + factionOff) = playerFaction; // escribir +0x10
+            outWrote = true;
+            outAfter = *reinterpret_cast<uintptr_t*>(cp + factionOff);       // releer
+        } else {
+            outAfter = outBefore;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false; // char liberado / memoria no accesible
+    }
+}
+
+FixFactionResult FixCharacterFactionTo(void* charPtr, uintptr_t playerFaction) {
+    uintptr_t cp = reinterpret_cast<uintptr_t>(charPtr);
+
+    // Validación previa del char (sin lecturas peligrosas todavía).
+    if (cp < 0x10000 || cp >= 0x00007FFFFFFFFFFF || (cp & 0x7) != 0)
+        return FixFactionResult::InvalidChar;
+
+    // La player faction debe ser un puntero de heap válido (la fuente de verdad).
+    if (playerFaction < 0x10000 || playerFaction >= 0x00007FFFFFFFFFFF || (playerFaction & 0x7) != 0)
+        return FixFactionResult::NoPlayerFaction;
+
+    const int factionOff = GetOffsets().character.faction; // +0x10
+    if (factionOff < 0) return FixFactionResult::InvalidChar;
+
+    uintptr_t modBase = Memory::GetModuleBase();
+    const uintptr_t modSize = 0x4000000; // 64MB — rango del módulo (mismo criterio que el fichero)
+    // La player faction NO debe estar dentro del módulo (debe ser objeto de heap del juego).
+    if (playerFaction >= modBase && playerFaction < modBase + modSize)
+        return FixFactionResult::NoPlayerFaction;
+
+    // ── Parte cruda protegida por SEH (sin objetos C++) ──
+    uintptr_t vtable = 0, before = 0, after = 0;
+    bool wrote = false;
+    bool accessible = SEH_RawFixFaction(cp, factionOff, playerFaction, modBase, modSize,
+                                        vtable, before, after, wrote);
+
+    // ── Logging y decisión FUERA del __try (spdlog crea temporales con destructor) ──
+    if (!accessible) {
+        spdlog::warn("[DIAG-FAC] char=0x{:X} EXCEPCION al leer/escribir faction — char liberado?", cp);
+        return FixFactionResult::Exception;
+    }
+    if (vtable < modBase || vtable >= modBase + modSize) {
+        spdlog::warn("[DIAG-FAC] char=0x{:X} vtable=0x{:X} fuera del modulo — no es Character valido",
+                     cp, vtable);
+        return FixFactionResult::InvalidChar;
+    }
+    if (!wrote) {
+        spdlog::info("[DIAG-FAC] char=0x{:X} faction(+0x{:X}) ANTES=0x{:X} player=0x{:X} -> YA CORRECTA",
+                     cp, factionOff, before, playerFaction);
+        return FixFactionResult::AlreadyCorrect;
+    }
+    bool match = (after == playerFaction);
+    spdlog::info("[DIAG-FAC] char=0x{:X} faction(+0x{:X}) ANTES=0x{:X} -> DESPUES=0x{:X} "
+                 "player=0x{:X} match={} {}",
+                 cp, factionOff, before, after, playerFaction,
+                 match ? "SI" : "NO", match ? "[FIX OK]" : "[FIX FALLO]");
+    return match ? FixFactionResult::Fixed : FixFactionResult::WriteFailed;
 }
 
 // ── SetPlayerControlled ──

@@ -110,6 +110,10 @@ bool ServerConfig::Load(const std::string& path) {
         if (j.contains("gameSpeed"))  gameSpeed  = j["gameSpeed"].get<float>();
         if (j.contains("masterServer")) masterServer = j["masterServer"].get<std::string>();
         if (j.contains("masterPort"))   masterPort   = j["masterPort"].get<uint16_t>();
+        // Nuevos campos: registro al master y modo de facciones
+        if (j.contains("enableMasterServer")) enableMasterServer = j["enableMasterServer"].get<bool>();
+        if (j.contains("factionMode")) factionMode = j["factionMode"].get<std::string>();
+        if (j.contains("teamSize"))    teamSize    = j["teamSize"].get<int>();
 
         // ── Validate loaded values ──
         port        = Clamp<uint16_t>(port, 1024, 65535);
@@ -119,6 +123,10 @@ bool ServerConfig::Load(const std::string& path) {
         masterPort  = Clamp<uint16_t>(masterPort, 1024, 65535);
         if (serverName.size() > KMP_MAX_NAME_LENGTH)
             serverName.resize(KMP_MAX_NAME_LENGTH);
+        // factionMode solo admite valores conocidos; cualquier otro cae a "single" (co-op seguro)
+        if (factionMode != "single" && factionMode != "teams" && factionMode != "per-player")
+            factionMode = "single";
+        teamSize    = Clamp(teamSize, 1, KMP_MAX_PLAYERS);
 
         return true;
     } catch (...) {
@@ -138,6 +146,10 @@ bool ServerConfig::Save(const std::string& path) const {
     j["gameSpeed"]  = gameSpeed;
     j["masterServer"] = masterServer;
     j["masterPort"]   = masterPort;
+    // Nuevos campos: registro al master deshabilitado por defecto + modo de facciones
+    j["enableMasterServer"] = enableMasterServer;
+    j["factionMode"]  = factionMode;
+    j["teamSize"]     = teamSize;
 
     std::ofstream file(path);
     if (!file.is_open()) return false;

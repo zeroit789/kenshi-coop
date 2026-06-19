@@ -129,6 +129,23 @@ inline bool SafeCall_Void_PtrPtr(void* fn, void* a1, void* a2, HookHealth* healt
     }
 }
 
+// void fn(void*, void*, void*) — StartAttack(attacker, target, weapon)
+__declspec(noinline)
+inline bool SafeCall_Void_PtrPtrPtr(void* fn, void* a1, void* a2, void* a3, HookHealth* health) {
+    if (!fn || (health && health->trampolineFailed.load())) return false;
+    using Fn = void(__fastcall*)(void*, void*, void*);
+    __try {
+        reinterpret_cast<Fn>(fn)(a1, a2, a3);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (health) {
+            health->trampolineFailed.store(true);
+            health->failCount.fetch_add(1);
+        }
+        return false;
+    }
+}
+
 // void fn(void*, int, int) — ZoneLoad/ZoneUnload
 __declspec(noinline)
 inline bool SafeCall_Void_PtrII(void* fn, void* a1, int a2, int a3, HookHealth* health) {

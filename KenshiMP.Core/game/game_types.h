@@ -38,13 +38,24 @@ struct CharacterOffsets {
     int position      = 0x48;    // Vec3 read-only cached position (KServerMod verified)
     int rotation      = 0x58;    // Quat rotation (KServerMod verified)
     int sceneNode     = -1;      // Ogre::SceneNode* (not yet verified — runtime probe)
-    int aiPackage     = -1;      // AI package pointer (not yet verified)
+    // ✅ CONFIRMADO (RE de bytes 2026-06-18, AI::create 0x622110): el "AI package" del Character
+    // es un AITaskSytem* (sic, RTTI .?AVAITaskSytem@@, vtable RVA 0x16E3F30) que AI::create crea
+    // (objeto de 0x3B8 bytes) y escribe en char+0x20 con `mov [rbx+0x20],rax` (0x6221AF). La cola
+    // de tareas es un lektor<Tasker*> INLINE en AITaskSytem+0x2E8 (size@+0x2F0 uint32, cap@+0x2F4,
+    // data@+0x2F8 Tasker**). Un char con char+0x20==NULL no tiene IA y queda inerte (el think
+    // pesado [char_vtbl+0x1D8]→0x5CE020 no tiene manager que procesar). Ver [DIAG-AITASK] en core.cpp.
+    int aiPackage     = 0x20;    // AITaskSytem* — char+0x20 (CONFIRMADO RE; cola jobs en +0x2E8/+0x2F0)
     int inventory     = 0x2E8;   // Inventory* (KServerMod verified)
     int stats         = 0x450;   // Stats base (KServerMod verified)
     int equipment     = -1;      // Equipment array (runtime probed)
     int currentTask   = -1;      // Current task type (not yet verified)
     int isAlive       = -1;      // Alive flag — use health chain fallback
-    int isPlayerControlled = -1; // Player-controlled flag (not yet verified)
+    // isPlayerControlled: -1 = pendiente, -2 = N/A (campo INEXISTENTE en Character).
+    // RE 2026-06-17 (KenshiLib Character.h + binario 1.0.68): Character NO tiene este
+    // campo. La distinción player/NPC se deriva por facción:
+    //   char.faction(+0x10) == gameWorld.player(+0x580).faction  (Character::isPlayerCharacter()).
+    // El probe diferencial quedó neutralizado en game_offset_prober.cpp.
+    int isPlayerControlled = -1; // Ver nota arriba — campo inexistente, se deriva por facción
 
     // Direct health offset (if scanner finds it; otherwise use chain below)
     int health            = -1;      // Direct offset to health array (use chain if -1)
@@ -53,12 +64,28 @@ struct CharacterOffsets {
     int moveSpeed     = -1;      // Offset to current move speed float (derived from physics)
     int animState     = -1;      // Offset to animation state index
 
-    // CE-verified health chain: character+2B8 -> +5F8 -> +40 = health[0]
-    // Each body part is +8 stride (health float + stun float per part)
-    int healthChain1  = 0x2B8;   // First pointer dereference offset
-    int healthChain2  = 0x5F8;   // Second pointer dereference offset
-    int healthBase    = 0x40;    // Final offset to health float
-    int healthStride  = 8;       // Stride between body parts (health+stun = 2 floats)
+    // ⚠ audit-02 (2026-06-18): cadena de salud PENDIENTE DE VERIFICAR para 1.0.68.
+    // La cadena CE +0x2B8 -> +0x5F8 -> +0x40 NO casa con el layout de KenshiLib:
+    //   - KenshiLib Character.h: +0x2B8 = CharacterMemory* _myMemory (NO inicio de salud).
+    //   - KenshiLib: 'MedicalSystem medical' es INLINE en Character+0x458.
+    //   - Dentro de MedicalSystem la salud por parte vive en un ogre_unordered_map 'status'(+0x8)
+    //     y/o en punteros leftLeg/rightLeg/leftArm/rightArm (+0x80..+0x98), cada uno -> HealthPartStatus.
+    //   - HealthPartStatus.flesh está en +0x40 (esto SÍ coincide con healthBase=+0x40).
+    // Es decir: el offset FINAL +0x40 es coherente (flesh), pero los dos saltos +0x2B8/+0x5F8
+    // probablemente sean de OTRA versión de Kenshi (las RVAs de KenshiLib no son 1.0.68 Steam).
+    // Por eso el /verify da FAIL en esta cadena: sigue _myMemory y lee un float arbitrario.
+    //
+    // NO se corrige a ciegas (sin el offset correcto verificado, cambiarlo rompería la lectura
+    // de salud si la cadena CE resultara válida en 1.0.68). PISTA para el RE futuro: la ruta
+    // correcta es Character+0x458 (medical inline) -> leftLeg/rightLeg/... (+0x80..) -> flesh(+0x40),
+    // o bien recorrer el hashmap 'status'. Verificar con CE en vivo sobre 1.0.68 Steam.
+    // Además la salud NO es un array plano indexable por part*8: cada HealthPartStatus es un
+    // objeto de 0x68 bytes (flesh@+0x40, fleshStun@+0x44), por lo que healthStride=8 tampoco
+    // aplica para iterar partes. PENDIENTE — ver audit-02 sección "Stats/CharStats / salud".
+    int healthChain1  = 0x2B8;   // [PENDIENTE 1.0.68] CE chain — no casa con KenshiLib (=_myMemory)
+    int healthChain2  = 0x5F8;   // [PENDIENTE 1.0.68] CE chain — sin verificar
+    int healthBase    = 0x40;    // Final offset a flesh (coincide con HealthPartStatus.flesh@+0x40)
+    int healthStride  = 8;       // [PENDIENTE] no aplica: HealthPartStatus es objeto de 0x68 B
 
     // Writable position chain (from KServerMod RE):
     // character -> AnimationClassHuman ptr (+animClassOffset)
@@ -96,11 +123,37 @@ struct WorldOffsets {
     int timeOfDay      = -1;     // On TimeManager (+0x08), NOT GameWorld — use time_hooks
     int gameSpeed      = 0x700;  // GameWorld+0x700 (KenshiLib verified)
     int weatherState   = -1;     // Not yet verified on GameWorld
-    int characterList  = 0x0888; // GameWorld+0x0888 characterArray (KenshiLib verified)
+    // ⚠ DEPRECADO: GameWorld+0x0888 NO es la lista de personajes en 1.0.68 — es
+    // 'mainUpdateListRemovalQueue' (cola de borrado, normalmente vacía). Leer aquí
+    // devolvía faction=0x0 y nombres basura. La lista real del jugador se obtiene
+    // ahora vía player(+0x580) -> PlayerInterface(+0x2B0 playerCharacters).
+    // Se conserva solo como ÚLTIMO fallback histórico.
+    int characterList  = 0x0888; // [DEPRECADO] removal queue, NO la lista de personajes
+    int player         = 0x0580; // GameWorld -> PlayerInterface* (KenshiLib GameWorld.h:137)
     int buildingList   = -1;     // Not yet verified
     int paused         = 0x08B9; // GameWorld+0x08B9 — bool paused flag (RE verified)
     int zoneManager    = 0x08B0; // GameWorld+0x08B0 (KenshiLib verified)
     int characterCount = -1;     // Derived from list (lektor length at +0x00)
+};
+
+// Offsets dentro de PlayerInterface (apuntado por GameWorld+0x580).
+// Verificados en KenshiLib Include/kenshi/PlayerInterface.h y Faction.h para v1.0.68.
+struct PlayerInterfaceOffsets {
+    int participant      = 0x02A0; // PlayerInterface -> participant (Faction*) — PlayerInterface.h:248
+    // ⚠ NUEVO (audit-09, confirmado RUNTIME 2026-06-18 + bytes): controlledChar es el char que
+    // el jugador REALMENTE controla (sobre el que el motor aplica las órdenes). Es DISTINTO de
+    // data[0] del lektor playerCharacters. Escrito por SetControlledChar (RVA 0x802520) como
+    // Faction(PI+0x2A0)+0x218[memberCount-1]; consumido en 0x50E9CF (mov rcx,[rcx+0x2A8]).
+    // El mod DEBE resolver el char primario por aquí, no por data[0] (que era 'Dani' != 'Sinnombre_0').
+    int controlledChar   = 0x02A8; // PlayerInterface -> controlledChar (Character*) — char activo real
+    int playerCharacters = 0x02B0; // PlayerInterface -> lektor<Character*> — PlayerInterface.h:250
+};
+
+// Offsets adicionales dentro de Faction (apuntado por participant / character.faction).
+// Verificados en KenshiLib Include/kenshi/Faction.h para v1.0.68.
+struct FactionExtraOffsets {
+    int nameStr   = 0x01A8; // Faction -> name (std::string) — Faction.h:147
+    int isPlayer  = 0x0250; // Faction -> isPlayer (PlayerInterface*) — Faction.h:158
 };
 
 struct BuildingOffsets {
@@ -119,41 +172,152 @@ struct BuildingOffsets {
 };
 
 struct InventoryOffsets {
-    int items          = 0x10;   // Item array pointer
-    int itemCount      = 0x18;   // Number of items (int)
+    int items          = 0x10;   // Item array pointer (lektor<Item*> _allItems — KenshiLib Inventory.h)
+    int itemCount      = 0x18;   // Number of items (int) — size del lektor en +0x18
     int width          = 0x20;   // Grid width
     int height         = 0x24;   // Grid height
-    int owner          = 0x28;   // Owner character/building pointer
+    // CORRECCIÓN audit-02 (2026-06-18): owner ERA +0x28 (INCORRECTO).
+    // KenshiLib Inventory.h confirma que el campo real 'owner' (RootObject*) está en +0x88
+    // (callbackObject vive en +0x80; owner en +0x88; totalWeight float en +0x90).
+    // El bug histórico de pickup/drop (pasar inventory* en vez del char* dueño) se arregla
+    // leyendo +0x88, no +0x28. Antes: 0x28 → ahora: 0x88.
+    int owner          = 0x88;   // Owner character/building pointer (RootObject*) — KenshiLib +0x88
     int maxStackMult   = 0x30;   // Stackable bonus multiplier
 };
 
 struct ItemOffsets {
-    int name           = 0x10;   // Item name string
-    int templateId     = 0x20;   // GameData template pointer
-    int stackCount     = 0x30;   // Number in stack (int)
-    int quality        = 0x38;   // Quality level (0-100)
-    int value          = 0x40;   // Monetary value (int)
-    int weight         = 0x48;   // Weight in kg (float)
-    int equipSlot      = 0x50;   // AttachSlot enum
-    int condition      = 0x58;   // Item condition / durability (float 0-1)
+    // ⚠ CORRECCIÓN audit-14 (2026-06-19): TODO ItemOffsets estaba ⛔ (offsets viejos 0x10-0x58).
+    // Item == InventoryItemBase (hereda RootObjectBase). Verificado contra KenshiLib Item.h
+    // (// 0xNN Member) + audit-12 (quality 0x11C, weight 0x120, quantity 0x12C en bytes).
+    // El bug histórico: templateId=0x20 caía DENTRO de std::string displayName (0x18..0x40),
+    // por lo que TryGetItemTemplateId enviaba BASURA por red (C2S_ItemPickup/Drop/Trade/Build).
+    //   Layout real (InventoryItemBase): displayName@0x18 · data(GameData* plantilla)@0x40 ·
+    //   slotType(AttachSlot)@0x110 · chargesLeft(float)@0x118 · quality(float)@0x11C ·
+    //   weight(float)@0x120 · quantity(int)@0x12C · itemWidth@0x130 · itemHeight@0x134.
+    int name           = 0x18;   // ✅ displayName (std::string, RootObjectBase) — era 0x10 (⛔)
+    int templateId     = 0x40;   // ✅ data (GameData* plantilla, RootObjectBase) — era 0x20 (⛔, caía en displayName)
+    int stackCount     = 0x12C;  // ✅ quantity (int) — era 0x30 (⛔)
+    int quality        = 0x11C;  // ✅ float quality (0-100) — era 0x38 (⛔)
+    int value          = -1;     // ⛔ NO existe plano (era 0x40 = data). El valor se calcula (getValueSingle RVA 0x7A7D30).
+    int weight         = 0x120;  // ✅ float weight (kg) — era 0x48 (⛔)
+    int equipSlot      = 0x110;  // ✅ AttachSlot slotType — era 0x50 (⛔)
+    int condition      = 0x118;  // ✅ chargesLeft (float) — era 0x58 (⛔, caía en handle de RootObjectBase)
 };
 
 struct FactionOffsets {
-    int id             = 0x08;   // Faction ID (used in 6+ files: entity_hooks, faction_hooks, etc.)
-    int name           = 0x10;   // Faction name string
-    int members        = 0x30;   // Member list pointer
-    int memberCount    = 0x38;   // Member count
-    int relations      = 0x50;   // Relations map pointer (faction->relation value)
-    int color1         = 0x80;   // Primary uniform color (uint32_t ARGB)
-    int color2         = 0x84;   // Secondary uniform color
-    int isPlayerFaction = 0x90;  // Is this the player's faction
-    int money          = 0xA0;   // Faction wealth (int)
+    // ⚠ CORRECCIÓN audit-02 (2026-06-18): id ERA +0x08 (INCORRECTO Y PELIGROSO).
+    // KenshiLib Faction.h confirma que en +0x08 está 'bool _antiSlavery', NO un id.
+    // Faction NO tiene ningún campo 'uint32 id' plano: el identificador estable de una
+    // facción es su 'name' (std::string @+0x1A8, ✅ confirmado) o su GameData* (data @+0x240,
+    // que expone el string-id usado por FactionManager::getFactionByStringID).
+    //
+    // Leer un bool en +0x08 y enviarlo como "factionId" de red producía ids basura (0/1) que
+    // colisionan entre todas las facciones → el matching cliente/servidor empareja facciones
+    // equivocadas o ninguna. Esto está LIGADO al bug conocido de facciones (enemigos huyen),
+    // porque C2S_FactionRelation no podía resolver los punteros correctos.
+    //
+    // Se pone a -1 (NO RESUELTO) en lugar de a otro offset a ciegas: NO existe un equivalente
+    // uint32 trivial. Todos los call-sites ya hacen fallback graceful con `if (fIdOff >= 0)`
+    // (faction_hooks, packet_handler, entity_hooks, player_controller, kenshi_sdk, core,
+    // builtin_commands) → con -1 dejan de enviar/leer basura. El fix REAL (identificar la
+    // facción por name/GameData en el protocolo) es trabajo de la cola de facciones (#4),
+    // no de este fix de offsets.  Antes: 0x08 → ahora: -1 (pendiente RE del identificador real).
+    int id             = -1;     // NO RESUELTO — +0x08 era _antiSlavery (bool), no un id. Ver nota.
+    int name           = 0x1A8;  // Faction name (std::string) — KenshiLib Faction.h:147, +0x1A8 ✅
+    // ⚠ audit-02: los offsets de abajo NO están confirmados contra KenshiLib (varios chocan:
+    // +0x30 = allowSlavesWeapons, +0x90 = dentro de tradeCulture). Se conservan sus valores
+    // por ahora porque NO se usan en rutas críticas, pero quedan marcados como dudosos.
+    int members        = 0x30;   // ❓ DUDOSO (KenshiLib: +0x30 = allowSlavesWeapons, no members)
+    int memberCount    = 0x38;   // ❓ DUDOSO (no confirmado)
+    // ✅ CONFIRMADOS (audit-09, bytes SetControlledChar 0x80267A/0x802683 + runtime 2026-06-18):
+    //   La lista REAL de miembros de la facción del jugador (de donde el motor saca controlledChar):
+    //     memberCountReal @+0x210 (uint32) ; memberArrayReal @+0x218 (Character**).
+    //   SetControlledChar elige memberArrayReal[memberCountReal-1] (ÚLTIMO miembro) y lo vuelca a
+    //   PlayerInterface+0x2A8. Usamos estos como FALLBACK al resolver el char primario del host.
+    int memberCountReal = 0x210; // Faction -> memberCount real (uint32) — confirmado RE
+    int memberArrayReal = 0x218; // Faction -> memberArray real (Character**) — confirmado RE
+    // ✅ CONFIRMADO (RE de bytes Steam 1.0.68, triple verificación 2026-06-19):
+    //   Faction+0x78 = FactionRelations* (boost::unordered_map<Faction*,RelationData>, NO MSVC-std).
+    //   La hostilidad la decide isEnemy 0x6B26D0 = (rel<=-30). ⚠ CORRECCIÓN audit-16 (2026-06-19):
+    //   0x6B2630 SÍ es FactionRelations::isAlly (TRUE=ALIADO; compara rel>=+50.0f .rdata 0x1683170 y
+    //   lee flag alliance@RelationData+0x0). audit-15 lo etiquetó AL REVÉS ("isEnemy enriquecida") →
+    //   el hook quedó invertido y SABOTEABA el ataque. El encolador de ataque 0x6744A0 llama a ESTA
+    //   isAlly (this=atacante->relations Faction+0x78) Y a Character::isAlly 0x7923D0 (char vt+0x3F0);
+    //   AMBOS deben dar FALSE (no-aliado) para que el ataque se encole. 0x7923D0 NO se hookea: delega
+    //   en 0x6B2630 tras sus checks propios. Es la función que se HOOKEA (polaridad isAlly corregida,
+    //   ver FIX-HOSTILITY-HOOK en core.cpp).
+    //   Layout boost real en FactionRelations: bucketCount @+0x38, SIZE @+0x40 (no +0x28),
+    //   buckets @+0x58, defaultRelation @+0x60 (float — el FIX clave), nodo: +0x10 key, +0x1C float.
+    //   Ver FactionRelationsOffsets para el detalle. Lo usa el FIX-HOSTILITY: en vez de iterar el
+    //   map (recorrido boost frágil), escribe FR+0x60 = -100.0 en las facciones "Player N" → el host
+    //   se vuelve enemigo de todo sin entry. SetControlledChar 0x802520 RESETEA este +0x78 al
+    //   ejecutarse, así que el FIX se aplica DESPUÉS del FIX-CONTROL.
+    int relations      = 0x78;   // ✅ FactionRelations* (Faction+0x78) — rango [-100,+100]
+    int color1         = 0x80;   // ❓ DUDOSO (KenshiLib: +0x80 = factionOwnerships*)
+    int color2         = 0x84;   // ❓ DUDOSO (no confirmado)
+    // ⚠ CORRECCIÓN audit-14 (2026-06-19): isPlayerFaction ERA 0x90 (⛔: +0x90 = TradeCulture
+    // inline, NO un flag de jugador → lecturas basura). El flag jugador REAL es el puntero
+    // PlayerInterface* en +0x250 (== isPlayerIface, abajo): != 0 ⇒ facción de jugador.
+    // IMPORTANTE: +0x250 es un PUNTERO (8 bytes), NO un bool. Los call-sites que lo consultan
+    // (FactionAccessor::IsPlayerFaction, SEH_CheckIsPlayerFaction en entity_hooks,
+    // player_controller) se actualizaron para leerlo como uintptr_t y comprobar != 0 — leerlo
+    // como bool de 1 byte daría falsos negativos (byte bajo del puntero == 0). Antes 0x90 (⛔).
+    int isPlayerFaction = 0x250; // ✅ = isPlayerIface (PlayerInterface*, != 0 ⇒ jugador) — era 0x90 (⛔)
+    int money          = 0xA0;   // ❓ DUDOSO (no confirmado)
+    // ✅ CONFIRMADOS (RE de bytes Steam 1.0.68, 2026-06-18) — usados por el FIX-HOSTILITY:
+    int isPlayerIface  = 0x250;  // PlayerInterface* (≠0 ⇒ facción de jugador). Distingue jugador vs mundo.
+    int data           = 0x240;  // GameData* (string-id estable del record FCS en GameData+0x58)
+    // relCount real del map de relaciones = *(uint32*)(faction + relations[0x78] + 0x28)
+};
+
+// ── FactionManager (instancia embebida en GameWorld+0x21345B8) — RE confirmado 2026-06-18 ──
+// Layout extraído de getFactionByStringID (RVA 0x2E7A20): array PLANO de Faction*, no lektor/vector.
+struct FactionManagerOffsets {
+    int factionCount   = 0x08;   // uint32 — nº de facciones cargadas
+    int factionArray   = 0x10;   // Faction** — array contiguo de punteros a Faction
+};
+
+// ── FactionRelations (boost::unordered_map<Faction*, RelationData>, en Faction+0x78) ──
+// ⚠ CORRECCIÓN CRÍTICA (RE de bytes Steam 1.0.68, triple verificación 2026-06-19):
+//   El map NO es un std::_Hash de MSVC (eso era una suposición ERRÓNEA del FIX previo, que por
+//   eso leía basura y NUNCA pobló nada). Es un boost::unordered::unordered_map clásico (closed
+//   addressing). Lo confirma OgreUnordered.h (ogre_unordered_map = boost::unordered) + el
+//   desensamblado de getRelationData (0x6B4C60) y find_or_insert (0x6B94F0).
+//
+//   Layout REAL de boost::table embebido en FactionRelations+0x20:
+//     FR+0x38 = bucket_count (size_t)        — leído como [this+0x38] en getRelationData
+//     FR+0x40 = element_count (size_t) = SIZE del map (relCount real, ANTES creíamos +0x28)
+//     FR+0x58 = buckets (node**)             — array de cabezas de bucket
+//   Nodo boost: +0x00 next, +0x08 hash, +0x10 key(Faction*), +0x18 RelationData{relation@+0x4}.
+//     → el float 'relation' que leen isEnemy/isAlly está en nodo+0x18+0x4 = nodo+0x1C.
+//
+//   CAMPO CLAVE para el FIX-HOSTILITY (verificado en isEnemy 0x6B26D0 e isAlly 0x6B2630):
+//     FR+0x60 = defaultFactionRelation (float). Cuando NO hay entry específica para 'other',
+//     isEnemy/isAlly leen ESTE float como la relación. Escribir FR+0x60 = -100.0 hace que
+//     isEnemy(faction, X)=true para CUALQUIER X sin entry → hostilidad global de la facción.
+//     Es la vía MÁS ROBUSTA (4 bytes atómicos, sin alocar, sin iterar el map boost, sin hook).
+struct FactionRelationsOffsets {
+    int bucketCount    = 0x38;   // boost: nº de buckets (size_t)
+    int size           = 0x40;   // boost: element_count = nº de entradas (relCount real) ⚠ era 0x28
+    int buckets        = 0x58;   // boost: node** array de cabezas de bucket
+    int defaultRelation = 0x60;  // ✅ float leído por isEnemy/isAlly cuando no hay entry (FIX clave)
+    // Nodo boost: +0x00 next, +0x08 hash, +0x10 key(Faction*), +0x18 RelationData (relation @+0x4).
+    int nodeNext       = 0x00;
+    int nodeKey        = 0x10;
+    int nodeRelation   = 0x1C;   // = nodo+0x18 (RelationData) + 0x4 (relation) — float que ve el motor
 };
 
 struct GameDataOffsets {
     int id             = 0x08;   // Template ID (uint32_t)
     int managerPtr     = 0x10;   // GameDataManager* backpointer
     int name           = 0x28;   // Template name (Kenshi std::string)
+    // ✅ CONFIRMADO (RE de bytes Steam 1.0.68, audit-15 2026-06-19, cruce con KenshiLib GameData.h):
+    //   GameData+0x58 = stringID (Kenshi std::string) = el ID ESTABLE del record FCS
+    //   (p.ej. "204-gamedata.base" para la facción del jugador vanilla 'Nameless').
+    //   ⚠ NO confundir con +0x28 (name, legible para humanos) ni con la vieja suposición +0x18.
+    //   Lo usa el hook del gate de combate (FIX-HOSTILITY-HOOK) para localizar la facción Nameless
+    //   por su stringID y heredar sus relaciones reales (vía Faction+0x240 → GameData+0x58).
+    int stringID       = 0x58;   // ✅ Kenshi std::string — string-id estable del record (getFactionByStringID)
 };
 
 struct TimeManagerOffsets {
@@ -194,16 +358,19 @@ struct StatsOffsets {
 
 // Combined offsets structure
 struct GameOffsets {
-    CharacterOffsets    character;
-    SquadOffsets        squad;
-    WorldOffsets        world;
-    BuildingOffsets     building;
-    InventoryOffsets    inventory;
-    ItemOffsets         item;
-    FactionOffsets      faction;
-    StatsOffsets        stats;
-    GameDataOffsets     gameData;
-    TimeManagerOffsets  timeManager;
+    CharacterOffsets        character;
+    SquadOffsets            squad;
+    WorldOffsets            world;
+    BuildingOffsets         building;
+    InventoryOffsets        inventory;
+    ItemOffsets             item;
+    FactionOffsets          faction;
+    PlayerInterfaceOffsets  playerInterface; // GameWorld+0x580 -> PlayerInterface
+    FactionExtraOffsets     factionExtra;    // name/isPlayer offsets dentro de Faction
+    FactionRelationsOffsets factionRelations;// boost::unordered_map en Faction+0x78 (size/default/nodo)
+    StatsOffsets            stats;
+    GameDataOffsets         gameData;
+    TimeManagerOffsets      timeManager;
 
     // Version string found in memory (for validation)
     char gameVersion[32] = {};
@@ -226,6 +393,54 @@ void SetResolvedPlayerBase(uintptr_t addr);
 uintptr_t GetResolvedGameWorld();
 void SetResolvedGameWorld(uintptr_t addr);
 
+// Getter DIRECTO de la facción del jugador, SIN iterar la lista de personajes.
+// Resuelve: GameWorld -> +0x580 (player/PlayerInterface*) -> +0x2A0 (participant) = Faction*.
+// Devuelve 0 si la cadena no es válida (cada paso se valida como puntero de heap).
+// Es la fuente PRIMARIA de facción: no depende de que la lista de personajes esté poblada.
+uintptr_t GetPlayerFactionDirect();
+
+// Getter DIRECTO del personaje PRIMARIO del jugador (el que controla), SIN iterar por nombre.
+// Resuelve: GameWorld -> +0x580 (player) -> +0x2B0 (playerCharacters lektor) -> data[0].
+// Devuelve 0 si la lista aún no está poblada (justo tras la carga) — reintentar por tick.
+// Vía ROBUSTA para el flujo connected-then-load (no depende del nombre "Player N").
+uintptr_t GetPlayerPrimaryCharacterDirect();
+
+// Resultado de FixCharacterFactionTo (ver abajo). Permite al orquestador decidir
+// cuándo dar por arreglado el char del host y dejar de reintentar.
+enum class FixFactionResult {
+    InvalidChar,      // char nulo / no alineado / vtable fuera del módulo
+    NoPlayerFaction,  // playerFaction no es un puntero de heap válido (no hay fuente)
+    AlreadyCorrect,   // char.faction(+0x10) ya == playerFaction (no se tocó nada)
+    Fixed,            // se escribió y la relectura confirma faction == playerFaction
+    WriteFailed,      // se escribió pero la relectura NO coincide (memoria protegida?)
+    Exception,        // SEH: el char se liberó o la memoria no es accesible
+};
+
+// ── FixCharacterFactionTo ──
+// Arregla la facción del personaje del HOST escribiendo la PLAYER faction válida en
+// char+0x10 si no coincide ya. Es la base del fix de combate: el motor reconoce al
+// jugador con char.faction(+0x10) == gameWorld.player(+0x580).faction. Si char+0x10
+// es NULL/incorrecta, el motor NO te trata como jugador y rechaza tus órdenes de ataque.
+//
+// 'playerFaction' debe venir de GetPlayerFactionDirect() (GameWorld+0x580 -> +0x2A0).
+// SEGURO para el host: la player faction vive toda la partida (no se descarga con
+// zonas), a diferencia de las facciones de NPC del caso remoto (que causaban UAF).
+// Protegido con SEH; loguea SIEMPRE [DIAG-FAC] con faction antes/después y si coincide.
+FixFactionResult FixCharacterFactionTo(void* charPtr, uintptr_t playerFaction);
+
+// VOLCADO DE DIAGNÓSTICO [DIAG] — SONDA v2, solo log, NO cambia comportamiento.
+// Resuelve gwObj (GameWorld) y pbObj (PlayerBase/PlayerInterface) y escanea EN RANGO:
+//   A) pbObj +0x00..+0x400 como Faction*; B) gwObj +0x400..+0xA00 (PlayerIface* y Faction*);
+//   C) char[0].faction (char+0x10, VERIFICADO) = facción del jugador con CERTEZA.
+// Filtra candidatos con un test de string LEGIBLE (>=3 chars, >=80% ASCII imprimible).
+// Loguea cada Faction* candidato en hex para cruzarlos. Máx 6 volcados globales.
+void DiagDumpPlayerFaction();
+
+// Bombea la sonda desde el game tick (OnGameTick). Throttle de 2s REALES (steady_clock).
+// Solo dispara cuando el PlayerBase resuelto es un puntero de heap válido (el player ya existe).
+// Llamar una vez por tick en AMBAS ramas de OnGameTick (sync + legacy).
+void DiagTickPump();
+
 // Loading state bridge: set by Core when entering/exiting Loading phase.
 // CharacterIterator checks this and skips game memory reads during loading
 // to prevent heap corruption from non-atomic lektor reads.
@@ -234,6 +449,14 @@ void SetGameLoadingState(bool loading);
 
 // SetPosition bridge: set by Core with the resolved CharacterSetPosition function ptr.
 void SetGameSetPositionFn(void* fn);
+
+// SetPaused bridge: set by Core con el puntero al setter OFICIAL GameWorld::setPaused
+// (RVA 0x787D40 en 1.0.68). Si está disponible, GameWorldAccessor::SetPaused lo invoca
+// en lugar de escribir GameWorld+0x8B9 a pelo — así refresca los caches de pausa de los
+// subsistemas (obj+0xB8), oculta el cartel "PAUSED" del HUD y emite "Resume_Game".
+// Esto arregla la "pausa fantasma" que bloqueaba las órdenes del jugador (atacar/hablar).
+void SetGameSetPausedFn(void* fn);
+bool HasGameSetPausedFn();
 
 // ── Deferred AnimClass Probing ──
 // Schedule a character for animClassOffset discovery on subsequent game ticks.
@@ -593,8 +816,29 @@ public:
     // Write game speed directly (for server sync)
     bool WriteGameSpeed(float speed);
 
+    // ── Pausa (GameWorld+0x8B9, bool de 1 byte — CONFIRMADO en KenshiLib GameWorld.h
+    //    y en el binario 1.0.68: isPaused @RVA 0xDEE00 hace movzx eax,[rcx+8B9h];
+    //    el game loop @RVA 0x788A00 hace cmp byte [rsi+8B9h],0 y, si está pausado,
+    //    fuerza el delta de simulación a 0 — congelando IA/combate/movimiento).
+    //    Estos métodos usan ResolveWorldObject() para manejar el layout de instancia
+    //    embebida de Steam 1.0.68 (NO se puede dereferenciar a ciegas el singleton). ──
+    // Devuelve: 1=pausado, 0=despausado, -1=desconocido (no se pudo resolver/leer).
+    int  GetPausedRaw() const;
+    // Escribe el flag paused. Devuelve true si la escritura tuvo éxito.
+    bool SetPaused(bool paused);
+    // Expone la dirección del OBJETO GameWorld real (instancia o *puntero), o 0.
+    // Útil para sondas de diagnóstico [DIAG] sin duplicar la lógica de resolución.
+    uintptr_t GetWorldObject() const { return ResolveWorldObject(); }
+
 private:
-    uintptr_t m_addr;  // Address of the GameWorld singleton pointer
+    uintptr_t m_addr;  // Direccion resuelta: puede ser la INSTANCIA GameWorld embebida
+                       // (1.0.68, m_addr ES el objeto) o un puntero clasico a GameWorld.
+
+    // Resuelve el OBJETO GameWorld real a partir de m_addr. Maneja ambos layouts:
+    //   - instancia embebida (1.0.68): *m_addr es la vtable (.text) -> el objeto es m_addr
+    //   - puntero clasico             : *m_addr es heap-ptr al objeto -> el objeto es *m_addr
+    // Devuelve 0 si no hay objeto valido. Definido en game_world.cpp.
+    uintptr_t ResolveWorldObject() const;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

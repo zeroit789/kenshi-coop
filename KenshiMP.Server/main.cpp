@@ -59,6 +59,9 @@ int main(int argc, char* argv[]) {
 
     // Create and start server
     kmp::GameServer server;
+    // Informar al server de la ruta de config para poder persistir cambios en caliente
+    // (p.ej. el comando 'factionmode' reescribe server.json).
+    server.SetConfigPath(configPath);
     if (!server.Start(config)) {
         spdlog::error("Failed to start server!");
         return 1;
@@ -89,6 +92,12 @@ int main(int argc, char* argv[]) {
                 std::cout << "  players - List connected players" << std::endl;
                 std::cout << "  kick <id> - Kick a player" << std::endl;
                 std::cout << "  say <msg> - Broadcast system message" << std::endl;
+                std::cout << "  speed <v> - Set global game speed (0-10, e.g. 'speed 2')" << std::endl;
+                std::cout << "  pause   - Pause the global world (sends speed=0 to clients)" << std::endl;
+                std::cout << "  resume  - Resume the global world at configured speed" << std::endl;
+                std::cout << "  factionmode <single|teams|per-player> - Change faction assignment mode (persists)" << std::endl;
+                std::cout << "  setfaction <playerId> <slot> - Assign a faction slot (1-6) to a connected player" << std::endl;
+                std::cout << "  factions - List faction slots from manifest and who owns each" << std::endl;
                 std::cout << "  save    - Save world state" << std::endl;
                 std::cout << "  stop    - Shutdown server" << std::endl;
             } else if (line == "status") {
@@ -106,6 +115,58 @@ int main(int argc, char* argv[]) {
                 } catch (...) {
                     std::cout << "Usage: kick <player_id>" << std::endl;
                 }
+            } else if (line.substr(0, 6) == "speed ") {
+                // Velocidad global autoritativa: la consola del server (host=admin) la fija.
+                // Se broadcastea a todos los clientes vía TimeSync.
+                try {
+                    float speed = std::stof(line.substr(6));
+                    if (server.SetGameSpeed(speed)) {
+                        std::cout << "Global game speed set to " << speed << "x" << std::endl;
+                    } else {
+                        std::cout << "Invalid speed. Range is 0-10 (e.g. 'speed 2')" << std::endl;
+                    }
+                } catch (...) {
+                    std::cout << "Usage: speed <value>  (0-10, e.g. 'speed 2' or 'speed 0.25')" << std::endl;
+                }
+            } else if (line == "pause") {
+                // Pausa global: el server envía speed=0 a todos los clientes.
+                server.PauseWorld();
+                std::cout << "World PAUSED (global)." << std::endl;
+            } else if (line == "resume") {
+                // Reanuda el mundo a la velocidad global configurada.
+                server.ResumeWorld();
+                std::cout << "World RESUMED at " << server.GetGameSpeed() << "x." << std::endl;
+            } else if (line.substr(0, 12) == "factionmode ") {
+                // Cambia el modo de facciones en caliente (single/teams/per-player) y lo persiste.
+                std::string mode = line.substr(12);
+                // Trim de espacios sobrantes al final por si el usuario teclea de más.
+                while (!mode.empty() && (mode.back() == ' ' || mode.back() == '\r'))
+                    mode.pop_back();
+                if (server.SetFactionMode(mode)) {
+                    std::cout << "Faction mode set to '" << mode << "' (saved to config)." << std::endl;
+                } else {
+                    std::cout << "Invalid mode. Use: single | teams | per-player" << std::endl;
+                }
+            } else if (line.substr(0, 11) == "setfaction ") {
+                // setfaction <playerId> <slot1-6>: asignación manual de facción a un jugador.
+                try {
+                    std::string args = line.substr(11);
+                    size_t sp = args.find(' ');
+                    if (sp == std::string::npos) throw std::invalid_argument("falta slot");
+                    uint32_t pid  = std::stoul(args.substr(0, sp));
+                    int      slot = std::stoi(args.substr(sp + 1));
+                    if (server.SetPlayerFaction(pid, slot)) {
+                        std::cout << "Player " << pid << " assigned to faction slot " << slot << "." << std::endl;
+                    } else {
+                        std::cout << "Failed: check that player " << pid
+                                  << " is connected and slot is in range." << std::endl;
+                    }
+                } catch (...) {
+                    std::cout << "Usage: setfaction <playerId> <slot>  (slot 1-6, e.g. 'setfaction 2 3')" << std::endl;
+                }
+            } else if (line == "factions") {
+                // Lista las facciones del manifiesto y qué jugador tiene cada una.
+                server.PrintFactions();
             } else if (!line.empty()) {
                 std::cout << "Unknown command. Type 'help' for commands." << std::endl;
             }

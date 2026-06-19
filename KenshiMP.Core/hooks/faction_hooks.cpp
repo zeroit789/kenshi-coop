@@ -72,19 +72,28 @@ static void __fastcall Hook_FactionRelation(void* factionA, void* factionB, floa
 // ── Install / Uninstall ──
 
 bool Install() {
-    auto& funcs = Core::Get().GetGameFunctions();
-    auto& hooks = HookManager::Get();
-
-    if (funcs.FactionRelation) {
-        if (hooks.InstallAt("FactionRelation", reinterpret_cast<uintptr_t>(funcs.FactionRelation),
-                            &Hook_FactionRelation, &s_origFactionRelation)) {
-            spdlog::info("faction_hooks: FactionRelation hook installed");
-            return true;
-        }
-    }
-
-    spdlog::warn("faction_hooks: No hooks installed (FactionRelation pattern not resolved)");
-    return false;
+    // ⚠ HOOK DESHABILITADO (RE de bytes Steam 1.0.68, 2026-06-18) ──────────────────────────
+    // El símbolo "FactionRelation" resuelve a RVA 0x872E00, que NO es el setter de relaciones
+    // de facción: es un LOGGER (función de traza). Hookearlo como si modificara relaciones era
+    // un anclaje INCORRECTO — nunca interceptó cambios de hostilidad reales. Además el handler
+    // enviaba C2S_FactionRelation con faction.id == -1 (offset no resuelto, ver FactionOffsets),
+    // o sea, ids basura.
+    //
+    // El setter REAL de relaciones es addRelation (RVA 0x6B2EA0, FactionRelations vtbl+0x20) y
+    // el getOrCreate getRelationEntry (RVA 0x6B4C60, vtbl+0x50). La causa del combate co-op
+    // congelado NO era un cambio de relación que hubiera que sincronizar, sino que las facciones
+    // "Player N" clonadas por ModGen nacen con el mapa de relaciones VACÍO (neutral con todos).
+    // Eso lo arregla el FIX-HOSTILITY en core.cpp (poblar el map en el hilo de lógica), no este
+    // hook. Por eso NO instalamos nada aquí: instalar un hook sobre un logger es inútil y arriesga
+    // un detour innecesario en un hot path de traza.
+    //
+    // El código de Hook_FactionRelation / SEH_FactionRelation se conserva (no se borra) por si en
+    // el futuro se localiza el setter REAL y se quiere sincronizar cambios de relación por red.
+    // Para reactivarlo: re-anclar el patrón al RVA correcto (addRelation 0x6B2EA0) y descomentar.
+    spdlog::info("faction_hooks: Install() NO-OP — 'FactionRelation' (0x872E00) es un LOGGER, no "
+                 "el setter de relaciones. La hostilidad la arregla el FIX-HOSTILITY en core.cpp.");
+    (void)&Hook_FactionRelation;  // silencia 'función sin usar' mientras el hook esté desactivado
+    return true;  // true: no es un fallo, es una decisión de diseño (no hay nada que instalar)
 }
 
 void Uninstall() {

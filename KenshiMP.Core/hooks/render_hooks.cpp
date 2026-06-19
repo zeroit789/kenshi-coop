@@ -347,6 +347,20 @@ static HRESULT __stdcall HookPresent(IDXGISwapChain* swapChain, UINT syncInterva
                     s_loadingSmoothStarted = false;
                     s_createsAtLoadingStart = entity_hooks::GetTotalCreates();
                     core.OnLoadingGapDetected();
+                } else if (phase == ClientPhase::Connected && !core.IsGameLoaded()) {
+                    // ⚠ FIX CRÍTICO (gameLoaded=false eterno): el jugador conectó DESDE EL
+                    // MENÚ (fase → Connected) y AHORA está cargando su save. Este gap >2s es
+                    // la carga de la partida, NO un zone-load. Antes caía en la rama
+                    // "no phase change" y la carga nunca se detectaba → m_gameLoaded eterno
+                    // en false. Lo tratamos como carga real: OnLoadingGapDetected() ahora
+                    // acepta Connected y transiciona a Loading, reactivando el smooth-frame
+                    // poll y los timeouts de PollForGameLoad. Al completar, OnGameLoaded()
+                    // ve m_connected==true y reanuda el sync con normalidad.
+                    spdlog::info("render_hooks: Save load detected ({} ms gap during Connected, "
+                                 "connected-then-load flow) — triggering load detection", gap.count());
+                    s_loadingSmoothStarted = false;
+                    s_createsAtLoadingStart = entity_hooks::GetTotalCreates();
+                    core.OnLoadingGapDetected();
                 } else if (phase == ClientPhase::Connected || phase == ClientPhase::GameReady) {
                     spdlog::info("render_hooks: Zone load gap detected ({} ms) during {} — no phase change",
                                  gap.count(), ClientPhaseToString(phase));

@@ -204,57 +204,31 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
 }
 
 // ── isPlayerControlled ──
-// Differential probe: compare a known player character with a known NPC.
-// The byte that is 1 on the player and 0 on the NPC is the flag.
-// This wraps the existing ProbePlayerControlledOffset logic with SEH.
+// HALLAZGO DE RE (KenshiLib Character.h + análisis del binario 1.0.68, 2026-06-17):
+//   La clase Character NO tiene ningún campo isPlayerControlled/playerControlled/
+//   isPlayer/controlledByPlayer. El motor distingue al personaje del jugador con un
+//   MÉTODO (Character::isPlayerCharacter()), derivado de la pertenencia a la facción
+//   del jugador: character.faction(+0x10) == gameWorld.player(+0x580).faction.
+//
+//   Por eso el antiguo probe diferencial (buscar un byte que valga 1 en el player y 0
+//   en el NPC en el rango 0x80..0x500) NUNCA podía acertar: estaba buscando un campo
+//   inexistente y siempre dejaba el offset en -1. Lo neutralizamos para no gastar ciclos
+//   ni generar falsas expectativas. La distinción player/NPC se hace por facción en la
+//   capa que lo necesita (ver derivación por facción en core.cpp / player_controller).
 static bool ProbeIsPlayerControlled(uintptr_t playerPtr, uintptr_t npcPtr) {
+    (void)playerPtr;
+    (void)npcPtr;
     if (s_probedIsPlayerCtrl) return false;
     s_probedIsPlayerCtrl = true;
 
+    // Marcamos el offset como "no aplica" (-2) para diferenciarlo de "pendiente" (-1)
+    // y dejar constancia en el log de que NO es un fallo de probe, sino que el campo
+    // no existe en la clase Character.
     auto& offsets = GetOffsets().character;
-    if (offsets.isPlayerControlled >= 0) return false; // Already known
-
-    if (playerPtr == 0 || npcPtr == 0) {
-        s_probedIsPlayerCtrl = false; // Need both — retry later
-        return false;
-    }
-
-    // Scan bytes in range 0x80..0x500 (past known pointer fields, before stats)
-    // Use wider range than the original to catch edge cases.
-    int candidateCount = 0;
-    int bestCandidate = -1;
-
-    for (int off = 0x80; off <= 0x500; off++) {
-        uint8_t playerVal = 0, npcVal = 0;
-        if (!SafeRead(playerPtr + off, playerVal)) continue;
-        if (!SafeRead(npcPtr + off, npcVal)) continue;
-
-        if (playerVal == 1 && npcVal == 0) {
-            // Cross-validate: neighboring bytes should be 0 on both sides
-            // (a standalone bool flag, not part of a multi-byte integer)
-            uint8_t playerPrev = 0xFF, playerNext = 0xFF;
-            uint8_t npcPrev = 0xFF, npcNext = 0xFF;
-            SafeRead(playerPtr + off - 1, playerPrev);
-            SafeRead(playerPtr + off + 1, playerNext);
-            SafeRead(npcPtr + off - 1, npcPrev);
-            SafeRead(npcPtr + off + 1, npcNext);
-
-            if (playerPrev == 0 && playerNext == 0 && npcPrev == 0 && npcNext == 0) {
-                candidateCount++;
-                if (bestCandidate < 0) bestCandidate = off;
-            }
-        }
-    }
-
-    if (bestCandidate >= 0) {
-        offsets.isPlayerControlled = bestCandidate;
-        spdlog::info("OffsetProber: Discovered isPlayerControlled = 0x{:X} "
-                     "({} total candidates, using first match)",
-                     bestCandidate, candidateCount);
-        return true;
-    }
-
-    spdlog::debug("OffsetProber: isPlayerControlled probe failed");
+    if (offsets.isPlayerControlled == -1) offsets.isPlayerControlled = -2; // -2 = N/A (campo inexistente)
+    spdlog::info("OffsetProber: isPlayerControlled — campo INEXISTENTE en Character "
+                 "(KenshiLib + RE 1.0.68). Se deriva por facción: char.faction == player.faction. "
+                 "Probe omitido (offset marcado N/A).");
     return false;
 }
 

@@ -35,6 +35,15 @@ struct ServerConfig {
     float       gameSpeed    = 1.0f;
     std::string masterServer = "162.248.94.149"; // Master server address
     uint16_t    masterPort   = 27801;            // Master server port
+    // Si es false (default), el server NO se registra en el master server.
+    // Para juego local/LAN no hace falta — evita el spam de reconexión al master.
+    bool        enableMasterServer = false;
+    // Modo de asignación de facciones:
+    //   "single"     = todos los jugadores comparten la facción slot 0 (co-op puro, estable HOY)
+    //   "teams"      = grupos comparten facción (slot = (id-1) / teamSize)
+    //   "per-player" = cada jugador su propia facción (slot = id-1, requiere maxPlayers <= nº facciones)
+    std::string factionMode  = "single";
+    int         teamSize     = 1;                // Para "teams": jugadores por equipo/facción
 
     bool Load(const std::string& path);
     bool Save(const std::string& path) const;

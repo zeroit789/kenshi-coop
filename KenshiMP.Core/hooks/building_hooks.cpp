@@ -138,15 +138,28 @@ static void __fastcall Hook_BuildingPlace(void* world, void* building, float x, 
     spdlog::info("building_hooks: BuildingPlace #{} (bld=0x{:X}, pos=[{:.1f},{:.1f},{:.1f}])",
                   s_placeCount, (uintptr_t)building, x, y, z);
 
-    // Extract templateId from building's GameData backpointer
+    // Extract templateId from building's GameData backpointer.
+    // ⚠ CORRECCIÓN audit-14 (2026-06-19):
+    //   • El GameData* del building está en +0x40 (RootObjectBase `GameData* data`), NO en +0x28.
+    //     +0x28 caía dentro de displayName/sections → puntero basura (Building hereda RootObjectBase
+    //     igual que Character: owner@0x10, displayName@0x18, data@0x40, pos@0x48).
+    //   • gameData+0x08 NO es un "templateId" entero: es `int validity` (KenshiLib GameData).
+    //     NO existe un id numérico plano en GameData+0x8. El identificador estable es el string-id
+    //     FCS (offset por confirmar con CE) o el propio puntero GameData. Como el protocolo aún
+    //     espera un uint32, enviamos los 4 bytes bajos del PUNTERO GameData (estable dentro de la
+    //     sesión: todos los edificios de la misma plantilla comparten el mismo GameData*) en vez
+    //     de `validity`. Es un id local consistente, NO portable entre máquinas (igual limitación
+    //     que ItemOffsets.templateId@0x40). Ver audit-14 §2.7/§2.11 y la cola de facciones (#4).
     uint32_t templateId = 0;
     uintptr_t bldPtr = reinterpret_cast<uintptr_t>(building);
     auto& bldOffsets = game::GetOffsets().building;
 
-    // GameData* is typically at +0x28 (same as character pattern)
+    // GameData* del building en +0x40 (data, RootObjectBase) — antes +0x28 (⛔ basura).
     uintptr_t gameData = 0;
-    if (Memory::Read(bldPtr + 0x28, gameData) && gameData != 0 && gameData > 0x10000) {
-        Memory::Read(gameData + 0x08, templateId);
+    if (Memory::Read(bldPtr + 0x40, gameData) && gameData != 0 && gameData > 0x10000) {
+        // Los 4 bytes bajos del puntero GameData como id local estable (gameData+0x08 era
+        // `validity`, no un id → no usar). Identificador consistente por-sesión, no portable.
+        templateId = static_cast<uint32_t>(gameData & 0xFFFFFFFF);
     }
 
     // Extract rotation from building struct (skip if offset unverified)

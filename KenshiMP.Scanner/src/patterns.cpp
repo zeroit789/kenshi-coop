@@ -440,6 +440,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
     // Game loop / Time
     tryPattern("GameFrameUpdate",      patterns::GAME_FRAME_UPDATE,      funcs.GameFrameUpdate);
     tryPattern("TimeUpdate",           patterns::TIME_UPDATE,            funcs.TimeUpdate);
+    tryPattern("SetPaused",            patterns::SET_PAUSED,             funcs.SetPaused);
 
     // Save/Load
     tryPattern("SaveGame",             patterns::SAVE_GAME,              funcs.SaveGame);
@@ -802,19 +803,105 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
 
     // GameWorld singleton: referenced by time/speed/world management functions.
     // Priority: 1) function disassembly, 2) string-xref, 3) hardcoded (GOG only)
+    // ── Helper: ¿es 'p' un puntero de heap válido del juego? ──
+    // Mismo criterio que isValidUserPtr + alineado a 8 + FUERA de la imagen del módulo.
+    // (Equivale a isValidHeapPtr de game_character.cpp, replicado aquí para el scanner.)
+    auto isHeapPtr = [&](uintptr_t p) -> bool {
+        if (!isValidUserPtr(p)) return false;
+        if ((p & 0x7) != 0) return false;              // objetos del juego alineados a 8
+        if (p >= base && p < base + moduleSize) return false; // heap, no imagen
+        return true;
+    };
+
+    // ── resolveGwObject (1.0.68: instancia embebida vs puntero clasico) ──
+    // CRITICO Steam 1.0.68: GameWorld NO es un puntero global (GameWorld* ou); es la INSTANCIA
+    // estatica embebida en .data. Por tanto el "candidato" base+0x2134110 ES directamente el
+    // objeto GameWorld (su primer qword es la vtable en .text), NO un puntero a el.
+    // Para ser robustos a version/plataforma, aceptamos AMBOS layouts:
+    //   (a) puntero clasico : *candidateAddr es un heap-ptr -> el OBJETO es *candidateAddr
+    //   (b) instancia directa: *candidateAddr es la vtable (.text) -> el OBJETO es candidateAddr
+    // Devuelve la direccion del OBJETO GameWorld resuelto, o 0 si no encaja ninguno.
+    uintptr_t textStart = base + 0x1000;
+    uintptr_t textEnd   = base + moduleSize;
+    auto resolveGwObject = [&](uintptr_t candidateAddr) -> uintptr_t {
+        if (candidateAddr == 0) return 0;
+        uintptr_t first = 0;
+        if (!Memory::Read(candidateAddr, first)) return 0;
+        if (first == 0) return 0; // Game not loaded — don't accept yet
+        // Caso (a): puntero clasico a un objeto de heap.
+        if (isHeapPtr(first)) {
+            uintptr_t vtable = 0;
+            if (Memory::Read(first, vtable) && vtable >= textStart && vtable < textEnd)
+                return first; // *candidateAddr es el objeto GameWorld (heap)
+        }
+        // Caso (b): instancia directa embebida — el primer qword YA es la vtable en .text.
+        if (first >= textStart && first < textEnd)
+            return candidateAddr; // candidateAddr ES el objeto GameWorld
+        return 0;
+    };
+
+    // ── validateGameWorld (Fix 3: validador de CADENA, robusto a la versión) ──
+    // El validador antiguo solo comprobaba "objeto de heap con vtable en .text" → daba
+    // FALSOS POSITIVOS (aceptaba cualquier objeto del juego). Ahora exigimos que el
+    // candidato sea realmente el GameWorld validando la cadena de 2-3 saltos que usa
+    // GetPlayerFactionDirect (offsets KenshiLib, Kenshi 1.0.68). El objeto GameWorld se
+    // resuelve con resolveGwObject (maneja instancia-directa vs puntero), luego:
+    //   player (PlayerInterface*)  = *(gwObj + 0x580) (GameWorld.h:137)
+    //   faction (Faction*)         = *(player + 0x2A0)(PlayerInterface.h:248)
+    //   name (std::string ASCII)   =   faction + 0x1A8(Faction.h:147)  [refuerzo opcional]
+    // Si la cadena no resuelve, NO es el GameWorld → se descarta el candidato. Esto deja
+    // que el escáner encuentre el GameWorld REAL aunque el RVA hardcodeado no sea exacto.
+    //
+    // IMPORTANTE — reintentable: esta lambda se evalúa por-candidato en cada pasada y NO
+    // cachea nada. Si en una carga temprana el player aún no existe, devuelve false sin
+    // marcar el candidato como inválido permanente; RetryGlobalDiscovery lo reintenta más
+    // tarde y entonces sí lo aceptará. No invalida para siempre.
     auto validateGameWorld = [&](uintptr_t candidateAddr) -> bool {
-        if (candidateAddr == 0) return false;
-        uintptr_t val = 0;
-        if (!Memory::Read(candidateAddr, val)) return false;
-        if (val == 0) return false; // Game not loaded — don't accept yet
-        if (!isValidUserPtr(val)) return false;
-        // MUST be outside module image — real game objects are heap-allocated
-        if (val >= base && val < base + moduleSize) return false;
-        uintptr_t vtable = 0;
-        if (!Memory::Read(val, vtable)) return false;
-        uintptr_t textStart = base + 0x1000;
-        uintptr_t textEnd = base + moduleSize;
-        if (vtable < textStart || vtable >= textEnd) return false;
+        // gwObj = objeto GameWorld real (instancia directa o *puntero). 0 = no encaja/aún null.
+        uintptr_t gwObj = resolveGwObject(candidateAddr);
+        if (gwObj == 0) return false;
+
+        // ── Salto 1: GameWorld + 0x580 -> player (PlayerInterface*) ──
+        uintptr_t player = 0;
+        if (!Memory::Read(gwObj + 0x580, player)) return false;
+        if (!isHeapPtr(player)) return false;
+
+        // ── Salto 2: player + 0x2A0 -> faction (Faction*) ──
+        uintptr_t faction = 0;
+        if (!Memory::Read(player + 0x2A0, faction)) return false;
+        if (!isHeapPtr(faction)) return false;
+
+        // ── Refuerzo opcional: el nombre en faction + 0x1A8 debe ser ASCII legible ──
+        // std::string MSVC x64: si capacidad <= 15 el texto está inline en +0x00;
+        // si no, el primer qword es el puntero al buffer en heap. Leemos hasta 8 bytes
+        // del comienzo del buffer y exigimos algún carácter ASCII imprimible. Si la
+        // lectura falla (carga muy temprana), NO invalidamos por ello: la cadena de 2
+        // saltos ya es muy específica del GameWorld real. Solo rechazamos si leemos
+        // basura binaria clara.
+        uintptr_t strField = faction + 0x1A8;
+        uintptr_t cap = 0;
+        Memory::Read(strField + 0x18, cap);            // capacity (uint64)
+        uintptr_t bufAddr = strField;                  // SSO: texto inline
+        if (cap > 15) {
+            uintptr_t heapBuf = 0;
+            if (Memory::Read(strField, heapBuf) && isValidUserPtr(heapBuf))
+                bufAddr = heapBuf;                      // texto en heap
+        }
+        // Leemos 8 bytes del comienzo del buffer (Memory::Read con T POD usa SEH).
+        struct Name8 { char c[8]; } name{};
+        if (Memory::Read(bufAddr, name)) {
+            int printable = 0, nonzero = 0;
+            for (char c : name.c) {
+                if (c == 0) break;
+                nonzero++;
+                if (static_cast<unsigned char>(c) >= 0x20 &&
+                    static_cast<unsigned char>(c) <= 0x7E) printable++;
+            }
+            // Si hay bytes pero <60% imprimibles, es basura → no es Faction.name real.
+            if (nonzero > 0 && printable * 100 < nonzero * 60) return false;
+        }
+
+        // Cadena de 2 saltos válida (y nombre no-basura): es el GameWorld REAL.
         return true;
     };
 
@@ -869,14 +956,19 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
-        // Method 3: Hardcoded GOG offset (last resort)
+        // Method 3: Hardcoded offset (last resort)
+        // RVA de la INSTANCIA GameWorld embebida en .data para Kenshi Steam 1.0.68.
+        // En 1.0.68 GameWorld NO es un puntero (GameWorld* ou) sino la instancia misma:
+        // base+0x2134110 ES el objeto (primer qword = vtable .text 0x1722608). validateGameWorld
+        // ya maneja ambos casos (instancia directa / puntero clasico). Verificado RTTI/xref.
+        // Historial: 0x2133040 (erroneo) -> 0x2131020 (era 1.0.65, NULL) -> 0x2134110 (1.0.68 OK).
         if (funcs.GameWorldSingleton == 0) {
-            uintptr_t hardcoded = base + 0x2133040;
+            uintptr_t hardcoded = base + 0x2134110;
             if (validateGameWorld(hardcoded)) {
                 uintptr_t val = 0;
                 Memory::Read(hardcoded, val);
                 funcs.GameWorldSingleton = hardcoded;
-                spdlog::info("ResolveGameFunctions: 'GameWorldSingleton' = 0x{:X} (hardcoded GOG, -> 0x{:X})",
+                spdlog::info("ResolveGameFunctions: 'GameWorldSingleton' = 0x{:X} (hardcoded embedded-instance 1.0.68, *addr=0x{:X})",
                              hardcoded, val);
             }
         }
@@ -968,6 +1060,67 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
         return (vtable >= textStart && vtable < textEnd);
     };
 
+    // ── isHeapPtr / validateGameWorldChain (Fix 3, también en el reintento post-carga) ──
+    // RetryGlobalDiscovery corre DESPUÉS de cargar la partida, cuando player/faction ya
+    // existen: es el mejor momento para exigir la cadena completa y DESCARTAR el falso
+    // positivo que el Pass 2 tentativo pudo dejar fijado. Misma cadena que
+    // GetPlayerFactionDirect: gwObj -> +0x580 (player) -> +0x2A0 (faction), nombre +0x1A8.
+    auto isHeapPtr = [&](uintptr_t p) -> bool {
+        if (!isValidUserPtr(p)) return false;
+        if ((p & 0x7) != 0) return false;
+        if (p >= base && p < base + moduleSize) return false;
+        return true;
+    };
+    // resolveGwObject: mismo criterio que en ResolveGameFunctions — acepta instancia
+    // embebida (1.0.68: *candidateAddr ES la vtable .text) o puntero clasico (*candidateAddr
+    // es heap-ptr al objeto). Devuelve la addr del OBJETO GameWorld, o 0 si no encaja.
+    uintptr_t textStart = base + 0x1000;
+    uintptr_t textEnd   = base + moduleSize;
+    auto resolveGwObject = [&](uintptr_t candidateAddr) -> uintptr_t {
+        if (candidateAddr == 0) return 0;
+        uintptr_t first = 0;
+        if (!Memory::Read(candidateAddr, first) || first == 0) return 0;
+        if (isHeapPtr(first)) { // caso (a): puntero clasico
+            uintptr_t vtable = 0;
+            if (Memory::Read(first, vtable) && vtable >= textStart && vtable < textEnd)
+                return first;
+        }
+        if (first >= textStart && first < textEnd) // caso (b): instancia directa
+            return candidateAddr;
+        return 0;
+    };
+    auto validateGameWorldChain = [&](uintptr_t candidateAddr) -> bool {
+        uintptr_t gwObj = resolveGwObject(candidateAddr);
+        if (gwObj == 0) return false;
+        // Salto 1: GameWorld + 0x580 -> player (PlayerInterface*)
+        uintptr_t player = 0;
+        if (!Memory::Read(gwObj + 0x580, player) || !isHeapPtr(player)) return false;
+        // Salto 2: player + 0x2A0 -> faction (Faction*)
+        uintptr_t faction = 0;
+        if (!Memory::Read(player + 0x2A0, faction) || !isHeapPtr(faction)) return false;
+        // Refuerzo opcional: nombre ASCII legible en faction + 0x1A8 (std::string MSVC).
+        uintptr_t strField = faction + 0x1A8;
+        uintptr_t cap = 0;
+        Memory::Read(strField + 0x18, cap);
+        uintptr_t bufAddr = strField;
+        if (cap > 15) {
+            uintptr_t heapBuf = 0;
+            if (Memory::Read(strField, heapBuf) && isValidUserPtr(heapBuf)) bufAddr = heapBuf;
+        }
+        struct Name8 { char c[8]; } name{};
+        if (Memory::Read(bufAddr, name)) {
+            int printable = 0, nonzero = 0;
+            for (char c : name.c) {
+                if (c == 0) break;
+                nonzero++;
+                if (static_cast<unsigned char>(c) >= 0x20 &&
+                    static_cast<unsigned char>(c) <= 0x7E) printable++;
+            }
+            if (nonzero > 0 && printable * 100 < nonzero * 60) return false;
+        }
+        return true;
+    };
+
     auto findGlobalInFunction = [&](uintptr_t funcAddr, int nth) -> uintptr_t {
         if (!funcAddr) return 0;
         // Use .pdata to determine function end (accurate), fallback to 4KB scan.
@@ -1051,10 +1204,30 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
     }
 
     // ── GameWorld retry ──
+    // Revalidamos con la CADENA (no solo vtable): si el Pass 2 tentativo fijó un falso
+    // positivo, aquí (ya cargada la partida) la cadena player/faction lo descarta y se
+    // vuelve a escanear para encontrar el GameWorld real.
     if (funcs.GameWorldSingleton != 0) {
-        if (validateGlobal(funcs.GameWorldSingleton)) {
-            // Already good
+        if (validateGameWorldChain(funcs.GameWorldSingleton)) {
+            // Already good — cadena player/faction válida
+        } else if (resolveGwObject(funcs.GameWorldSingleton) != 0) {
+            // ── FIX connected-then-load (entities=0 / tracked:0) ──────────────────────
+            // El candidato es ESTRUCTURALMENTE un GameWorld (instancia embebida con vtable
+            // en .text), pero la sub-cadena player/faction (GW+0x580 -> +0x2A0) AÚN no
+            // resuelve en este instante. Esto pasa en el flujo "connected-then-load":
+            // RetryGlobalDiscovery corre justo al terminar la carga, ANTES de que
+            // PlayerInterface/faction estén enlazados. ANTES borrábamos a 0 -> el bridge de
+            // GameWorld nunca se seteaba -> CharacterIterator Strategy 2 jamás corría ->
+            // entities=0 para siempre. Como la instancia embebida (base+0x2134110) NUNCA se
+            // mueve y su validez de vtable es estable, CONSERVAMOS el candidato. La cadena
+            // player/faction se revalida por-tick dentro de CharacterIterator y
+            // GetPlayerFactionDirect cuando ya esté poblada.
+            spdlog::warn("RetryGlobalDiscovery: GameWorld 0x{:X} con vtable válida pero cadena "
+                         "player/faction aún sin poblar — CONSERVANDO candidato (se revalida por tick)",
+                         funcs.GameWorldSingleton);
         } else {
+            spdlog::info("RetryGlobalDiscovery: GameWorld 0x{:X} no es instancia GameWorld — re-escaneando...",
+                         funcs.GameWorldSingleton);
             funcs.GameWorldSingleton = 0;
         }
     }
@@ -1073,7 +1246,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
             if (!gwFuncCandidates[fi]) continue;
             for (int nth = 0; nth < 16 && funcs.GameWorldSingleton == 0; nth++) {
                 uintptr_t candidate = findGlobalInFunction(gwFuncCandidates[fi], nth);
-                if (candidate && validateGlobal(candidate)) {
+                if (candidate && validateGameWorldChain(candidate)) {
                     uintptr_t val = 0;
                     Memory::Read(candidate, val);
                     funcs.GameWorldSingleton = candidate;
@@ -1092,7 +1265,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
                 for (int n = 0; n < 12 && funcs.GameWorldSingleton == 0; n++) {
                     uintptr_t globalAddr = rss.FindGlobalNearString(
                         worldAnchors[a], worldAnchorLens[a], n, true);
-                    if (globalAddr && validateGlobal(globalAddr)) {
+                    if (globalAddr && validateGameWorldChain(globalAddr)) {
                         uintptr_t val = 0;
                         Memory::Read(globalAddr, val);
                         funcs.GameWorldSingleton = globalAddr;

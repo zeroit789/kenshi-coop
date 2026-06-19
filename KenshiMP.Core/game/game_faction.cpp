@@ -45,9 +45,11 @@ bool FactionAccessor::IsPlayerFaction() const {
     auto& offsets = GetOffsets().faction;
     if (offsets.isPlayerFaction < 0) return false;
 
-    bool isPlayer = false;
-    Memory::Read(m_ptr + offsets.isPlayerFaction, isPlayer);
-    return isPlayer;
+    // audit-14: isPlayerFaction (0x250) es un PlayerInterface* (8 bytes), NO un bool.
+    // Una facción es de jugador si ese puntero != 0. Leer 1 byte daría falsos negativos.
+    uintptr_t playerIface = 0;
+    Memory::Read(m_ptr + offsets.isPlayerFaction, playerIface);
+    return playerIface != 0;
 }
 
 int FactionAccessor::GetMoney() const {

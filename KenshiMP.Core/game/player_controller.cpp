@@ -267,13 +267,15 @@ void PlayerController::OnGameWorldLoaded() {
         }
 
         // Check isPlayerFaction flag
+        // audit-14: isPlayerFaction (0x250) = PlayerInterface* (8 bytes), != 0 ⇒ jugador.
+        // Antes se leía como bool de 1 byte (offset 0x90 erróneo) → señal basura.
         bool isFlagged = false;
         {
             const int flagOff = game::GetOffsets().faction.isPlayerFaction;
             if (flagOff >= 0) {
-                bool flag = false;
-                Memory::Read(faction + flagOff, flag);
-                isFlagged = flag;
+                uintptr_t playerIface = 0;
+                Memory::Read(faction + flagOff, playerIface);
+                isFlagged = (playerIface != 0);
             }
         }
 

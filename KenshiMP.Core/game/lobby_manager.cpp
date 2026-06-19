@@ -7,6 +7,34 @@
 
 namespace kmp {
 
+// ══════════════════════════════════════════════════════════════════════════════════════
+//  TOGGLE MAESTRO — Modo CO-OP (no parchear la facción del jugador)  [Fase 4 — combate]
+// ══════════════════════════════════════════════════════════════════════════════════════
+// CONTEXTO (RE + runtime, 2026-06-18): el combate del host estaba ROTO porque ApplyFactionPatch
+// reescribe el literal .rdata "204-gamedata.base" (facción vanilla "Nameless", hacia la que
+// TODO el mundo tiene cableadas sus relaciones de hostilidad) por "10-kenshi-online.mod"
+// (facción "Player N", clon de ModGen SIN relaciones declaradas). Resultado: el jugador se muda
+// a una facción HUÉRFANA → neutral con todos → ni ataca ni le atacan (combate PvE muerto).
+//
+// OPCIÓN C (la elegida para CO-OP cooperativo de Zero): NO parchear → el jugador permanece en
+// "Nameless" (204-gamedata.base), que YA tiene toda la red de relaciones del mundo → combate
+// PvE restaurado al instante. Coste: todos los jugadores comparten Nameless (aliados, sin PvP).
+//
+// SEGURIDAD del modo co-op (verificado en el código del mod, 2026-06-18):
+//   - La identificación del char del HOST NO depende del nombre "Player N": usa la cadena directa
+//     del motor (GetPlayerPrimaryCharacterDirect, GW+0x580->+0x2B0->data[0]) + GetPlayerFactionDirect
+//     (GW+0x580->+0x2A0), que ya resuelve "Nameless" correctamente. Por tanto, para 1 jugador host
+//     es 100% seguro NO parchear.
+//   - ⚠ Para 2+ jugadores SÍ rompe: la vinculación de remotos (FindModCharacterBySlot) busca
+//     "Player N" por nombre, que solo existe si se parchea. El co-op multijugador real necesita
+//     OPCIÓN A (mantener Player N + copiar relaciones de Nameless en runtime, FIX-HOSTILITY en
+//     core.cpp ya corregido a nodo+0x1C). Para activar PvP: poner kCoopNoFactionPatch = false.
+//
+// PALANCA: kCoopNoFactionPatch
+//   true  → modo CO-OP: NO se parchea, host en Nameless, combate PvE nativo. (DEFAULT para Zero)
+//   false → modo Player N (PvP/facciones separadas): se parchea como antes; requiere la Opción A.
+static constexpr bool kCoopNoFactionPatch = true;
+
 void LobbyManager::OnFactionAssigned(const std::string& factionString, int playerSlot) {
     m_factionString = factionString;
     m_playerSlot = playerSlot;
@@ -88,9 +116,30 @@ uintptr_t LobbyManager::FindFactionStringAddress() {
 }
 
 bool LobbyManager::ApplyFactionPatch() {
+    // ── Modo CO-OP (Opción C): NO parchear → jugador permanece en "Nameless" (combate PvE) ──
+    // Palanca maestra del lado cliente: ignora la factionString asignada por el server y NO
+    // escribe nada en .rdata. Devuelve true (NO es un error: es la decisión de diseño co-op),
+    // para que los logs/HUD no muestren fallo. Cubre AMBOS call sites (core.cpp:1329 pre-carga
+    // y packet_handler.cpp:1849 al recibir la asignación), porque el no-op vive aquí dentro.
+    if (kCoopNoFactionPatch) {
+        spdlog::info("LobbyManager: modo CO-OP activo (kCoopNoFactionPatch) → NO se parchea la "
+                     "facción. El jugador permanece en 'Nameless' (204-gamedata.base), que conserva "
+                     "la red de relaciones del mundo → combate PvE nativo. (factionString asignada "
+                     "ignorada: '{}')", m_factionString);
+        return true;
+    }
+
     if (!m_hasAssignment || m_factionString.empty()) {
         spdlog::warn("LobbyManager: No faction assigned, cannot patch");
         return false;
+    }
+
+    // ── Defensa extra: si la facción asignada YA es "Nameless" (204-gamedata.base), no hay nada
+    //    que parchear (parcharía el string sobre sí mismo). No-op natural, evita un write inútil.
+    if (m_factionString == "204-gamedata.base") {
+        spdlog::info("LobbyManager: facción asignada ya es 'Nameless' (204-gamedata.base) → no-op "
+                     "(el jugador ya está en la facción con relaciones del mundo).");
+        return true;
     }
 
     uintptr_t addr = FindFactionStringAddress();

@@ -579,7 +579,8 @@ static uint32_t SEH_ReadEquipmentSlot(void* gameObj, EquipSlot slot) {
         game::CharacterAccessor accessor(gameObj);
         uintptr_t itemPtr = accessor.GetEquipmentSlot(slot);
         if (itemPtr == 0) return 0;
-        // Read template ID from item pointer (ItemOffsets::templateId = 0x20)
+        // Read template ID from item pointer (ItemOffsets::templateId = 0x40 = data/GameData*,
+        // corregido en audit-14; antes 0x20 caía dentro de displayName → basura).
         static const game::ItemOffsets itemOffsets;
         Memory::Read(itemPtr + itemOffsets.templateId, result);
     } __except (EXCEPTION_EXECUTE_HANDLER) {

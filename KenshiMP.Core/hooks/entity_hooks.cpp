@@ -231,9 +231,11 @@ static bool SEH_CheckIsPlayerFaction(uintptr_t factionPtr) {
     __try {
         const int flagOff = game::GetOffsets().faction.isPlayerFaction;
         if (flagOff < 0) return false;
-        bool isPlayer = false;
-        Memory::Read(factionPtr + flagOff, isPlayer);
-        return isPlayer;
+        // audit-14: isPlayerFaction (0x250) = PlayerInterface* (8 bytes), != 0 ⇒ jugador.
+        // Antes se leía como bool de 1 byte (offset 0x90 erróneo) → señal basura.
+        uintptr_t playerIface = 0;
+        Memory::Read(factionPtr + flagOff, playerIface);
+        return playerIface != 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }

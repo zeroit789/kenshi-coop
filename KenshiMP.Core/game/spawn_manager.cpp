@@ -538,17 +538,32 @@ void SpawnManager::ScanGameDataHeap() {
         auto& core = Core::Get();
         uintptr_t gwAddr = core.GetGameFunctions().GameWorldSingleton;
         if (gwAddr != 0) {
-            uintptr_t gwPtr = 0;
-            if (Memory::Read(gwAddr, gwPtr) && gwPtr != 0 &&
-                !(gwPtr >= moduleBase && gwPtr < moduleBase + moduleSize)) {
+            // CRITICO 1.0.68: GameWorld es una INSTANCIA embebida, NO un puntero. Resolvemos
+            // el OBJETO GameWorld real manejando ambos layouts:
+            //   (a) puntero clasico  : *gwAddr es heap-ptr (fuera del modulo) -> ese es el objeto
+            //   (b) instancia directa: *gwAddr es la vtable (.text, dentro del modulo) -> el
+            //                          objeto es gwAddr mismo
+            uintptr_t first = 0;
+            uintptr_t gwObj = 0;
+            if (Memory::Read(gwAddr, first) && first != 0) {
+                uintptr_t textStart = moduleBase + 0x1000;
+                uintptr_t textEnd   = moduleBase + moduleSize;
+                if (first >= textStart && first < textEnd) {
+                    gwObj = gwAddr;             // (b) instancia directa
+                } else if (first > 0x10000 && first < 0x00007FFFFFFFFFFF &&
+                           !(first >= moduleBase && first < moduleBase + moduleSize)) {
+                    gwObj = first;              // (a) puntero clasico a objeto de heap
+                }
+            }
+            if (gwObj != 0) {
                 // GameWorld+0x20 = dataMgr1 (KenshiLib verified)
                 uintptr_t val = 0;
-                if (Memory::Read(gwPtr + 0x20, val) && val != 0 &&
+                if (Memory::Read(gwObj + 0x20, val) && val != 0 &&
                     val > 0x10000 && val < 0x00007FFFFFFFFFFF &&
                     !(val >= moduleBase && val < moduleBase + moduleSize)) {
                     gdmValue = val;
-                    gdmAddress = gwPtr + 0x20;
-                    spdlog::info("SpawnManager: GameDataManager found via GameWorld+0x20 = 0x{:X}", val);
+                    gdmAddress = gwObj + 0x20;
+                    spdlog::info("SpawnManager: GameDataManager found via GameWorld+0x20 = 0x{:X} (gwObj=0x{:X})", val, gwObj);
                 }
             }
         }

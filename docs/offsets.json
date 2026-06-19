@@ -24,7 +24,9 @@
       "chain": "char+0x2B8 -> +0x5F8 -> +0x40",
       "stride": 8,
       "type": "float health + float stun per body part",
-      "source": "CE verified"
+      "source": "CE verified (PENDIENTE 1.0.68)",
+      "verified": false,
+      "audit_02_note": "La cadena CE NO casa con KenshiLib 1.0.68: Character+0x2B8 = CharacterMemory* _myMemory (no salud); 'MedicalSystem medical' es INLINE en Character+0x458; la salud por parte vive en un ogre_unordered_map 'status'(+0x8) y/o en punteros leftLeg/rightLeg/leftArm/rightArm (+0x80..+0x98) -> HealthPartStatus, con flesh@+0x40 (de ahí que el offset FINAL +0x40 sí coincida). El /verify da FAIL porque sigue _myMemory. NO corregido a ciegas (sin offset verificado). Ruta probable a verificar con CE en vivo: medical@+0x458 -> leftLeg/...@+0x80 -> flesh@+0x40."
     },
     "money": {
       "chain": "char+0x298 -> +0x78 -> +0x88",
@@ -63,18 +65,19 @@
     "isConstructed":   { "offset": "0x114",  "type": "bool" }
   },
   "inventory_offsets": {
-    "items":           { "offset": "0x10",   "type": "Item* array" },
-    "itemCount":       { "offset": "0x18",   "type": "int" },
+    "items":           { "offset": "0x10",   "type": "lektor<Item*> _allItems" },
+    "itemCount":       { "offset": "0x18",   "type": "int (size del lektor)" },
     "width":           { "offset": "0x20",   "type": "int" },
-    "height":          { "offset": "0x24",   "type": "int" }
+    "height":          { "offset": "0x24",   "type": "int" },
+    "owner":           { "offset": "0x88",   "type": "RootObject*",     "source": "KenshiLib Inventory.h", "verified": true, "audit_02_note": "CORREGIDO: el owner real es +0x88 (callbackObject@+0x80, owner@+0x88, totalWeight@+0x90). Antes el código/doc decía +0x28 (INCORRECTO)." }
   },
   "faction_offsets": {
-    "name":            { "offset": "0x10",   "type": "std::string" },
-    "factionId":       { "offset": "0x08",   "type": "uint32",        "source": "faction_hooks.cpp reads at +0x08" },
-    "members":         { "offset": "0x30",   "type": "ptr array" },
-    "relations":       { "offset": "0x50",   "type": "map ptr" },
-    "isPlayerFaction": { "offset": "0x90",   "type": "bool" },
-    "money":           { "offset": "0xA0",   "type": "int" }
+    "name":            { "offset": "0x1A8",  "type": "std::string",   "source": "KenshiLib Faction.h:147", "verified": true },
+    "factionId":       { "offset": "-1",     "type": "NO RESUELTO",   "source": "audit-02", "verified": false, "audit_02_note": "+0x08 era _antiSlavery (bool), NO un id. Faction NO tiene campo 'uint32 id' plano. Identificar facción por name(+0x1A8) o GameData(data@+0x240, getFactionByStringID). Puesto a -1 para que los call-sites hagan fallback graceful (if fIdOff>=0) en vez de enviar un bool basura como id de red. LIGADO al bug de facciones (enemigos huyen). Fix real = cola de facciones #4." },
+    "members":         { "offset": "0x30",   "type": "ptr array", "verified": false, "audit_02_note": "DUDOSO: KenshiLib +0x30 = allowSlavesWeapons" },
+    "relations":       { "offset": "0x78",   "type": "FactionRelations*", "verified": true, "audit_14_note": "CORREGIDO 0x50 -> 0x78 (sincronizado con game_types.h). Faction+0x78 = FactionRelations* (KenshiLib Faction.h:128). El 0x50 anterior era basura. Load-bearing para el FIX-HOSTILITY (defaultRelation FR+0x60)." },
+    "isPlayerFaction": { "offset": "0x90",   "type": "bool",      "verified": false, "audit_02_note": "DUDOSO: KenshiLib isPlayer* real en +0x250" },
+    "money":           { "offset": "0xA0",   "type": "int",       "verified": false, "audit_02_note": "DUDOSO: no confirmado" }
   },
   "stats_offsets": {
     "meleeAttack":     "0x00", "meleeDefence": "0x04", "dodge": "0x08",
@@ -88,7 +91,7 @@
   },
   "singletons": {
     "PlayerBase":         { "rva": "0x01AC8A90", "source": "pattern scanner" },
-    "GameWorldSingleton": { "rva": "0x02133040", "source": "pattern scanner" }
+    "GameWorldSingleton": { "rva": "0x02134110", "source": "INSTANCIA GameWorld embebida en .data, Steam 1.0.68 (verificado RTTI/ctor/dtor/513 xrefs). NO es puntero: base+0x2134110 ES el objeto, su primer qword es la vtable .text 0x1722608. Historial: 0x02131020 era de 1.0.65 -> daba NULL", "is_embedded_instance": true, "vtable_rva": "0x1722608" }
   },
   "string_layout": {
     "type": "MSVC x64 std::string",

@@ -21,6 +21,7 @@
 #include <spdlog/spdlog.h>
 #include <cmath>
 #include <unordered_set>
+#include <array>  // FIX CRASH 2º JUGADOR: capturar healthData[7] por VALOR en la lambda del CommandQueue
 
 namespace kmp {
 
@@ -704,36 +705,72 @@ private:
                     }
                 }
 
-                // 2. Rename to player's display name + track in PlayerController
-                if (!SEH_OnRemoteCharSpawned(entityId, existingChar, ownerId)) {
-                    spdlog::warn("PacketHandler: OnRemoteCharacterSpawned failed for linked mod char entity {}", entityId);
-                }
-                // Safe to write GameData template name — mod characters have unique per-slot templates
-                core.GetPlayerController().WriteGameDataNameForModLink(existingChar, ownerId);
+                // ── FIX CRASH 2º JUGADOR: migración a GameCommandQueue ──
+                // Antes, los puntos 2,3,4,6 tocaban memoria del motor / llamaban
+                // funciones nativas DIRECTAMENTE desde el hilo de RED mientras el
+                // hilo de render usaba esa misma memoria -> data race -> crash.
+                // Ahora se encolan en UN solo Push que el game thread drena en
+                // core.cpp:6680. Captura SIEMPRE por VALOR: el frame de red ya
+                // ha muerto cuando el comando se ejecuta en el game thread.
 
-                // 3. Schedule deferred AnimClass probe for animation pipeline
-                if (!SEH_ScheduleAnimProbe(existingChar)) {
-                    spdlog::warn("PacketHandler: AnimClassProbe failed for linked mod char entity {}", entityId);
-                }
+                // El array C float[7] no es capturable por valor en una lambda,
+                // así que lo copiamos a un std::array (sí capturable).
+                std::array<float, 7> healthCopy{};
+                for (int i = 0; i < 7; i++) healthCopy[i] = healthData[i];
 
-                // 4. Apply extended health state from server (per-limb health + alive flag)
-                if (hasExtended && core.IsGameLoaded()) {
+                // 4a. Actualizar registry con la salud (registry tiene su propio
+                //     lock interno -> seguro en hilo de red, queda FUERA del Push).
+                if (hasExtended) {
                     registry.UpdateLimbHealth(entityId, healthData);
-                    if (!SEH_WriteLimbHealthToChar(existingChar, healthData)) {
-                        spdlog::warn("PacketHandler: Health write failed for linked mod char entity {}", entityId);
-                    }
                 }
 
-                // 5. Create VisualProxy for state tracking + future rendering
+                // Encolar TODO el trabajo que toca memoria del motor / nativo.
+                core.GetCommandQueue().Push({[existingChar, entityId, ownerId, healthCopy, hasExtended]() {
+                    auto& core = Core::Get();
+                    auto& registry = core.GetEntityRegistry();
+
+                    // REVALIDAR dentro del game thread: el juego pudo descargarse,
+                    // desconectarse o el char pudo re-vincularse a otra entidad
+                    // entre el encolado (hilo red) y el drenaje (hilo juego).
+                    if (!core.IsGameLoaded() ||
+                        core.GetClientPhase() < ClientPhase::GameReady ||
+                        registry.GetNetId(existingChar) != entityId) {
+                        spdlog::warn("PacketHandler: Spawn-init cmd descartado (revalidación falló) entity {}", entityId);
+                        return;
+                    }
+
+                    // 2. Renombrar al nombre del jugador + track en PlayerController
+                    if (!SEH_OnRemoteCharSpawned(entityId, existingChar, ownerId)) {
+                        spdlog::warn("PacketHandler: OnRemoteCharacterSpawned failed for linked mod char entity {}", entityId);
+                    }
+                    // Escribir nombre de plantilla GameData (chars mod tienen plantilla única por slot)
+                    core.GetPlayerController().WriteGameDataNameForModLink(existingChar, ownerId);
+
+                    // 3. Programar la sonda diferida de AnimClass (pipeline de animación)
+                    if (!SEH_ScheduleAnimProbe(existingChar)) {
+                        spdlog::warn("PacketHandler: AnimClassProbe failed for linked mod char entity {}", entityId);
+                    }
+
+                    // 4b. Escribir salud por miembro a la memoria del char
+                    if (hasExtended) {
+                        if (!SEH_WriteLimbHealthToChar(existingChar, healthCopy.data())) {
+                            spdlog::warn("PacketHandler: Health write failed for linked mod char entity {}", entityId);
+                        }
+                    }
+
+                    // 6. SEH_AllyModFaction DESACTIVADO — es el faction-UAF (game+0x927E94),
+                    //    el gatillo más letal del crash del 2º jugador. El char remoto
+                    //    queda con su facción de fábrica (nameplate neutral, cosmético).
+                    // SEH_AllyModFaction(existingChar);  // <-- NO LLAMAR
+                }});
+
+                // 5. Crear VisualProxy (tiene su propio estado, hilo de red OK -> FUERA del Push)
                 {
                     auto* rp = core.GetPlayerController().GetRemotePlayer(ownerId);
                     std::string displayName = rp ? rp->playerName : ("Player " + std::to_string(ownerId));
                     core.GetVisualProxy().CreateProxy(entityId, ownerId, displayName,
                         "", spawnPos, rot);
                 }
-
-                // 6. Set mod faction relation to allied (green nameplate instead of neutral)
-                SEH_AllyModFaction(existingChar);
 
                 linkedExisting = true;
                 spdlog::info("PacketHandler: LINKED existing mod character 'Player {}' "
@@ -1900,28 +1937,57 @@ void ProcessDeferredSpawn(const DeferredSpawn& ds) {
         registry.UpdatePosition(ds.entityId, spawnPos);
         ai_hooks::MarkRemoteControlled(existingChar);
 
-        // Apply position, health, etc. (same as HandleEntitySpawn)
-        if (core.IsGameLoaded() && (spawnPos.x != 0.f || spawnPos.y != 0.f || spawnPos.z != 0.f)) {
-            core.GetCommandQueue().Push({[existingChar, spawnPos, ds]() {
-                auto& core = Core::Get();
-                if (core.IsGameLoaded() && core.GetClientPhase() >= ClientPhase::GameReady) {
-                    if (!SEH_WritePositionToChar(existingChar, spawnPos.x, spawnPos.y, spawnPos.z)) {
-                        spdlog::warn("ProcessDeferredSpawn: WritePosition failed for entity {}", ds.entityId);
-                    }
+        // ── FIX CRASH 2º JUGADOR: mismo bug que HandleEntitySpawn ──
+        // Las llamadas SEH (OnRemoteCharSpawned, WriteGameDataName, AnimProbe,
+        // WriteLimbHealth) tocaban memoria del motor DIRECTAMENTE desde el hilo
+        // de red. Ahora todo va en UN solo Push drenado por el game thread, con
+        // captura por VALOR y revalidación dentro del lambda.
+
+        // Copiar salud a std::array (capturable por valor; ds.health es C-array).
+        std::array<float, 7> healthCopy{};
+        for (int i = 0; i < 7; i++) healthCopy[i] = ds.health[i];
+
+        const EntityID dsEntityId  = ds.entityId;
+        const PlayerID dsOwnerId   = ds.ownerId;
+        const bool     dsHasHealth = ds.hasExtendedHealth;
+
+        // Actualizar registry (lock interno propio -> seguro en hilo de red).
+        if (dsHasHealth) {
+            registry.UpdateLimbHealth(dsEntityId, ds.health);
+        }
+
+        // Posición + inicialización completa en UN solo comando de game thread.
+        core.GetCommandQueue().Push({[existingChar, spawnPos, dsEntityId, dsOwnerId,
+                                      healthCopy, dsHasHealth]() {
+            auto& core = Core::Get();
+            auto& registry = core.GetEntityRegistry();
+
+            // REVALIDAR en el game thread (ver HandleEntitySpawn).
+            if (!core.IsGameLoaded() ||
+                core.GetClientPhase() < ClientPhase::GameReady ||
+                registry.GetNetId(existingChar) != dsEntityId) {
+                spdlog::warn("ProcessDeferredSpawn: cmd descartado (revalidación falló) entity {}", dsEntityId);
+                return;
+            }
+
+            if (spawnPos.x != 0.f || spawnPos.y != 0.f || spawnPos.z != 0.f) {
+                if (!SEH_WritePositionToChar(existingChar, spawnPos.x, spawnPos.y, spawnPos.z)) {
+                    spdlog::warn("ProcessDeferredSpawn: WritePosition failed for entity {}", dsEntityId);
                 }
-            }});
-        }
+            }
 
-        SEH_OnRemoteCharSpawned(ds.entityId, existingChar, ds.ownerId);
-        core.GetPlayerController().WriteGameDataNameForModLink(existingChar, ds.ownerId);
-        SEH_ScheduleAnimProbe(existingChar);
+            SEH_OnRemoteCharSpawned(dsEntityId, existingChar, dsOwnerId);
+            core.GetPlayerController().WriteGameDataNameForModLink(existingChar, dsOwnerId);
+            SEH_ScheduleAnimProbe(existingChar);
 
-        if (ds.hasExtendedHealth && core.IsGameLoaded()) {
-            registry.UpdateLimbHealth(ds.entityId, ds.health);
-            SEH_WriteLimbHealthToChar(existingChar, ds.health);
-        }
+            if (dsHasHealth) {
+                SEH_WriteLimbHealthToChar(existingChar, healthCopy.data());
+            }
 
-        spdlog::info("ProcessDeferredSpawn: Linked mod character for entity {}", ds.entityId);
+            // SEH_AllyModFaction DESACTIVADO (faction-UAF). No se llama aquí.
+        }});
+
+        spdlog::info("ProcessDeferredSpawn: Linked mod character for entity {}", dsEntityId);
     } else {
         // Fallback to factory spawn
         SpawnRequest req;

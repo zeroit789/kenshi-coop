@@ -37,6 +37,10 @@ static void* s_otherCharPtr = nullptr;
 static bool s_initialized = false;
 static bool s_ownFound = false;
 static bool s_otherFound = false;
+// s_otherRequired: el modelo binario "other" solo aplica con 2 jugadores (slot 0/1).
+// Con 3+ facciones (slot >= 2) NO hay "other" derivable por nombre → false. En ese caso el
+// gating de "ambos encontrados" no debe esperar a un other que nunca llegará (audit-05 §1).
+static bool s_otherRequired = false;
 
 // Position sending throttle
 static auto s_lastPosSend = std::chrono::steady_clock::time_point{};
@@ -54,16 +58,78 @@ static bool s_hasRemotePosition = false;
 static std::atomic<float> s_remoteGameSpeed{-1.f};
 
 // ── Faction string → character name mapping ──
-static std::string FactionToOwnName(const std::string& faction) {
-    if (faction == "10-kenshi-online") return "Player 1";
-    if (faction == "12-kenshi-online") return "Player 2";
-    return "";
+// El string real que llega del lobby es del tipo "10-kenshi-online.mod" (con sufijo .mod),
+// pero las comparaciones se hacen sin él. Normalizamos quitando el ".mod" final antes de
+// comparar para evitar el spam "Unknown faction".
+static std::string StripModSuffix(const std::string& faction) {
+    const std::string suffix = ".mod";
+    if (faction.size() >= suffix.size() &&
+        faction.compare(faction.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return faction.substr(0, faction.size() - suffix.size());
+    }
+    return faction;
 }
 
-static std::string FactionToOtherName(const std::string& faction) {
-    if (faction == "10-kenshi-online") return "Player 2";
-    if (faction == "12-kenshi-online") return "Player 1";
-    return "";
+// ── Tabla StringId de facción → slot 0-based ──
+// FUENTE DE VERDAD: E:\Aplicaciones\Kenshi-Online\faction-slots.json (generado por ModGen,
+// leído por el server). Mientras el cliente no lea ese JSON directamente, mantenemos esta
+// tabla espejo de los 6 StringIds del manifiesto. Si ModGen genera más facciones, hay que
+// ampliar esta tabla O (mejor) leer el manifiesto desde disco (ver audit-05 §1, Camino B).
+//
+// IMPORTANTE: esta tabla SOLO se usa como respaldo cuando el slot del paquete no llega
+// (slot < 0). En operación normal el slot SÍ viene en el S2C_FactionAssignment y se usa
+// directamente (ver SlotToCharName), lo que cubre cualquier nº de facciones sin tocar tabla.
+static int FactionToSlot(const std::string& faction) {
+    const std::string f = StripModSuffix(faction);
+    if (f == "10-kenshi-online") return 0; // Player 1
+    if (f == "12-kenshi-online") return 1; // Player 2
+    if (f == "45-kenshi-online") return 2; // Player 3
+    if (f == "46-kenshi-online") return 3; // Player 4
+    if (f == "47-kenshi-online") return 4; // Player 5
+    if (f == "48-kenshi-online") return 5; // Player 6
+    return -1; // Desconocida
+}
+
+// Deriva el nombre del Character a controlar a partir del slot 0-based.
+// El .mod nombra a los personajes de jugador como "Player N" (1-based), así que:
+//   slot 0 → "Player 1", slot 1 → "Player 2", ... slot 5 → "Player 6".
+// Esto funciona para CUALQUIER nº de facciones sin tabla rígida (audit-05 §2).
+// Devuelve "" si el slot está fuera de rango razonable (1..16 personajes de jugador).
+static std::string SlotToCharName(int slot0Based) {
+    if (slot0Based < 0 || slot0Based > 15) return "";
+    return "Player " + std::to_string(slot0Based + 1);
+}
+
+// Resuelve el nombre del personaje PROPIO (Own).
+// Estrategia: usar el SLOT que llega en el paquete (lo más limpio y escalable). Si el slot
+// no es válido (paquete viejo / -1), se cae a derivarlo del StringId vía la tabla espejo.
+static std::string ResolveOwnName(const std::string& faction, int slot) {
+    // 1) Vía slot del paquete (preferida — escala a N facciones).
+    std::string byName = SlotToCharName(slot);
+    if (!byName.empty()) return byName;
+
+    // 2) Respaldo: derivar slot desde el StringId conocido.
+    int fallbackSlot = FactionToSlot(faction);
+    return SlotToCharName(fallbackSlot);
+}
+
+// Resuelve el nombre del personaje "Other" (modelo binario heredado de 2 jugadores).
+//
+// LIMITACIÓN CONOCIDA (audit-05 §1, problema del modelo "Own/Other"):
+// El concepto "Other" SOLO tiene sentido con EXACTAMENTE 2 jugadores (tú y "el otro").
+// Con 3+ facciones (Player 3..6) este modelo binario está ROTO: no se puede enumerar a
+// todos los remotos por un único nombre. La solución correcta (Camino B) es descubrir a
+// los remotos por su entidad de red (EntityRegistry/ownerId), no por facción.
+//
+// Como puente, mantenemos el comportamiento de 2 jugadores:
+//   slot 0 (Player 1) → other = Player 2
+//   slot 1 (Player 2) → other = Player 1
+// Para slot >= 2 NO hay "other" derivable → devolvemos "" y el sync de Other queda inactivo
+// (los remotos se sincronizan por el sistema de entidades, no por este atajo de 2 jugadores).
+static std::string ResolveOtherName(int ownSlot) {
+    if (ownSlot == 0) return "Player 2"; // Player 1 ↔ Player 2 (caso 2 jugadores)
+    if (ownSlot == 1) return "Player 1";
+    return ""; // 3+ facciones: sin "other" binario (ver Camino B)
 }
 
 void Init() {
@@ -74,17 +140,44 @@ void Init() {
     }
 
     std::string faction = lobby.GetFactionString();
-    s_ownCharName = FactionToOwnName(faction);
-    s_otherCharName = FactionToOtherName(faction);
+    int slot = lobby.GetPlayerSlot(); // slot 0-based que envió el server en S2C_FactionAssignment
 
-    if (s_ownCharName.empty() || s_otherCharName.empty()) {
-        spdlog::error("shared_save_sync: Unknown faction '{}' — cannot determine character names", faction);
+    // ── Matching por SLOT (audit-05 §1-§2) ──
+    // Own: derivado del slot (escala a Player 1..6+). Other: modelo binario de 2 jugadores
+    // (heredado; vacío para slot >= 2, ver ResolveOtherName).
+    s_ownCharName = ResolveOwnName(faction, slot);
+    int ownSlot = SlotToCharName(slot).empty() ? FactionToSlot(faction) : slot; // slot efectivo usado
+    s_otherCharName = ResolveOtherName(ownSlot);
+
+    // ── DIAG-FACMATCH: volcado del matching de facción ──
+    // Permite verificar de un vistazo (log + HUD) qué slot/facción llegó y si own/other
+    // resolvieron. Útil para depurar per-player/teams con 6 facciones.
+    spdlog::info("[DIAG-FACMATCH] faction='{}' slot={} ownSlot={} -> own='{}' (resolved={}) other='{}' (resolved={})",
+                 faction, slot, ownSlot,
+                 s_ownCharName, (s_ownCharName.empty() ? "NO" : "YES"),
+                 s_otherCharName, (s_otherCharName.empty() ? "NO" : "YES"));
+
+    // Own es OBLIGATORIO: sin él no sabemos qué personaje controla el jugador local → abortamos.
+    if (s_ownCharName.empty()) {
+        spdlog::error("[DIAG-FACMATCH] Unknown faction '{}' slot {} — no se pudo determinar el personaje propio",
+                      faction, slot);
+        Core::Get().GetNativeHud().AddSystemMessage(
+            "ERROR: facción desconocida (slot " + std::to_string(slot) + ") — no puedo asignar tu personaje");
         return;
+    }
+
+    // Other es OPCIONAL: con 3+ facciones (slot >= 2) no hay "other" binario y es NORMAL.
+    // No abortamos; el sync de la posición remota por este atajo simplemente queda inactivo
+    // (los remotos se sincronizan vía el sistema de entidades, no por nombre de facción).
+    if (s_otherCharName.empty()) {
+        spdlog::warn("[DIAG-FACMATCH] Sin 'other' binario para slot {} (normal con 3+ facciones / per-player). "
+                     "El sync de posición remota por nombre queda inactivo para este modo.", slot);
     }
 
     s_initialized = true;
     s_ownFound = false;
     s_otherFound = false;
+    s_otherRequired = !s_otherCharName.empty(); // solo esperamos "other" si lo pudimos derivar
     s_ownAnimClass = nullptr;
     s_otherAnimClass = nullptr;
     s_ownCharPtr = nullptr;
@@ -97,16 +190,22 @@ void Init() {
     s_remoteGameSpeed.store(-1.f);
     s_discoveryAttempts = 0;
 
-    spdlog::info("shared_save_sync: Initialized — own='{}' other='{}'",
-                 s_ownCharName, s_otherCharName);
-    Core::Get().GetNativeHud().AddSystemMessage(
-        "Shared save sync: you are " + s_ownCharName + ", looking for " + s_otherCharName + "...");
+    spdlog::info("shared_save_sync: Initialized — own='{}' other='{}' (otherRequired={})",
+                 s_ownCharName, s_otherCharName, s_otherRequired);
+    if (s_otherRequired) {
+        Core::Get().GetNativeHud().AddSystemMessage(
+            "Shared save sync: you are " + s_ownCharName + ", looking for " + s_otherCharName + "...");
+    } else {
+        Core::Get().GetNativeHud().AddSystemMessage(
+            "Shared save sync: you are " + s_ownCharName + " (remotos via sistema de entidades)");
+    }
 }
 
 void Reset() {
     s_initialized = false;
     s_ownFound = false;
     s_otherFound = false;
+    s_otherRequired = false;
     s_ownAnimClass = nullptr;
     s_otherAnimClass = nullptr;
     s_ownCharPtr = nullptr;
@@ -193,8 +292,13 @@ void Update(float deltaTime) {
         if (!s_initialized) return;
     }
 
+    // "other" se considera satisfecho si NO se requiere (3+ facciones / per-player) o si ya
+    // se encontró. Esto evita que el gating de discovery se bloquee esperando a un personaje
+    // "other" que no existe en modos con más de 2 facciones (audit-05 §1).
+    const bool otherSatisfied = (!s_otherRequired) || s_otherFound;
+
     // ── STEP 1: Discover characters by name ──
-    if (!s_ownFound || !s_otherFound) {
+    if (!s_ownFound || !otherSatisfied) {
         s_discoveryAttempts++;
 
         // Re-validate cached pointers on every discovery tick (handles zone changes)
@@ -210,7 +314,9 @@ void Update(float deltaTime) {
             }
         }
 
-        if (!s_otherFound) {
+        // Solo buscamos "other" si el modelo binario aplica (2 jugadores). Con 3+ facciones
+        // s_otherRequired==false y nos saltamos esta búsqueda (s_otherCharName está vacío).
+        if (s_otherRequired && !s_otherFound) {
             auto* tc = char_tracker_hooks::FindByName(s_otherCharName);
             if (tc && tc->animClassPtr) {
                 s_otherAnimClass = tc->animClassPtr;
@@ -227,19 +333,23 @@ void Update(float deltaTime) {
             }
         }
 
-        // Periodic status log
+        // Log periódico de estado.
+        // FIX #2 (Zero): antes esto spameaba el HUD cada 5s con
+        // "Looking for characters...". Muy molesto para el jugador.
+        // Ahora va SOLO al log de archivo (spdlog) y throttleado a 1 vez
+        // cada 30s. NO se toca la lógica del tracker, solo el mensaje.
         auto now = std::chrono::steady_clock::now();
         auto sinceLog = std::chrono::duration_cast<std::chrono::seconds>(now - s_lastDiscoveryLog);
-        if (sinceLog.count() >= 5) {
+        if (sinceLog.count() >= 30) { // throttle subido de 5s a 30s
             s_lastDiscoveryLog = now;
-            if (!s_ownFound || !s_otherFound) {
-                core.GetNativeHud().AddSystemMessage(
-                    "Looking for characters... (tracked: " +
-                    std::to_string(char_tracker_hooks::GetTrackedCount()) + ")");
+            if (!s_ownFound || !otherSatisfied) {
+                // Solo a archivo, NO al HUD (antes era AddSystemMessage).
+                spdlog::info("shared_save_sync: Looking for characters... (tracked: {})",
+                             char_tracker_hooks::GetTrackedCount());
             }
         }
 
-        if (!s_ownFound || !s_otherFound) return;
+        if (!s_ownFound || !otherSatisfied) return;
 
         core.GetNativeHud().AddSystemMessage("Both players found! Position sync active.");
         spdlog::info("shared_save_sync: BOTH CHARACTERS FOUND — sync active");
@@ -254,13 +364,16 @@ void Update(float deltaTime) {
                 spdlog::debug("shared_save_sync: Own animClass updated to 0x{:X}",
                               reinterpret_cast<uintptr_t>(s_ownAnimClass));
             }
-            auto* tc2 = char_tracker_hooks::FindByName(s_otherCharName);
-            if (tc2 && tc2->animClassPtr != s_otherAnimClass) {
-                s_otherAnimClass = tc2->animClassPtr;
-                s_otherCharPtr = tc2->characterPtr;
-                if (s_otherCharPtr) ai_hooks::MarkRemoteControlled(s_otherCharPtr);
-                spdlog::debug("shared_save_sync: Other animClass updated to 0x{:X}",
-                              reinterpret_cast<uintptr_t>(s_otherAnimClass));
+            // Revalidar "other" solo si el modelo binario aplica (2 jugadores).
+            if (s_otherRequired) {
+                auto* tc2 = char_tracker_hooks::FindByName(s_otherCharName);
+                if (tc2 && tc2->animClassPtr != s_otherAnimClass) {
+                    s_otherAnimClass = tc2->animClassPtr;
+                    s_otherCharPtr = tc2->characterPtr;
+                    if (s_otherCharPtr) ai_hooks::MarkRemoteControlled(s_otherCharPtr);
+                    spdlog::debug("shared_save_sync: Other animClass updated to 0x{:X}",
+                                  reinterpret_cast<uintptr_t>(s_otherAnimClass));
+                }
             }
         }
     }

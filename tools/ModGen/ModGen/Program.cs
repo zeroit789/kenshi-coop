@@ -58,6 +58,28 @@ if (args.Length > 0 && args[0] == "explore")
     return;
 }
 
+// Modo "basefac" (Onyx): carga gamedata.base del juego y vuelca la faccion del jugador vanilla
+// ("Nameless", 204-gamedata.base) con sus Values y relaciones, para saber que copiar a Player 1/2.
+if (args.Length > 0 && args[0] == "basefac")
+{
+    var basePath = @"E:\SteamLibrary\steamapps\common\Kenshi\data\gamedata.base";
+    var baseData = await new ModFile(basePath).ReadDataAsync();
+    Console.WriteLine($"gamedata.base: {baseData.Items.Count} items");
+    var nameless = baseData.Items.FirstOrDefault(i => i.Type == ItemType.Faction
+        && (i.StringId == "204-gamedata.base" || i.Name == "Nameless"));
+    if (nameless is null) { Console.WriteLine("Faccion Nameless no encontrada"); return; }
+    // Dict tolerante a StringIds duplicados en gamedata.base (los hay, p.ej. 3012-walls.mod).
+    var byIdB = new Dictionary<string, Item>(StringComparer.OrdinalIgnoreCase);
+    foreach (var it in baseData.Items) byIdB[it.StringId] = it;
+    string NameOfB(string sid) => byIdB.TryGetValue(sid, out var it) ? $"\"{it.Name}\" [{it.Type}]" : "(externo/?)";
+    Console.WriteLine($"\n[Faction] \"{nameless.Name}\" ({nameless.StringId})");
+    foreach (var kv in nameless.Values) Console.WriteLine($"    val {kv.Key} = {kv.Value}");
+    foreach (var cat in nameless.ReferenceCategories)
+        foreach (var r in cat.References)
+            Console.WriteLine($"    {cat.Name} -> {NameOfB(r.TargetId)}  ({r.TargetId})  [v0={r.Value0} v1={r.Value1} v2={r.Value2}]");
+    return;
+}
+
 var src = new ModFile(SrcPath);
 var data = await src.ReadDataAsync();
 Console.WriteLine($"Read {data.Items.Count} items from kenshi-online.mod (lastId={data.LastId}, type={data.Type})");
@@ -101,6 +123,65 @@ for (int n = 1; n <= TotalPlayers; n++)
 data.LastId = Math.Max(data.LastId, nextId - 1);
 Console.WriteLine($"Created {created} new Player records. Total items now {data.Items.Count}. Writing self-contained mod:\n  {OutPath}");
 
+// ── Clonado de FACCIONES de jugador (Onyx 2026-06-18) ──
+// Objetivo: tener hasta 6 facciones de jugador (Player 1..6) en vez de 2, para habilitar
+// en el futuro modos "teams"/"per-player" en el servidor. HOY el cliente (Core,
+// shared_save_sync.cpp) solo reconoce "10-" y "12-", así que estas facciones extra son
+// DATOS PREPARADOS: el server las usará cuando Core amplíe su mapeo. No rompen el co-op
+// actual (factionMode="single" sigue usando solo la facción del Player 1).
+//
+// Cada facción nueva se clona de "Player 1" (que ya tiene el fundamental type correcto tras
+// el fix de abajo) para heredar su cableado. Se generan los StringIds y se emite el
+// manifiesto faction-slots.json para que el server lea los slots sin hardcodear.
+const int TotalFactions = 6; // Player 1..6 como facciones de jugador
+var factionSlots = new List<string>();
+{
+    // Facciones de jugador existentes en el mod fuente (Player 1, Player 2).
+    var playerFactions = data.Items
+        .Where(i => i.Type == ItemType.Faction && i.Name.StartsWith("Player "))
+        .OrderBy(i => {
+            var parts = i.Name.Split(' ');
+            return parts.Length > 1 && int.TryParse(parts[1], out var n) ? n : 999;
+        })
+        .ToList();
+
+    var faction1 = playerFactions.FirstOrDefault(i => i.Name == "Player 1");
+    if (faction1 is null)
+    {
+        Console.WriteLine("  [WARN] Faccion 'Player 1' no encontrada — no se clonan facciones extra ni se genera manifiesto");
+    }
+    else
+    {
+        // Registrar las facciones ya presentes en el manifiesto (StringId = "{id}-kenshi-online.mod").
+        foreach (var pf in playerFactions)
+            factionSlots.Add(pf.StringId);
+
+        int facCreated = 0;
+        for (int n = playerFactions.Count + 1; n <= TotalFactions; n++)
+        {
+            string fName = $"Player {n}";
+            if (data.Items.Any(i => i.Type == ItemType.Faction && i.Name == fName))
+                continue; // Ya existe
+
+            int fid = nextId++;
+            string fStringId = $"{fid}-kenshi-online.mod";
+
+            // Deep-copy de Player 1 para no aliasear referencias entre facciones.
+            var fValues = new Dictionary<string, object>(faction1.Values);
+            var fRefs = faction1.ReferenceCategories.Select(c => new ReferenceCategory(c)).ToList();
+            var fInstances = faction1.Instances.Select(ins => new Instance(ins)).ToList();
+
+            var facClone = new Item(ItemType.Faction, fid, fName, fStringId, faction1.SaveData, fValues, fRefs, fInstances);
+            data.Items.Add(facClone);
+            factionSlots.Add(fStringId);
+            facCreated++;
+            Console.WriteLine($"  created FACTION {fName} id={fid} stringId={fStringId} (clon de Player 1)");
+        }
+        data.LastId = Math.Max(data.LastId, nextId - 1);
+        Console.WriteLine($"  Facciones de jugador totales: {factionSlots.Count} (creadas {facCreated})");
+    }
+}
+
 // ── FIX del bug del perro (Onyx 2026-06-17) ──
 // El game start "Multiplayer" tenia su 'squad' apuntando a "startoff- Wanderer dead" (22-),
 // un escuadron SIN lider que solo contiene un animal ("Bonedog dead", 24-) -> el creador de
@@ -124,26 +205,44 @@ Console.WriteLine($"Created {created} new Player records. Total items now {data.
     }
 }
 
-// ── FIX de facciones (Onyx 2026-06-17) ──
-// Las facciones del jugador (Player 1/2) tenian "fundamental type" = 9 (OT_ADVENTURER), lo que
-// hace que el motor trate a tus personajes como NPCs errantes: los enemigos huyen en vez de pelear
-// y no puedes provocar/enemistarte normal. La faccion del jugador vanilla ("Nameless") usa 0
-// (OT_NONE). Lo corregimos a 0 preservando el tipo del valor. (Diagnostico: game-reverse-engineer,
-// confirmado en KenshiLib Faction.h / Enums.h.)
+// ── FIX de facciones v2 (Onyx 2026-06-17) ──
+// HISTORIAL: el tipo original era 9 (OT_ADVENTURER) -> enemigos huyen. Un primer fix lo puso a 0
+// (OT_NONE) por un diagnostico ERRONEO (se creyo que Nameless usaba 0). NO basto: 0 deja a la
+// faccion del jugador sin clase de comportamiento valida y los enemigos siguen huyendo.
+// VERIFICADO EMPIRICAMENTE con el modo 'basefac': la faccion del jugador vanilla "Nameless"
+// (204-gamedata.base) usa "fundamental type" = 4 (OT_CIVILIAN). Lo correcto es CIVILIAN, no NONE.
+// El motor mete al host en la faccion "Player 1" (parche del string .rdata en lobby_manager.cpp),
+// asi que estos datos rigen el aggro/combate del jugador. (RE: game-reverse-engineer, enum
+// CharacterTypeEnum en KenshiLib Enums.h:254-267, fundamentalNPCType en Faction.h:64 offset +0x34.)
 {
     int facFixed = 0;
+    // Aplica a TODAS las facciones de jugador (Player 1..N), incluidas las recién clonadas.
     foreach (var fac in data.Items.Where(i => i.Type == ItemType.Faction
-                                              && (i.Name == "Player 1" || i.Name == "Player 2")))
+                                              && i.Name.StartsWith("Player ")))
     {
         if (fac.Values.ContainsKey("fundamental type"))
         {
             var cur = fac.Values["fundamental type"];
-            fac.Values["fundamental type"] = Convert.ChangeType(0, cur.GetType()); // 0 = OT_NONE (jugador)
+            fac.Values["fundamental type"] = Convert.ChangeType(4, cur.GetType()); // 4 = OT_CIVILIAN (como Nameless)
             facFixed++;
-            Console.WriteLine($"  FIX faccion: {fac.Name} 'fundamental type' {cur} -> 0 (OT_NONE, jugador)");
+            Console.WriteLine($"  FIX faccion: {fac.Name} 'fundamental type' {cur} -> 4 (OT_CIVILIAN, igual que Nameless)");
         }
     }
     if (facFixed == 0) Console.WriteLine("  [WARN] no se encontraron facciones Player 1/2 para corregir el tipo");
+}
+
+// ── Manifiesto de slots de facción (Onyx 2026-06-18) ──
+// Lista ORDENADA de los StringIds de facción de jugador. El servidor puede leerlo para
+// asignar slots sin hardcodear el array. Se emite junto al mod, en el mismo directorio.
+{
+    string manifestPath = Path.Combine(Path.GetDirectoryName(OutPath)!, "faction-slots.json");
+    // JSON simple a mano (sin dependencias extra): {"factionSlots":["10-...","12-...",...]}
+    var quoted = factionSlots.Select(s => "\"" + s.Replace("\"", "\\\"") + "\"");
+    string jsonManifest = "{\n  \"factionSlots\": [\n    " +
+                          string.Join(",\n    ", quoted) +
+                          "\n  ]\n}\n";
+    File.WriteAllText(manifestPath, jsonManifest);
+    Console.WriteLine($"Manifiesto de facciones escrito: {manifestPath} ({factionSlots.Count} slots)");
 }
 
 var dst = new ModFile(OutPath);

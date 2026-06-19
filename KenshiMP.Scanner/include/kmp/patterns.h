@@ -114,6 +114,20 @@ constexpr const char* UNARMED_DAMAGE = "40 55 56 57 41 54 41 55 41 56 41 57 48 8
 // RVA: 0x00892120
 constexpr const char* MARTIAL_ARTS_COMBAT = "48 8B C4 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 B8 FB FF FF 48 81 EC 10 05 00 00 48 C7 45 98";
 
+// ── issueOrder / setJobTarget — EJECUTOR REAL de la orden del jugador ──
+// ⚠ NO CONFIRMADA — 0x722EF0 NO es la orden del jugador (REFUTADO por RE, 2026-06-18).
+// La doble verificación de bytes demostró que 0x722EF0 construye un MyGUI::UString y aloca
+// un Ogre::AllocatedObject (imports MyGUIEngine_x64.dll / OgreMain_x64.dll): es una función
+// de UI/GUI (tooltip/label/feedback de orden), NO la que encola un Job de IA. Sus callers
+// (0x6714A5, 0x6719A8) pasan un manager de UI global [0x21337D0], no un Character.
+// La orden REAL del jugador (clic→Task) entra por un método del vtable de Tasker/GOAPTaskMgr
+// que empuja un Task_* (Task_MeleeAttack @RTTI 0x1CF7350, Task_GetUp @0x1CF7538,
+// Task_GetOutOfBed @0x1CF76D8...) a la cola del char — RVA exacta SIN resolver todavía.
+// Este AOB casa con esa función UI; se conserva solo como referencia histórica. NO usar
+// como "IssueOrder": el hook DIAG de combate que lo usaba quedó deshabilitado (combat_hooks).
+// Firma del prólogo: __fastcall(void* uiMgr /*rcx*/, void* obj /*rdx*/, bool variant /*r8b*/).
+constexpr const char* ISSUE_ORDER = "48 8B C4 57 48 81 EC B0 00 00 00 48 C7 44 24 28 FE FF FF FF 48 89 58 18 48 89 70 20";
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  WORLD / ZONES
 // ═══════════════════════════════════════════════════════════════════════════
@@ -162,6 +176,23 @@ constexpr const char* GAME_FRAME_UPDATE = "48 8B C4 55 41 54 41 55 41 56 41 57 4
 // Found via "timeScale"
 // RVA: 0x00214B50
 constexpr const char* TIME_UPDATE = "40 55 56 48 83 EC 28 48 8B F2 48 8B E9 BA 02 00 00 00 48 8B CE E8 ? ? ? ? 84 C0 0F 84 ? ?";
+
+// ── GameWorld::setPaused — SETTER OFICIAL DE PAUSA ──
+// Firma: void __fastcall(void* gameWorld /*rcx*/, bool paused /*dl*/)
+// RVA: 0x00787D40 (Steam 1.0.68). Verificado byte a byte + análisis estático completo.
+// Lógica: paused = paramPaused OR (gameSpeed==0). Escribe GameWorld+0x8B9, y ADEMÁS
+// refresca los caches de pausa de 3 subsistemas (obj+0xB8), oculta el cartel "PAUSED"
+// del HUD (updatePauseUI @0x6E20D0) y emite el evento "Resume_Game"/"Pause_Game".
+//
+// CRÍTICO: escribir GameWorld+0x8B9 a pelo (como hacía el mod) despausa SOLO la
+// simulación pero NO refresca esos caches → los subsistemas siguen creyendo que está
+// pausado → bloquean las órdenes del jugador (atacar/hablar) y el HUD muestra "PAUSED".
+// Llamar a este setter en su lugar arregla la "pausa fantasma" de raíz.
+//
+// El byte wildcard es el disp32 RIP-relativo de la constante 0.0f (ucomiss xmm6,[rip+x]).
+// 33 bytes fijos antes del wildcard → patrón ÚNICO en .text (verificado, 1 match).
+// Prólogo normal (48 89 5C 24 08...), NO mov-rax-rsp → llamable directo sin el fix ASM.
+constexpr const char* SET_PAUSED = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 50 0F 29 74 24 40 F3 0F 10 B1 00 07 00 00 33 F6 0F 2E 35 ? ? ? ? 0F B6 DA 48 8B F9";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  SAVE / LOAD
@@ -405,6 +436,31 @@ struct GameFunctions {
     void*  CutDamageMod         = nullptr;  // Cut damage modifier
     void*  UnarmedDamage        = nullptr;  // Unarmed damage bonus
     void*  MartialArtsCombat    = nullptr;  // Martial arts combat handler
+    void*  IssueOrder           = nullptr;  // issueOrder/setJobTarget (0x722EF0) — orden real
+                                            // del jugador (clic objetivo → Job de IA).
+                                            // void(__fastcall*)(void* char, void* target, bool now)
+    void*  PushOrder            = nullptr;  // Tasker::pushOrder (0x674300) — INSERTA la orden en
+                                            // el map del Tasker del platoon (this = *(char+0x658
+                                            // ActivePlatoon +0x98)). Es el punto donde la orden de
+                                            // ataque ENTRA en la cola que el AI tick acaba
+                                            // consumiendo (vía AI+0x20 → selector → CharBody+0x68).
+                                            // void(__fastcall*)(Tasker* this, RootObject* subject, int mode)
+    void*  AttackTarget         = nullptr;  // Character::attackTarget (0x5CB0A0) — orden de ataque
+                                            // directa: escribe AI+0x78 (target) y encola en el
+                                            // Tasker del platoon vía enqueueCombatOrder(mode=4).
+                                            // void(__fastcall*)(Character* me, Character* who)
+    void*  SetActivePlatoon     = nullptr;  // Character::setActivePlatoon (0x6213F0) — CONFIRMADO
+                                            // en bytes (Steam 1.0.68). Hace el REGISTRO AI<->platoon
+                                            // que el spawn del clon del mod OMITE:
+                                            //   1) [char+0x658] = platoon        (ActivePlatoon*)
+                                            //   2) rcx = [char+0x650]            (AI*)
+                                            //   3) rdx = platoon ? [platoon+0x78] : 0   (platoon->me = Platoon*)
+                                            //   4) call 0x506CC0  ->  mov [AI+0x10], rdx
+                                            //      => AI+0x10 = Platoon*  (ESTE es el enlace omitido)
+                                            //   5) si platoon!=0: [char+0x418] = flags(r8d)
+                                            // Sin el paso 4 el AI tick no encuentra el platoon y su
+                                            // Tasker (ActivePlatoon+0x98) queda HUERFANO (no consumido).
+                                            // void(__fastcall*)(Character* me, void* activePlatoon, int flags)
 
     // ── World / Zones ──
     void*  ZoneLoad             = nullptr;  // Zone loading
@@ -420,6 +476,9 @@ struct GameFunctions {
     // ── Game Loop / Time ──
     void*  GameFrameUpdate      = nullptr;  // Main game frame tick
     void*  TimeUpdate           = nullptr;  // Time scale handler
+    void*  SetPaused            = nullptr;  // GameWorld::setPaused (0x787D40) — setter OFICIAL
+                                            // de pausa: refresca caches de subsistemas + HUD.
+                                            // void(__fastcall*)(void* gameWorld, bool paused)
 
     // ── Save / Load ──
     void*  SaveGame             = nullptr;  // Save game
@@ -479,6 +538,7 @@ struct GameFunctions {
             &CharacterSetPosition, &CharacterMoveTo,
             &ApplyDamage, &StartAttack, &CharacterDeath,
             &HealthUpdate, &CutDamageMod, &UnarmedDamage, &MartialArtsCombat,
+            &IssueOrder, &PushOrder, &AttackTarget, &SetActivePlatoon,
             &ZoneLoad, &ZoneUnload, &BuildingPlace, &BuildingDestroyed,
             &Navmesh, &SpawnCheck,
             &GameFrameUpdate, &TimeUpdate,

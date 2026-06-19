@@ -43,6 +43,14 @@ bool IsRemoteControlled(void* character) {
     return s_remoteControlled.count(character) > 0;
 }
 
+// Diagnóstico (solo lectura): tamaño actual del set de remote-controlled.
+// Pensado para [DIAG-REMOTE]: si el host está vivo y solo (sin peers) este valor
+// debería ser 0; >0 con el host marcado = anomalía que bloquearía su combate/IA.
+size_t RemoteControlledCount() {
+    std::lock_guard lock(s_remoteMutex);
+    return s_remoteControlled.size();
+}
+
 // ── Hooks ──
 
 static void* __fastcall Hook_AICreate(void* character, void* faction) {

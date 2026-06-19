@@ -1,6 +1,8 @@
 #include "server.h"
 #include "authority_validator.h"
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
+#include <fstream>
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
@@ -16,6 +18,21 @@ namespace {
 bool IsLoopbackAddress(const ENetAddress& addr) {
     return addr.host == 0x0100007Fu;
 }
+
+// Devuelve la IP de un peer como string (sin puerto). Usado para baneos por IP.
+std::string AddressToIPString(const ENetAddress& addr) {
+    char buf[64] = {0};
+    if (enet_address_get_host_ip(&addr, buf, sizeof(buf)) == 0) {
+        return std::string(buf);
+    }
+    return std::string();
+}
+
+// ── Umbrales de rate limiting (mensajes por segundo y por jugador) ──
+// Generosos para no afectar al juego legítimo; solo cortan flood evidente.
+constexpr uint32_t KMP_MAX_CHAT_PER_SEC = 5;    // 5 mensajes de chat/seg
+constexpr uint32_t KMP_MAX_POS_PER_SEC  = 40;   // 40 position updates/seg (tickRate 20 + margen)
+constexpr uint16_t KMP_MAX_CHAT_LEN     = 256;  // Longitud máx de chat (antes 1024 implícito)
 } // namespace
 
 // Forward declaration from combat_resolver.cpp
@@ -87,6 +104,12 @@ bool GameServer::Start(const ServerConfig& config) {
 
     // Auto-save interval from config (default 60s)
     m_autoSaveInterval = 60.f;
+
+    // Cargar lista de baneados (bans.json) si existe
+    LoadBans();
+
+    // Cargar el manifiesto de slots de facción (faction-slots.json) generado por ModGen.
+    LoadFactionSlots();
 
     // Connect to master server for server browser registration
     ConnectToMaster();
@@ -160,8 +183,10 @@ void GameServer::Update(float deltaTime) {
         }
     }
 
-    // Update game time
-    m_timeOfDay += deltaTime * m_config.gameSpeed / 86400.f; // 24h cycle
+    // Update game time — el reloj solo avanza si el mundo NO está pausado.
+    // Velocidad efectiva = 0 cuando está pausado (coherente con lo que enviamos en TimeSync).
+    float effectiveSpeed = m_serverPaused ? 0.f : m_config.gameSpeed;
+    m_timeOfDay += deltaTime * effectiveSpeed / 86400.f; // 24h cycle
     if (m_timeOfDay >= 1.f) m_timeOfDay -= 1.f;
 
     // Broadcast positions every tick
@@ -530,6 +555,228 @@ void GameServer::HandlePacket(ENetPeer* peer, const uint8_t* data, size_t size, 
     }
 }
 
+// ── Rate limiting ──
+// Cuenta mensajes en ventanas de 1 segundo. El host loopback (admin físico) queda exento.
+// Devuelve true si el mensaje se acepta, false si excede el umbral y debe descartarse.
+bool GameServer::CheckRateLimit(ConnectedPlayer& player, uint32_t& counter, uint32_t maxPerSecond) {
+    // El host integrado (loopback) no se limita: es el anfitrión, no un atacante remoto.
+    if (player.isLoopback) return true;
+
+    // Reinicia la ventana si ha pasado 1 segundo desde su inicio.
+    if (m_uptime - player.rateWindowStart >= 1.0f) {
+        player.rateWindowStart = m_uptime;
+        player.chatMsgCount = 0;
+        player.posMsgCount  = 0;
+    }
+    if (counter >= maxPerSecond) {
+        return false; // Excedido — descartar
+    }
+    counter++;
+    return true;
+}
+
+// ── Baneos ──
+bool GameServer::IsBanned(const std::string& name, const ENetAddress& addr) const {
+    if (m_bannedNames.count(name) > 0) return true;
+    std::string ip = AddressToIPString(addr);
+    if (!ip.empty() && m_bannedIPs.count(ip) > 0) return true;
+    return false;
+}
+
+void GameServer::LoadBans() {
+    std::ifstream file("bans.json");
+    if (!file.is_open()) return; // Sin baneos previos, normal
+    try {
+        nlohmann::json j;
+        file >> j;
+        if (j.contains("names"))
+            m_bannedNames = j["names"].get<std::unordered_set<std::string>>();
+        if (j.contains("ips"))
+            m_bannedIPs = j["ips"].get<std::unordered_set<std::string>>();
+        spdlog::info("GameServer: Cargados {} baneos por nombre, {} por IP",
+                     m_bannedNames.size(), m_bannedIPs.size());
+    } catch (...) {
+        spdlog::warn("GameServer: bans.json corrupto, ignorado");
+    }
+}
+
+void GameServer::SaveBans() {
+    nlohmann::json j;
+    j["names"] = m_bannedNames;
+    j["ips"]   = m_bannedIPs;
+    std::ofstream file("bans.json");
+    if (!file.is_open()) {
+        spdlog::warn("GameServer: No se pudo escribir bans.json");
+        return;
+    }
+    file << j.dump(2);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Selector de facciones — implementación
+// ──────────────────────────────────────────────────────────────────────────
+
+void GameServer::LoadFactionSlots() {
+    // Carga el manifiesto faction-slots.json generado por ModGen junto al .mod.
+    // Estructura: {"factionSlots": ["10-kenshi-online.mod", "12-...", ...]}.
+    // El índice de cada string es el "slot" que se envía al cliente.
+    m_factionSlots.clear();
+    std::ifstream file("faction-slots.json");
+    if (file.is_open()) {
+        try {
+            nlohmann::json j;
+            file >> j;
+            if (j.contains("factionSlots") && j["factionSlots"].is_array()) {
+                for (const auto& s : j["factionSlots"]) {
+                    if (s.is_string()) m_factionSlots.push_back(s.get<std::string>());
+                }
+            }
+        } catch (...) {
+            spdlog::warn("GameServer: faction-slots.json corrupto, usando slots por defecto");
+        }
+    }
+
+    // Fallback: si no hay manifiesto (o vino vacío), usar los 2 slots históricos.
+    // Garantiza que el co-op básico sigue funcionando aunque falte el fichero.
+    if (m_factionSlots.empty()) {
+        m_factionSlots = { "10-kenshi-online.mod", "12-kenshi-online.mod" };
+        spdlog::info("GameServer: faction-slots.json no encontrado — usando 2 facciones por defecto (10-/12-)");
+    } else {
+        spdlog::info("GameServer: Cargadas {} facciones de jugador del manifiesto", m_factionSlots.size());
+    }
+}
+
+int GameServer::ComputeFactionSlot(PlayerID id) const {
+    // Calcula el slot 0-based según factionMode:
+    //   "single"     → todos slot 0 → todos comparten la facción del Player 1 (co-op puro).
+    //   "teams"      → grupos de teamSize comparten facción: slot = (id-1)/teamSize.
+    //   "per-player" → cada jugador su facción: slot = id-1.
+    // En todos los casos se acota al nº real de facciones del manifiesto; si se agotan,
+    // se cae a la última disponible para no enviar slots inexistentes (per-player → co-op).
+    int n = static_cast<int>(m_factionSlots.size());
+    if (n <= 0) return 0;
+
+    int slot;
+    if (m_config.factionMode == "single") {
+        slot = 0;
+    } else if (m_config.factionMode == "teams") {
+        int ts = m_config.teamSize > 0 ? m_config.teamSize : 1;
+        slot = (static_cast<int>(id) - 1) / ts;
+    } else { // "per-player"
+        slot = static_cast<int>(id) - 1;
+    }
+
+    if (slot < 0) slot = 0;
+    // Si nos pasamos del nº de facciones, acotamos a la última (degrada a co-op en ese slot).
+    if (slot >= n) slot = n - 1;
+    return slot;
+}
+
+bool GameServer::SendFactionAssignment(ConnectedPlayer& player, int slot0Based) {
+    // Centraliza el envío del paquete S2C_FactionAssignment (usado por handshake y setfaction).
+    // Formato: [header][u16 len][raw factionString][i32 slot]. El cliente parchea ese string
+    // en .rdata para controlar la facción correspondiente.
+    if (slot0Based < 0 || slot0Based >= static_cast<int>(m_factionSlots.size())) {
+        spdlog::warn("GameServer: slot de facción {} fuera de rango (hay {} facciones)",
+                     slot0Based, m_factionSlots.size());
+        return false;
+    }
+    const std::string& factionStr = m_factionSlots[slot0Based];
+
+    PacketWriter factionWriter;
+    factionWriter.WriteHeader(MessageType::S2C_FactionAssignment);
+    factionWriter.WriteU16(static_cast<uint16_t>(factionStr.size()));
+    factionWriter.WriteRaw(factionStr.data(), factionStr.size());
+    factionWriter.WriteI32(slot0Based);
+
+    ENetPacket* factionPkt = enet_packet_create(factionWriter.Data(), factionWriter.Size(),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+    if (!factionPkt) {
+        spdlog::error("GameServer: fallo al crear paquete de facción ({} bytes)", factionWriter.Size());
+        return false;
+    }
+    if (player.peer) {
+        enet_peer_send(player.peer, KMP_CHANNEL_RELIABLE_ORDERED, factionPkt);
+    } else {
+        enet_packet_destroy(factionPkt);
+        return false;
+    }
+
+    player.factionSlot = slot0Based;
+    spdlog::info("GameServer: Asignada facción '{}' (slot {}) al jugador {} ('{}')",
+                 factionStr, slot0Based, player.id, player.name);
+    return true;
+}
+
+bool GameServer::SetFactionMode(const std::string& mode) {
+    // Cambia el modo de facciones en caliente, lo persiste y reasigna a todos los conectados.
+    if (mode != "single" && mode != "teams" && mode != "per-player") {
+        return false;
+    }
+    std::lock_guard lock(m_mutex);
+    m_config.factionMode = mode;
+    SaveConfig(); // Persistir en server.json
+
+    // Reasignar facción a cada jugador conectado según el nuevo modo y notificarle.
+    for (auto& [id, player] : m_players) {
+        int slot = ComputeFactionSlot(id);
+        SendFactionAssignment(player, slot);
+    }
+    spdlog::info("GameServer: factionMode cambiado a '{}' — {} jugadores reasignados",
+                 mode, m_players.size());
+    BroadcastSystemMessage("El servidor cambió el modo de facciones a: " + mode);
+    return true;
+}
+
+bool GameServer::SetPlayerFaction(PlayerID id, int slot1Based) {
+    // Asignación manual: el admin fija la facción de un jugador concreto (slot 1-based).
+    std::lock_guard lock(m_mutex);
+    ConnectedPlayer* player = GetPlayer(id);
+    if (!player) {
+        spdlog::warn("GameServer: setfaction — jugador {} no encontrado", id);
+        return false;
+    }
+    int slot0 = slot1Based - 1; // Convertir a 0-based (interno)
+    if (slot0 < 0 || slot0 >= static_cast<int>(m_factionSlots.size())) {
+        spdlog::warn("GameServer: setfaction — slot {} fuera de rango (1..{})",
+                     slot1Based, m_factionSlots.size());
+        return false;
+    }
+    return SendFactionAssignment(*player, slot0);
+}
+
+void GameServer::PrintFactions() {
+    // Lista las facciones del manifiesto y qué jugador tiene asignada cada una.
+    std::lock_guard lock(m_mutex);
+    spdlog::info("=== Facciones (modo: {}, teamSize: {}) ===", m_config.factionMode, m_config.teamSize);
+    if (m_factionSlots.empty()) {
+        spdlog::info("  (sin facciones cargadas)");
+        return;
+    }
+    for (size_t i = 0; i < m_factionSlots.size(); ++i) {
+        // Buscar qué jugadores tienen este slot asignado.
+        std::string owners;
+        for (auto& [id, player] : m_players) {
+            if (player.factionSlot == static_cast<int>(i)) {
+                if (!owners.empty()) owners += ", ";
+                owners += "[" + std::to_string(id) + "] " + player.name;
+            }
+        }
+        spdlog::info("  slot {} (Player {}): {}  ->  {}",
+                     i + 1, i + 1, m_factionSlots[i],
+                     owners.empty() ? "(libre)" : owners);
+    }
+}
+
+void GameServer::SaveConfig() {
+    // Persiste la config actual en el fichero con el que se arrancó (server.json por defecto).
+    if (m_config.Save(m_configPath)) {
+        spdlog::info("GameServer: config guardada en {}", m_configPath);
+    } else {
+        spdlog::warn("GameServer: no se pudo escribir la config en {}", m_configPath);
+    }
+}
+
 void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
     MsgHandshake msg;
     if (!reader.ReadRaw(&msg, sizeof(msg))) return;
@@ -589,6 +836,44 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
         if (c >= 32 && c < 127) sanitizedName += c;
     }
     if (sanitizedName.empty()) sanitizedName = "Player";
+
+    // ── Password opcional (lectura tolerante a tamaño) ──
+    // Si quedan bytes tras la base del handshake, el cliente envió una contraseña
+    // (U16 len + string). Clientes antiguos no la mandan → 'clientPassword' queda vacía.
+    std::string clientPassword;
+    if (reader.Remaining() >= sizeof(uint16_t)) {
+        reader.ReadString(clientPassword, KMP_MAX_PASSWORD_LENGTH);
+    }
+
+    // Si el server tiene contraseña configurada, debe coincidir.
+    if (!m_config.password.empty() && clientPassword != m_config.password) {
+        spdlog::warn("GameServer: Rechazado '{}' por contrasena incorrecta", sanitizedName);
+        PacketWriter writer;
+        writer.WriteHeader(MessageType::S2C_HandshakeReject);
+        MsgHandshakeReject reject{};
+        reject.reasonCode = 3; // other
+        snprintf(reject.reasonText, sizeof(reject.reasonText), "Contrasena incorrecta");
+        writer.WriteRaw(&reject, sizeof(reject));
+        ENetPacket* pkt = enet_packet_create(writer.Data(), writer.Size(), ENET_PACKET_FLAG_RELIABLE);
+        if (pkt) enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, pkt);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
+
+    // ── Comprobación de baneo (por nombre o IP) ──
+    if (IsBanned(sanitizedName, peer->address)) {
+        spdlog::warn("GameServer: Rechazada conexion de jugador baneado '{}'", sanitizedName);
+        PacketWriter writer;
+        writer.WriteHeader(MessageType::S2C_HandshakeReject);
+        MsgHandshakeReject reject{};
+        reject.reasonCode = 2; // banned/kicked
+        snprintf(reject.reasonText, sizeof(reject.reasonText), "Estas baneado de este servidor");
+        writer.WriteRaw(&reject, sizeof(reject));
+        ENetPacket* pkt = enet_packet_create(writer.Data(), writer.Size(), ENET_PACKET_FLAG_RELIABLE);
+        if (pkt) enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, pkt);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
 
     // Create player
     PlayerID id = NextPlayerId();
@@ -676,42 +961,16 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
         BroadcastHostAssignment();
     }
 
-    // Send faction assignment to the new player
-    // Each player gets a unique faction string from kenshi-online.mod.
-    // Player 1 → slot 0 ("10-kenshi-online"), Player 2 → slot 1 ("12-kenshi-online"), etc.
-    // The client patches this string in .rdata before save load to determine
-    // which faction's characters they control.
+    // Send faction assignment to the new player.
+    // Cada jugador recibe un StringId de facción del manifiesto faction-slots.json
+    // (generado por ModGen a partir de kenshi-online.mod). El cliente parchea ese string
+    // en .rdata antes de cargar el save para determinar qué facción controla.
+    // El slot se calcula según factionMode (single/teams/per-player) en ComputeFactionSlot.
     {
-        // Faction strings must match the FCS IDs in kenshi-online.mod
-        // Format: "{numId}-{modFilename}" — the .mod extension IS part of the reference.
-        static const char* factionStrings[] = {
-            "10-kenshi-online.mod",   // Slot 0 (Player 1)
-            "12-kenshi-online.mod",   // Slot 1 (Player 2)
-        };
-        static const int numFactions = sizeof(factionStrings) / sizeof(factionStrings[0]);
-
-        int slot = (id - 1) % numFactions;
-        if (slot < 0) slot = 0;
-        const char* factionStr = factionStrings[slot];
-        size_t factionLen = strlen(factionStr);
-
-        PacketWriter factionWriter;
-        factionWriter.WriteHeader(MessageType::S2C_FactionAssignment);
-        factionWriter.WriteU16(static_cast<uint16_t>(factionLen));
-        factionWriter.WriteRaw(factionStr, factionLen);
-        factionWriter.WriteI32(slot);
-
-        ENetPacket* factionPkt = enet_packet_create(factionWriter.Data(), factionWriter.Size(),
-                                                     ENET_PACKET_FLAG_RELIABLE);
-        if (!factionPkt) {
-            spdlog::error("Failed to create packet ({} bytes)", factionWriter.Size());
-            m_players.erase(id);
-            peer->data = nullptr;
-            return;
-        }
-        enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, factionPkt);
-        spdlog::info("GameServer: Assigned faction '{}' (slot {}) to player {}",
-                     factionStr, slot, id);
+        int slot = ComputeFactionSlot(id);
+        // SendFactionAssignment puede fallar si el manifiesto está vacío; en ese caso no
+        // abortamos el handshake (el jugador sigue conectado, simplemente sin facción extra).
+        SendFactionAssignment(*GetPlayer(id), slot);
     }
 
     // Notify existing players about the new player (use sanitized name)
@@ -790,6 +1049,13 @@ void GameServer::HandleServerQuery(ENetPeer* peer, PacketReader& reader) {
 void GameServer::HandlePositionUpdate(ConnectedPlayer& player, PacketReader& reader) {
     uint8_t count;
     if (!reader.ReadU8(count)) return;
+
+    // Anti-flood: descarta el paquete entero si el jugador supera el umbral de updates/seg.
+    // (Cada paquete puede traer varias entidades, pero limitamos por paquete recibido.)
+    if (!CheckRateLimit(player, player.posMsgCount, KMP_MAX_POS_PER_SEC)) {
+        spdlog::debug("GameServer: Position update de '{}' descartado por rate limit", player.name);
+        return;
+    }
 
     bool playerPosUpdated = false;
     for (uint8_t i = 0; i < count; i++) {
@@ -932,8 +1198,15 @@ void GameServer::HandleChatMessage(ConnectedPlayer& player, PacketReader& reader
     uint32_t senderId;
     if (!reader.ReadU32(senderId)) return;
     std::string message;
-    if (!reader.ReadString(message)) return;
+    // Cap de longitud de chat más bajo (256) para evitar spam de mensajes enormes.
+    if (!reader.ReadString(message, KMP_MAX_CHAT_LEN)) return;
     if (message.empty()) return;
+
+    // Anti-flood: descarta si el jugador supera el umbral de chat/seg.
+    if (!CheckRateLimit(player, player.chatMsgCount, KMP_MAX_CHAT_PER_SEC)) {
+        spdlog::debug("GameServer: Chat de '{}' descartado por rate limit", player.name);
+        return;
+    }
 
     spdlog::info("[Chat] {}: {}", player.name, message);
 
@@ -1057,7 +1330,10 @@ void GameServer::BroadcastTimeSync() {
     msg.serverTick = m_serverTick;
     msg.timeOfDay = m_timeOfDay;
     msg.weatherState = m_weatherState;
-    msg.gameSpeed = m_config.gameSpeed;
+    // Velocidad efectiva: si el servidor está pausado, enviamos 0 a los clientes.
+    // El formato del paquete NO cambia (gameSpeed sigue siendo float, el cliente ya lo
+    // parsea como float) — solo cambia el VALOR que pone el servidor.
+    msg.gameSpeed = m_serverPaused ? 0.f : m_config.gameSpeed;
     writer.WriteRaw(&msg, sizeof(msg));
     Broadcast(writer.Data(), writer.Size(), KMP_CHANNEL_RELIABLE_ORDERED, ENET_PACKET_FLAG_RELIABLE);
 }
@@ -1491,9 +1767,50 @@ void GameServer::BroadcastSystemMessage(const std::string& message) {
     Broadcast(writer.Data(), writer.Size(), KMP_CHANNEL_RELIABLE_ORDERED, ENET_PACKET_FLAG_RELIABLE);
 }
 
+// ── Control de velocidad/pausa global (autoridad del servidor) ──
+// El SERVIDOR dicta la velocidad; los clientes la siguen vía TimeSync.
+// Estos métodos los llama la consola del server (host = admin).
+
+bool GameServer::SetGameSpeed(float speed) {
+    // Validación de rango razonable. 0 = pausa efectiva; tope 10x.
+    if (speed < 0.f || speed > 10.f) {
+        return false;
+    }
+    std::lock_guard lock(m_mutex);
+    m_config.gameSpeed = speed;
+    // Si fijamos una velocidad > 0, salimos de pausa automáticamente.
+    if (speed > 0.f) {
+        m_serverPaused = false;
+    }
+    BroadcastTimeSync();  // Empuja inmediatamente la nueva velocidad a todos los clientes
+    spdlog::info("GameServer: velocidad global fijada a {:.2f}x (pausado={})",
+                 m_config.gameSpeed, m_serverPaused);
+    return true;
+}
+
+void GameServer::PauseWorld() {
+    std::lock_guard lock(m_mutex);
+    m_serverPaused = true;
+    BroadcastTimeSync();  // Envía speed=0 a todos los clientes (el formato no cambia)
+    spdlog::info("GameServer: mundo PAUSADO por la consola del servidor");
+    BroadcastSystemMessage("El servidor ha PAUSADO el mundo.");
+}
+
+void GameServer::ResumeWorld() {
+    std::lock_guard lock(m_mutex);
+    m_serverPaused = false;
+    BroadcastTimeSync();  // Reanuda a la velocidad global configurada
+    spdlog::info("GameServer: mundo REANUDADO a {:.2f}x", m_config.gameSpeed);
+    BroadcastSystemMessage("El servidor ha REANUDADO el mundo.");
+}
+
 void GameServer::LoadWorld() {
+    // Fallback unificado al default real de ServerConfig::savePath ("world.kmpsave").
+    // Antes este fallback usaba "kenshi_mp_world.json", distinto al de SaveWorld y al
+    // default de config → si alguien vaciaba savePath se cargaba/guardaba en ficheros
+    // distintos y se perdía el mundo silenciosamente.
     std::string savePath = m_config.savePath.empty()
-        ? "kenshi_mp_world.json" : m_config.savePath;
+        ? "world.kmpsave" : m_config.savePath;
 
     float loadedTime = m_timeOfDay;
     int loadedWeather = m_weatherState;
@@ -1515,8 +1832,9 @@ void GameServer::SaveWorld() {
     spdlog::info("GameServer: Saving world... ({} entities, {} players)",
                  m_entities.size(), m_players.size());
 
+    // Fallback unificado con LoadWorld y con el default de config ("world.kmpsave").
     std::string savePath = m_config.savePath.empty()
-        ? "kenshi_mp_world.json" : m_config.savePath;
+        ? "world.kmpsave" : m_config.savePath;
 
     // Build a combined saved-players map: merge currently-connected players
     // (their live entity ownership) with previously-saved offline players.
@@ -2182,6 +2500,48 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
         }
         break;
     }
+    case 1: { // Ban
+        auto* target = GetPlayer(msg.targetPlayerId);
+        if (target && target->id != m_hostPlayerId) {
+            std::string reason = msg.textParam[0] ? msg.textParam : "Baneado por el host";
+            std::string bannedName = target->name;
+            std::string bannedIP   = AddressToIPString(target->peer->address);
+
+            // Registrar baneo por nombre y por IP (la IP es frágil con NAT/dinámica,
+            // por eso se combina con el nombre).
+            m_bannedNames.insert(bannedName);
+            if (!bannedIP.empty()) m_bannedIPs.insert(bannedIP);
+            SaveBans(); // Persistir inmediatamente
+
+            spdlog::info("GameServer: Host baneo a '{}' (IP {}): {}", bannedName, bannedIP, reason);
+            BroadcastSystemMessage(bannedName + " fue baneado: " + reason);
+
+            // No preservar sus entidades como reconectables: purgar su registro guardado
+            // y dejar sus entidades vivas como server-owned (owner=0) sin mapping de reclamo.
+            m_savedPlayers.erase(bannedName);
+
+            // Enviar reject y desconectar.
+            PacketWriter banWriter;
+            banWriter.WriteHeader(MessageType::S2C_HandshakeReject);
+            MsgHandshakeReject reject{};
+            reject.reasonCode = 2; // banned/kicked
+            strncpy(reject.reasonText, reason.c_str(), sizeof(reject.reasonText) - 1);
+            banWriter.WriteRaw(&reject, sizeof(reject));
+            ENetPacket* banPkt = enet_packet_create(banWriter.Data(), banWriter.Size(), ENET_PACKET_FLAG_RELIABLE);
+            if (!banPkt) {
+                spdlog::error("Failed to create packet ({} bytes)", banWriter.Size());
+                enet_peer_disconnect_later(target->peer, 0);
+            } else {
+                enet_peer_send(target->peer, KMP_CHANNEL_RELIABLE_ORDERED, banPkt);
+                enet_peer_disconnect_later(target->peer, 0);
+            }
+
+            responseText = "Baneado " + bannedName;
+        } else {
+            responseText = "Jugador no encontrado o no se puede banear al host.";
+        }
+        break;
+    }
     case 2: { // Set time
         float newTime = msg.floatParam;
         if (newTime >= 0.f && newTime < 1.f) {
@@ -2250,6 +2610,13 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
 // ── Master Server Registration ──
 
 void GameServer::ConnectToMaster() {
+    // El registro al master server es opcional. Para partidas locales/LAN se deja
+    // deshabilitado por defecto (enableMasterServer=false) para no llenar el log
+    // con reintentos de conexión a una IP de terceros que puede estar caída.
+    if (!m_config.enableMasterServer) {
+        spdlog::info("GameServer: Master server deshabilitado (modo local), no se registra en el browser publico");
+        return;
+    }
     if (m_config.masterServer.empty()) {
         spdlog::info("GameServer: No master server configured, skipping registration");
         return;
@@ -2371,7 +2738,8 @@ void GameServer::UpdateMasterConnection(float deltaTime) {
             case ENET_EVENT_TYPE_DISCONNECT:
                 m_masterConnected = false;
                 m_masterPeer = nullptr;
-                spdlog::warn("GameServer: Disconnected from master server — will retry in {:.0f}s",
+                // Bajado a debug: un master caído NO debe escupir warnings en partida local.
+                spdlog::debug("GameServer: Disconnected from master server — will retry in {:.0f}s",
                              m_masterReconnectDelay);
                 break;
             case ENET_EVENT_TYPE_RECEIVE:

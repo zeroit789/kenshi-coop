@@ -184,6 +184,40 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     reg("MartialArtsCombat", "combat", "Martial arts full combat handler",
         patterns::MARTIAL_ARTS_COMBAT, "Martial Arts", 12,
         0x00892120, &funcs.MartialArtsCombat);
+    // ⚠ IssueOrder NO CONFIRMADA — 0x722EF0 es UI/MyGUI (UString), NO la orden del jugador
+    // (REFUTADO por RE de bytes 2026-06-18). Se mantiene el registro para que funcs.IssueOrder
+    // resuelva al AOB, PERO el hook DIAG de combate que lo usaba está deshabilitado
+    // (combat_hooks.cpp) para no hookear una función UI por error. La orden real entra por
+    // Tasker/GOAPTaskMgr (RVA sin resolver). NO tratar como dispatcher de órdenes.
+    reg("IssueOrder", "combat", "UI string builder (NO es IssueOrder — refutado)",
+        patterns::ISSUE_ORDER, nullptr, 0,
+        0x00722EF0, &funcs.IssueOrder);
+    // ── Tasker::pushOrder (0x674300) — DIAG-PUSHORDER (Fase 4) ──
+    // RE 2026-06-19 (byte a byte): es donde la orden de ataque ENTRA en el map del Tasker del
+    // platoon (this = *(char+0x658 ActivePlatoon +0x98)). Cadena confirmada:
+    //   attackTarget 0x5CB0A0 → enqueueCombatOrder 0x6744A0 (mode=4, tras 2 gates isAlly)
+    //   → getTasker 0x791B10 (devuelve char+0x658) → [+0x98] → pushOrder 0x674300 → inserta nodo.
+    // Prólogo limpio (48 85 D2 0F 84 ...), NO mov rax,rsp → hookeable sin el fix MovRaxRsp.
+    // AOB único en .text (1 match). El hook DIAG solo registra (no muta) para confirmar en
+    // runtime si la orden del HOST entra y a QUÉ Tasker.
+    reg("PushOrder", "combat", "Tasker::pushOrder — inserta orden en el map del Tasker del platoon",
+        nullptr, nullptr, 0,
+        0x00674300, &funcs.PushOrder);
+    // ── Character::attackTarget (0x5CB0A0) — ya usada por el [AUTOTEST] vía RVA directa ──
+    // Se registra también en GameFunctions para que el resto del mod la tenga resuelta.
+    reg("AttackTarget", "combat", "Character::attackTarget — orden de ataque directa (encola mode=4)",
+        nullptr, nullptr, 0,
+        0x005CB0A0, &funcs.AttackTarget);
+    // ── Character::setActivePlatoon (0x6213F0) — FIX-PLATOON (Fase 4) ──
+    // RE 2026-06-19 (byte a byte, Steam 1.0.68): hace el REGISTRO AI<->platoon que el spawn del
+    // clon del mod OMITE. Escribe [char+0x658]=platoon, carga AI=[char+0x650], y llama 0x506CC0
+    // que pone [AI+0x10]=platoon->me (=[platoon+0x78]). Sin ese paso el AI tick no encuentra el
+    // platoon y su Tasker (ActivePlatoon+0x98) queda huérfano (orden encolada pero NO consumida).
+    // Prólogo estándar (48 89 5C 24 08 57) → hookeable/llamable sin el fix MovRaxRsp.
+    // AOB único en .text (1 match): 48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 89 91 58 06 00 00
+    reg("SetActivePlatoon", "combat", "Character::setActivePlatoon — registro AI<->platoon (FIX-PLATOON)",
+        nullptr, nullptr, 0,
+        0x006213F0, &funcs.SetActivePlatoon);
 
     // ── World / Zones ──
     reg("ZoneLoad", "world", "Zone loading",
@@ -331,8 +365,15 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     {
         PatternEntry e;
         e.id = "GameWorldSingleton"; e.category = "global";
-        e.description = "GameWorld singleton pointer";
-        e.hardcodedRVA = 0x02133040; e.isGlobalPointer = true; e.critical = true;
+        e.description = "GameWorld embedded instance (NO puntero)";
+        // RVA de la INSTANCIA estatica de GameWorld embebida en .data para Kenshi Steam 1.0.68.
+        // Verificado por RTTI + ctor/dtor + 513 xrefs del binario: en 1.0.68 GameWorld NO es un
+        // puntero global (GameWorld* ou), es la INSTANCIA misma. Por tanto base+0x2134110 ES
+        // directamente el objeto GameWorld (su primer qword es la vtable en .text 0x1722608),
+        // NO hay que dereferenciar.
+        // Historial de RVAs: 0x02133040 (erroneo) -> 0x02131020 (era de 1.0.65, daba NULL) ->
+        // 0x02134110 (CORRECTO 1.0.68, verificado RTTI/xref).
+        e.hardcodedRVA = 0x02134110; e.isGlobalPointer = true; e.critical = true;
         e.targetUintptr = &funcs.GameWorldSingleton;
         // GameWorld is loaded by functions referencing time/speed/zone strings.
         e.stringAnchor = "dayTime";

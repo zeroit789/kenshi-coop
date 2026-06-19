@@ -204,14 +204,19 @@ public:
         uint16_t len;
         if (!ReadU16(len)) return false;
         if (len > maxLen) return false; // Reject oversized strings
-        if (m_pos + len > m_size) return false;
+        // Comprobación sin overflow: m_pos <= m_size siempre (invariante de ReadRaw),
+        // así que m_size - m_pos nunca se desborda. "m_pos + len" sí podría desbordar
+        // si len fuera enorme; esta forma es defensa en profundidad.
+        if (len > m_size - m_pos) return false;
         s.assign(reinterpret_cast<const char*>(m_data + m_pos), len);
         m_pos += len;
         return true;
     }
 
     bool ReadRaw(void* out, size_t len) {
-        if (m_pos + len > m_size) return false;
+        // Resta sin overflow (m_pos <= m_size siempre). Evita que un len gigante
+        // (p.ej. sizeof de un struct mal calculado) pase el bounds check por wraparound.
+        if (len > m_size - m_pos) return false;
         std::memcpy(out, m_data + m_pos, len);
         m_pos += len;
         return true;
