@@ -3,6 +3,28 @@
 
 namespace kmp::entity_hooks {
 
+// ── FIX-FACTORY-EARLY (2026-06-20) ──
+// Flag de activación de la "captura temprana del factory vía el hook CharacterCreate".
+//
+// CAUSA RAÍZ: InstallAt() instala el hook MovRaxRsp con bypass=1 (Phase 6 de
+// hook_manager.cpp -> "starts BYPASSED"). Mientras bypass=1, el naked detour
+// cortocircuita ANTES de llamar a Hook_CharacterCreate: salta directo al original.
+// Por eso el CUERPO del hook (incl. la captura de s_savedFactory y la promoción al
+// SpawnManager) NUNCA corre durante la carga del save -> m_factory queda en 0,
+// IsReady()=false, y el spawn de remotos no arranca. El bypass solo se limpia en
+// HookManager::Enable() dentro de ResumeForNetwork/OnGameLoaded, DESPUÉS de que la
+// carga ya creó todos los NPCs.
+//
+// SOLUCIÓN (Opción A, la más segura): armar el hook (bypass->0) DESDE Install(),
+// dejándolo en LOADING PASSTHROUGH (s_loadingPassthrough=true). En passthrough el
+// cuerpo hace lo MÍNIMO: timestamp + counter + guardar el 1er arg (factory) +
+// promover al SpawnManager + delegar al original. Así captura el factory en el 1er
+// create de CUALQUIER carga, sin ejecutar lógica pesada en bypass.
+//
+// Si en alguna build la captura temprana resultara peligrosa, poner este flag a
+// false: el hook vuelve a arrancar bypassed (comportamiento previo).
+extern bool kCaptureFactoryEarly;
+
 bool Install();
 void Uninstall();
 

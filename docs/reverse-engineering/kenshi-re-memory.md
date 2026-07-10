@@ -45,6 +45,36 @@ NEW: "48 8B C4 55 41 54 41 55 41 56 41 57 48 8D 68 88 48 81 EC 50 01 00 00 48 C7
   3. Game loop: en 0x82B8C8 hace `lea rcx,[0x2134110]; call 0x26724` (= GameWorld::mainLoop_GPUSensitiveStuff, unico virtual, slot0). El `lea` (no `mov`) prueba que es objeto embebido, no puntero.
   4. 513 sitios en .text hacen `lea reg,[0x2134110]` para pasar la instancia como `this`.
   5. Campos verificados por conteo de xref absoluto (instancia + offset): player @0x2134690 (609 refs), zoneMgr @0x21349C0 (284), theFactory @0x21345B0 (98), factionMgr @0x21345B8 (67), navmesh @0x21345C0 (130), nodeList @0x21345C8 (62).
+     - ⚠ CORRECCIÓN 2026-06-20: **theFactory @0x21345B0 es offset +0x4A0 sobre la instancia GameWorld
+       (0x2134110), NO +0x5B0.** 0x21345B0 - 0x2134110 = **0x4A0**. (+0x5B0 = 0x21346C0 = OTRO campo,
+       un FLOAT 1.0f en runtime). Mejor tratarlo como **puntero global .data directo @RVA 0x21345B0**
+       (no como GW+offset): 9 callers de RootObjectFactory::create (0x583400) lo cargan con
+       `mov rcx,[rip+disp]` -> 0x21345B0. Ver "theFactory / RootObjectFactory" abajo.
+
+## theFactory / RootObjectFactory — RESUELTO (Steam 1.0.68) [2026-06-20]
+**theFactory = PUNTERO GLOBAL en .data @ RVA 0x21345B0** (VA = modBase+0x21345B0). NO es un campo
+leído como `[GW+off]` por el código del juego; es un global independiente cargado vía RIP-relative.
+- RE de bytes (capstone): `RootObjectFactory::create` (0x583400) y `process` (0x581770) NO tienen
+  callers `call rel32` directos; se invocan vía thunks JMP: process←thunk 0x29195, create←thunk 0x2C5A2.
+- **9 de 11 callers de create cargan rcx (el factory/this) con `mov rcx,[rip+disp]` que resuelve
+  SIEMPRE a RVA 0x21345B0:** call-sites 0x36B202/0x36BEEC/0x36F560/0x36F889/0x4D11EE/0x4D777A/
+  0x54EC45/0x8743E3/0x8F7516 (instr. de carga en -0x7 de cada uno). Convergencia total → es theFactory.
+- create guarda el factory en r14 (0x58343C `mov r14,rcx`) y se lo pasa a process intacto
+  (0x583995 `mov rcx,r14; call create_thunk`). process: rcx=this(factory), rdx=gameData; lee
+  `[rdx+0x18]`→`[rax+0x50]` cmp 0xD (tipo Character). Firma `void* process(void* factory, void* gameData)`.
+- **El valor estático en 0x21345B0 es una entrada de relocación (puntero), NO un float** — en runtime
+  contiene el RootObjectFactory* del heap (1er qword = vtable en .text). Validación correcta del fix:
+  no-null, alineado 8, fuera del módulo, y `*factory` (vtable) dentro de .text.
+- **BUG del FIX viejo (FIX-FACTORY-GW):** usó GW+0x5B0 (=0x21346C0) en vez de +0x4A0 (=0x21345B0).
+  GW+0x5B0 contiene en runtime 0x3F800000 (float 1.0f) → al usarlo como factory en CallFactoryCreate
+  → CRASH. Confirmado por el log `capturado factory=0x3F800000 de GW+0x5B0`. Corregido en spawn_manager.cpp:
+  vía primaria = leer el global estático modBase+0x21345B0 (deref) con validación de vtable en .text.
+| RVA Steam 1.0.68 | Función / dato |
+|---|---|
+| 0x21345B0 | **theFactory (puntero global .data)** — leer `*(modBase+0x21345B0)` = RootObjectFactory* |
+| 0x583400 | RootObjectFactory::create (dispatcher alto nivel; factory en rcx desde el global) |
+| 0x581770 | RootObjectFactory::process (rcx=factory, rdx=gameData; mov rax,rsp prólogo) |
+| 0x29195 / 0x2C5A2 | thunks JMP a process / create |
   6. NO existe ningun puntero en .data/.rdata que contenga 0x2134110 -> confirmado: no hay variable `GameWorld* ou` separada.
 - **IMPLICACION PARA EL MOD**: validateGameWorld()/consumidores hacen `gwObj = *candidateAddr` (tratan GameWorldSingleton como GameWorld**). Con instancia directa eso es INCORRECTO. Dos arreglos posibles:
   - (A) GameWorldSingleton = base + 0x2134110 y tratarlo como GameWorld* DIRECTO (quitar el primer deref: gwObj = candidateAddr, NO *candidateAddr).

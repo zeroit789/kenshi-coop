@@ -1662,6 +1662,26 @@ void Core::OnGameLoaded() {
         }
     }
 
+    // ═══ FIX-FACTORY-GW #1: capturar theFactory desde GameWorld+0x5B0 ═══
+    // CAUSA RAÍZ del spawn de remotos roto: el hook CharacterCreate (única fuente previa del
+    // m_factory) NO dispara al conectar con la partida YA cargada (no hay creates nuevos), así
+    // que IsReady()=false y el gate del heap scan + el de spawn bloqueaban todo el flujo.
+    // Aquí capturamos el factory directamente de la instancia GameWorld (GW+0x5B0, RVA absoluto
+    // 0x21345B0; confirmado en docs/reverse-engineering/kenshi-re-memory.md línea 47), sin
+    // depender del hook -> IsReady() pasa a true. Tras flag kCaptureFactoryFromGameWorld (=true).
+    if (m_gameFuncs.GameWorldSingleton != 0 && !m_spawnManager.IsReady()) {
+        // NOTA (2026-06-20): el factory es el puntero global theFactory @ RVA 0x21345B0
+        // (== GW+0x4A0, NO +0x5B0). Si aquí aún está NULL (el host acaba de empezar NEW GAME
+        // y todavía no creó su 1er personaje), el reintento por tick FIX-FACTORY-RETRY lo
+        // capturará en cuanto el juego llene el slot. Ver core.cpp OnGameTick.
+        m_nativeHud.LogStep("GAME", "Capturando factory (theFactory @0x21345B0)...");
+        if (m_spawnManager.CaptureFactoryFromGameWorld(m_gameFuncs.GameWorldSingleton)) {
+            m_nativeHud.LogStep("OK", "Factory capturado @0x21345B0 (IsReady=true)");
+        } else {
+            m_nativeHud.LogStep("WARN", "Factory @0x21345B0 aún NULL — reintento por tick activo");
+        }
+    }
+
     // ═══ Verify spawn system readiness ═══
     m_nativeHud.LogStep("GAME", "Verifying spawn system...");
     bool spawnReady = m_spawnManager.VerifyReadiness();
@@ -2795,6 +2815,301 @@ static void SetHostControlledCharTick(Core& core) {
                      "PI=0x{:X} faction=0x{:X}). Revisar si SetControlledChar 0x802520 es correcto.",
                      s_hostControlledAttempts, ds.called, ds.faction250_post,
                      ds.playerIface, playerFaction);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// [FIX-AI-NULL] — El char del host nace con char+0x650 (AI*) == NULL.
+// ══════════════════════════════════════════════════════════════════════════════════
+// HALLAZGO RUNTIME (log 2 jugadores, [DIAG-COMBATSTRUCT]): el char primario del host
+// tiene char+0x650 (AI) == NULL. CAMINA porque char+0x640 (CharMovement) sí existe, pero
+// NO piensa / NO combate / NO es objetivo: sin el subsistema de IA el AI tick no encuentra
+// cola de tareas ni estado de combate. En sesiones PRE-Nameless el AI era válido
+// (p.ej. 0xA2ED9C60); post-Nameless aparece NULL.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────
+// RE DE BYTES — ¿quién crea el AI y lo escribe en char+0x650? (Steam 1.0.68, ke_re.py)
+// ─────────────────────────────────────────────────────────────────────────────────────
+// Cruce con KenshiLib (firmas exactas) + delta de versión +0x780 (ventana de combate,
+// audit-12) + verificación directa de bytes del binario:
+//
+//   • Character::createComponents(GameDataCopyStandalone* appearance)
+//       KenshiLib RVA 0x62A7D0  → Steam 0x62AF50  (+0x780). VERIFICADO:
+//       - prólogo 'mov rax,rsp' (48 8B C4) en 0x62AF50.
+//       - lee rdx = appearance (mov r12,rdx en +0x2B).
+//       - en 0x62AF84: call [vtable+0x228] (init/createPhysical — código pesado del motor).
+//       - en 0x62AFB8: *** mov [rsi+0x650], rax ***  ← ÚNICO sitio del binario (de 5 totales
+//         que escriben [reg+0x650]) que aloca el AI y lo guarda en char+0x650. ESTA es la
+//         función que "crea el AI ausente".
+//       - acto seguido aloca char+0x648 (CharBody, 0x3B8 bytes) y char+0x640 (CharMovement).
+//       ⛔ NO es idempotente: SOBREESCRIBE char+0x650/+0x648/+0x640 INCONDICIONALMENTE (sin
+//         test previo). Si el host YA tiene CharBody/CharMovement (y los tiene: camina),
+//         llamar createComponents los RE-ALOCA → fuga de los antiguos + estado a medias →
+//         corrupción/crash casi seguros. Además EXIGE un GameDataCopyStandalone* válido en rdx.
+//
+//   • Character::giveBirth(appearance, pos, rot, GameSaveState*, ActivePlatoon*, Faction*)
+//       vtable Character +0x378 → thunk 0xA687 → 0x62B210 (KenshiLib 0x62AA90 +0x780).
+//       VERIFICADO (vtable+0x378 qword = 0x14000A687, jmp → 0x62B210). Es el constructor de
+//       alto nivel: 6 args complejos. Llamarla sobre un char YA nacido = doble nacimiento =
+//       catástrofe (re-corre toda la cadena create→createComponents).
+//
+//   • Character::setupAI()  (KenshiLib 0x6213F0; el proyecto la conoce como setActivePlatoon
+//       0x6213F0 — misma región, RE previo del FIX-PLATOON). VERIFICADO: LEE [char+0x650]
+//       repetidamente (mov rcx,[rdi+650h] en 0x621BDB/0x621C47/0x621CDD) y hace call [rax+58h]
+//       sobre él. ASUME que el AI YA EXISTE: lo configura, NO lo crea. Si char+0x650==NULL →
+//       deref de NULL → CRASH. NO sirve para arreglar AI==NULL.
+//
+//   • AI::create / AICreate 0x622110: this=rcx es el PROPIO objeto AI (escribe AI+0x300..+0x318,
+//       AI+0x8), NO el Character. Es el ctor interno del AI; no escribe char+0x650 por sí mismo
+//       (lo invoca createComponents tras alocar el bloque). Llamarla suelta no enlaza nada.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────
+// VEREDICTO DE SEGURIDAD — POR QUÉ EL FLAG QUEDA EN false (NO se invoca a ciegas)
+// ─────────────────────────────────────────────────────────────────────────────────────
+// NINGUNA de las funciones que tocan char+0x650 es segura de invocar sobre un char ya
+// existente al que solo le falta el AI:
+//   - setupAI/setActivePlatoon LEEN char+0x650 → crashean si es NULL.
+//   - createComponents/giveBirth lo CREAN, pero RE-ALOCAN el resto de subsistemas (body,
+//     movement) sin guard de idempotencia y EXIGEN un GameDataCopyStandalone* (appearance)
+//     + (giveBirth) pos/rot/state/platoon/faction. Sobre un char ya nacido = corrupción/crash.
+// El prompt es explícito: "mejor un DLL que no crashea que uno que sí". Como NO se puede
+// confirmar una firma SEGURA (idempotente, sin args externos) que cree solo el AI, este fix
+// queda DOCUMENTADO y DESACTIVADO (kFixHostAiNull=false). El helper SEH_DiagHostAiNull SOLO
+// LEE/loguea el estado de char+0x650 (antes/después conceptual) para confirmar el síntoma en
+// runtime sin tocar memoria. La vía de invocación queda escrita pero tras el guard del flag.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────
+// ¿LO CAUSÓ NAMELESS? — el ángulo del "char equivocado" (punto 2 del encargo)
+// ─────────────────────────────────────────────────────────────────────────────────────
+// GetPlayerPrimaryCharacterDirect() reclama data[0] de la lektor PlayerInterface+0x2B0
+// (game_character.cpp:913): el PRIMER Character* de la lista del jugador. Dos observaciones:
+//   (a) El FIX-COMBATCLASS (RE previo, líneas ~2825) documenta que el char del host tiene
+//       AI(+0x650) PRESENTE y solo CombatClass(+0x8) NULL. El nuevo log dice AI==NULL. Esa
+//       CONTRADICCIÓN sugiere que NO es el mismo char: con Nameless el orden/contenido de la
+//       lista cambió (antes 'Zero/Pepo' + 'Player 1'; ahora otro), y data[0] puede apuntar a
+//       un char insertado a medio nacer (AI aún no creado) en vez del char realmente jugable.
+//   (b) Si el problema es el CHAR EQUIVOCADO, el arreglo correcto NO es fabricar el AI a mano
+//       (peligroso) sino RECLAMAR EL CHAR CORRECTO: el que tiene char+0x650 con vtable de AI
+//       válida (== modBase+0x16FA3E8). El helper de abajo vuelca, para los primeros N chars de
+//       la lista, cuál tiene AI válido — para decidir en runtime si basta cambiar el índice
+//       reclamado (vía data[i] con AI!=NULL) en lugar de crear el subsistema.
+//
+// SEGURIDAD/THREAD: igual que FIX-COMBATCLASS/FIX-PLATOON — SOLO host, HILO DE LÓGICA
+// (OnGameTick), nunca desde el callback de red. Todo bajo SEH en helper POD (sin objetos C++
+// en el __try → evita C2712). One-shot re-armable. Throttle 250ms.
+
+// Toggle maestro del FIX-AI-NULL. DEFAULT **false** (no se invoca ninguna creación de AI a
+// ciegas: ver VEREDICTO DE SEGURIDAD arriba). Con el flag en false, FixHostAiNullTick SOLO
+// diagnostica (lee/loguea char+0x650 y busca un char alternativo con AI válido); NO escribe
+// memoria del juego. Subir a true ÚNICAMENTE si se confirma una firma segura de creación de AI.
+static constexpr bool kFixHostAiNull = false;
+
+// Firmas RE-verificadas (sin usar mientras el flag esté en false; documentadas para activación).
+//   createComponents 0x62AF50: bool(__fastcall)(Character* this, GameDataCopyStandalone* appearance)
+using CreateComponentsFn = bool(__fastcall*)(void* character, void* appearance);
+//   setupAI 0x621B70 (lee char+0x650): void(__fastcall)(Character* this)  ← NO arregla NULL
+using SetupAiFn = void(__fastcall*)(void* character);
+
+// Estado one-shot del FIX-AI-NULL (re-armable en disconnect / nueva carga).
+static std::atomic<bool> s_aiNullFixDone{false};
+static int  s_aiNullAttempts = 0;
+static auto s_lastAiNullTry  = std::chrono::steady_clock::now();
+static constexpr int AINULL_MAX_ATTEMPTS = 240; // ~varios segundos (≈throttle 250ms), igual que COMBATCLASS
+
+// Re-arma el FIX-AI-NULL para una partida/conexión nueva (mismo patrón que FIX-COMBATCLASS).
+void ResetHostAiNullFix() {
+    s_aiNullFixDone.store(false);
+    s_aiNullAttempts = 0;
+    s_lastAiNullTry = std::chrono::steady_clock::now();
+}
+
+// Snapshot POD del FIX-AI-NULL (vive dentro del __try; sin objetos C++ → evita C2712).
+struct AiNullFixSnapshot {
+    uintptr_t hostChar       = 0;  // data[0] de la lista del jugador (lo que reclama el mod)
+    uintptr_t aiPre          = 0;  // char+0x650 ANTES — 0 = AI ausente (síntoma)
+    int       aiPreVtblOk     = 0; // 1 si aiPre válido y vtable == kAIVtableRVA(abs)
+    uintptr_t aiPost         = 0;  // char+0x650 DESPUÉS (igual a aiPre mientras el flag esté en false)
+    int       aiPostVtblOk    = 0; // 1 si aiPost válido y vtable correcta
+    uintptr_t movement       = 0;  // char+0x640 (debe existir: el host camina)
+    uintptr_t body           = 0;  // char+0x648
+    int       alreadyHad     = 0;  // 1 si char+0x650 ya tenía un AI válido (idempotencia: nada que hacer)
+    int       called         = 0;  // 0 no se llamó (flag off) · 1 llamado · -1 excepción en la llamada
+    // ── Ángulo "char equivocado": primer char de la lista con AI VÁLIDO (índice alternativo) ──
+    int       altIndex       = -1; // índice i (data[i]) con AI válido != hostChar ; -1 si ninguno
+    uintptr_t altChar        = 0;  // ese Character*
+    uintptr_t altAi          = 0;  // su char+0x650 (AI válido)
+    int       listSize       = 0;  // tamaño de la lista del jugador (PlayerInterface+0x2B0+0x08)
+};
+
+// Lee el estado del AI del host y (sin activar nada mientras kFixHostAiNull=false) busca un char
+// alternativo con AI válido en la lista del jugador. SOLO LECTURA salvo que el flag se active.
+//   chr            = host char (data[0])
+//   aiVtblAbs      = modBase + kAIVtableRVA (vtable conocida del AI para validar)
+//   listData/listN = data[] y size de la lektor del jugador (para el ángulo "char equivocado")
+//   ccFn/appearance= createComponents + appearance (SOLO se usan si kFixHostAiNull==true)
+static void SEH_DiagHostAiNull(uintptr_t chr, uintptr_t aiVtblAbs,
+                               uintptr_t listData, int listN,
+                               CreateComponentsFn ccFn, void* appearance,
+                               AiNullFixSnapshot* out) {
+    auto isHeap = [](uintptr_t v) -> bool {
+        if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+        if ((v & 0x7) != 0) return false;
+        return true;
+    };
+    __try {
+        if (!isHeap(chr)) return;
+        out->hostChar = chr;
+        uintptr_t vtbl = 0;
+
+        // Estado base del host: movement (debe existir), body, y el AI (síntoma).
+        uintptr_t mv = 0, bd = 0, ai = 0;
+        Memory::Read(chr + 0x640, mv); out->movement = mv;
+        Memory::Read(chr + 0x648, bd); out->body     = bd;
+        Memory::Read(chr + 0x650, ai); out->aiPre    = ai;
+        if (isHeap(ai) && Memory::Read(ai, vtbl) && vtbl == aiVtblAbs) {
+            out->aiPreVtblOk = 1;
+            out->alreadyHad  = 1;       // el host YA tiene AI válido → no es la causa (idempotencia).
+            out->aiPost      = ai;
+            out->aiPostVtblOk = 1;
+        }
+
+        // ── Ángulo "char equivocado": ¿hay OTRO char en la lista del jugador con AI válido? ──
+        // Recorre data[1..N-1] (data[0] es el host) y reporta el primero con vtable de AI correcta.
+        out->listSize = listN;
+        if (isHeap(listData)) {
+            int cap = listN; if (cap > 32) cap = 32; // techo de seguridad
+            for (int i = 0; i < cap; i++) {
+                uintptr_t ci = 0;
+                if (!Memory::Read(listData + (uintptr_t)i * 8, ci) || !isHeap(ci)) continue;
+                if (ci == chr) continue;
+                uintptr_t aii = 0, cvt = 0;
+                if (!Memory::Read(ci + 0x650, aii) || !isHeap(aii)) continue;
+                if (Memory::Read(aii, cvt) && cvt == aiVtblAbs) {
+                    out->altIndex = i; out->altChar = ci; out->altAi = aii;
+                    break;
+                }
+            }
+        }
+
+        // ── Vía de creación de AI (DESACTIVADA mientras kFixHostAiNull==false) ──
+        // Solo se ejecutaría si: flag activo + host SIN AI + appearance válido. createComponents
+        // RE-ALOCA body/movement (no idempotente) → reservado, no se usa sin confirmar firma segura.
+        if (kFixHostAiNull && ccFn && appearance && out->aiPre == 0 && isHeap((uintptr_t)appearance)) {
+            ccFn(reinterpret_cast<void*>(chr), appearance);
+            out->called = 1;
+            uintptr_t post = 0;
+            if (Memory::Read(chr + 0x650, post)) {
+                out->aiPost = post;
+                if (isHeap(post) && Memory::Read(post, vtbl))
+                    out->aiPostVtblOk = (vtbl == aiVtblAbs) ? 1 : 0;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->called = -1;
+    }
+}
+
+// Orquesta el FIX-AI-NULL. Mismo patrón que FixHostCombatClassTick: throttle 250ms, one-shot
+// re-armable, SOLO host, en el HILO DE LÓGICA. Con kFixHostAiNull=false NO escribe memoria del
+// juego: solo confirma el síntoma y reporta si hay un char alternativo con AI válido (ángulo
+// "char equivocado"). Corre ANTES del FIX-COMBATCLASS/FIX-PLATOON (que ASUMEN AI!=NULL).
+static void FixHostAiNullTick(Core& core) {
+    if (s_aiNullFixDone.load()) return;                  // ya resuelto / confirmado
+    if (s_aiNullAttempts >= AINULL_MAX_ATTEMPTS) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastAiNullTry < std::chrono::milliseconds(250)) return;
+    s_lastAiNullTry = now;
+    s_aiNullAttempts++;
+
+    uintptr_t modBase = Memory::GetModuleBase();
+    if (modBase == 0) return;
+
+    uintptr_t hostChar = game::GetPlayerPrimaryCharacterDirect();
+    if (hostChar <= 0x10000) return;                     // char aún no resoluble → reintentar
+
+    const uintptr_t aiVtblAbs = modBase + 0x16FA3E8;     // vtable AI (char+0x650), CombatStructSnapshot::kAIVtableRVA
+
+    // Resolver data[] y size de la lista del jugador para el ángulo "char equivocado".
+    // (Mismo camino que GetPlayerPrimaryCharacterDirect: GameWorld→player(PI)→PI+0x2B0 lektor.)
+    uintptr_t listData = 0; int listN = 0;
+    {
+        uintptr_t gwAddr = game::GetResolvedGameWorld();
+        if (gwAddr != 0) {
+            uintptr_t gw = 0;
+            if (!(Memory::Read(gwAddr, gw) && gw > 0x10000)) gw = gwAddr;
+            const auto& off = game::GetOffsets();
+            uintptr_t pi = 0;
+            if (Memory::Read(gw + off.world.player, pi) && pi > 0x10000) {
+                uintptr_t lek = pi + off.playerInterface.playerCharacters; // +0x2B0
+                uint32_t sz = 0; uintptr_t dp = 0;
+                if (Memory::Read(lek + 0x08, sz) && Memory::Read(lek + 0x10, dp)) {
+                    if (sz > 0 && sz <= 100000) { listData = dp; listN = (int)sz; }
+                }
+            }
+        }
+    }
+
+    // appearance NO se resuelve (la vía de creación está tras el flag, que está en false).
+    AiNullFixSnapshot fx{};
+    SEH_DiagHostAiNull(hostChar, aiVtblAbs, listData, listN,
+                       /*ccFn=*/nullptr, /*appearance=*/nullptr, &fx);
+
+    if (fx.alreadyHad) {
+        // El host YA tiene AI válido → NO es la causa (o ya se resolvió). Cerrar one-shot.
+        s_aiNullFixDone.store(true);
+        spdlog::info("[FIX-AI-NULL] host char=0x{:X} ya tiene AI VÁLIDO (char+0x650=0x{:X}, vtblOk=1) "
+                     "→ no aplica (idempotente). El combate no se bloquea por AI nulo en este char.",
+                     fx.hostChar, fx.aiPre);
+        return;
+    }
+
+    if (fx.called == 1) {
+        // Solo posible con kFixHostAiNull==true (hoy inalcanzable). Registrado por completitud.
+        if (fx.aiPostVtblOk) {
+            s_aiNullFixDone.store(true);
+            spdlog::info("[FIX-AI-NULL] APLICADO ✓ char=0x{:X} | char+0x650: 0x{:X} -> 0x{:X} (vtblOk=1) "
+                         "vía createComponents 0x62AF50 (intento {}).",
+                         fx.hostChar, fx.aiPre, fx.aiPost, s_aiNullAttempts);
+        } else {
+            spdlog::warn("[FIX-AI-NULL] createComponents NO dejó un AI válido (post=0x{:X}) — revisar "
+                         "appearance/firma. char=0x{:X}.", fx.aiPost, fx.hostChar);
+        }
+        return;
+    }
+    if (fx.called == -1) {
+        if (s_aiNullAttempts <= 5 || s_aiNullAttempts % 60 == 0)
+            spdlog::warn("[FIX-AI-NULL] excepción durante el diagnóstico (char=0x{:X}) — reintento {}.",
+                         fx.hostChar, s_aiNullAttempts);
+        return;
+    }
+
+    // Flag en false → SOLO diagnóstico. Loguear el síntoma + el ángulo "char equivocado".
+    // ANTES (char+0x650) y, conceptualmente, DESPUÉS (igual: no se tocó memoria).
+    if (s_aiNullAttempts <= 5 || s_aiNullAttempts % 120 == 0) {
+        const char* verdict;
+        if (fx.aiPre != 0 && !fx.aiPreVtblOk)
+            verdict = "char+0x650 != NULL pero vtable de AI desconocida → objeto inesperado (re-examinar)";
+        else if (fx.altIndex >= 0)
+            verdict = "*** AI del host NULL, PERO data[altIndex] SÍ tiene AI válido → el mod reclama el "
+                      "CHAR EQUIVOCADO. FIX RECOMENDADO (seguro): reclamar data[altIndex] en vez de data[0] "
+                      "en GetPlayerPrimaryCharacterDirect/ClaimHostPrimaryCharacter (NO crear AI a mano) ***";
+        else
+            verdict = "AI del host NULL y NINGÚN char de la lista tiene AI válido → la creación de AI no es "
+                      "segura sin appearance/firma confirmada. Mantener kFixHostAiNull=false (no crashear).";
+
+        spdlog::info("[FIX-AI-NULL] DIAG host char=0x{:X} | char+0x650(AI) ANTES=0x{:X} vtblOk={} | "
+                     "DESPUÉS=0x{:X} (sin tocar: flag off) | move(+0x640)=0x{:X} body(+0x648)=0x{:X} | "
+                     "listSize={} altIndex={} altChar=0x{:X} altAi=0x{:X} (intento {})",
+                     fx.hostChar, fx.aiPre, fx.aiPreVtblOk, fx.aiPost, fx.movement, fx.body,
+                     fx.listSize, fx.altIndex, fx.altChar, fx.altAi, s_aiNullAttempts);
+        spdlog::info("[FIX-AI-NULL] ==> {}", verdict);
+    }
+    if (s_aiNullAttempts == AINULL_MAX_ATTEMPTS) {
+        spdlog::warn("[FIX-AI-NULL] diagnóstico agotado tras {} intentos (kFixHostAiNull=false: NO se "
+                     "creó AI por seguridad). Si altIndex>=0 en los logs → reclamar ese char; si no → "
+                     "resolver el appearance (GameDataCopyStandalone*) antes de activar el flag.",
+                     s_aiNullAttempts);
     }
 }
 
@@ -5720,6 +6035,42 @@ void Core::OnGameTick(float deltaTime) {
     WriteBreadcrumb("tick_entry", s_tickCallCount);
     SetLastCompletedStep(0);
 
+    // ── FIX-FACTORY-RETRY (2026-06-20): reintento PERSISTENTE de la captura del factory ──
+    // CAUSA RAÍZ (verificada por RE de bytes, Steam 1.0.68):
+    //   theFactory @ RVA 0x21345B0 es un PUNTERO GLOBAL que el ctor de GameWorld (0x874E70)
+    //   pone a NULL en 0x874EF2 (`mov [GW+0x4A0], r13` con r13=0). El juego lo rellena LAZY,
+    //   solo cuando ejecuta RootObjectFactory::create (0x583400) -> process (0x581770) por
+    //   PRIMERA vez. Verificado: 98 lecturas `mov rcx,[0x21345B0]`, 0 escrituras y 0 LEA
+    //   estáticos en .text -> el slot se inicializa en runtime, no antes.
+    //
+    //   En el flujo host = "Multiplayer NEW GAME", cuando CaptureFactoryFromGameWorld corría
+    //   UNA sola vez en OnGameLoaded, el slot AÚN estaba NULL/residuo (0x590301A0) porque el
+    //   primer create del personaje del host todavía no había ocurrido -> m_factory=0 para
+    //   siempre. El único retry existente (HandleSpawnQueue ~8090) está GATEADO por
+    //   `queueSize>0`: sin joiners no hay spawns pendientes -> NUNCA se reintenta.
+    //
+    // FIX: reintentar la captura cada ~1s mientras el juego esté cargado y aún sin factory.
+    //   En cuanto el host cree su primer personaje (y el juego llene 0x21345B0), la siguiente
+    //   pasada captura el factory real y IsReady() pasa a true SIN forzar creates ni spawnar
+    //   NPCs dummy. CaptureFactoryFromGameWorld ya es SEH-safe (valida con Memory::Read y
+    //   rechaza el residuo de 32 bits en el check#4). Coste: 1 comparación + (cuando falta) una
+    //   lectura de puntero, una vez por segundo. No-op en cuanto IsReady()==true.
+    if (!m_spawnManager.IsReady() && m_gameFuncs.GameWorldSingleton != 0) {
+        static int s_factoryRetryGuard = 0;
+        if (++s_factoryRetryGuard % 150 == 0) { // ~1s a 150 fps
+            uintptr_t sb = m_scanner.GetBase();
+            size_t    ss = m_scanner.GetSize();
+            if (ValidateGameWorldGlobal(m_gameFuncs.GameWorldSingleton, sb, ss)) {
+                if (m_spawnManager.CaptureFactoryFromGameWorld(m_gameFuncs.GameWorldSingleton)) {
+                    spdlog::info("Core: [FIX-FACTORY-RETRY] factory capturado en reintento por tick "
+                                 "(IsReady()=true) — el slot global 0x21345B0 quedó poblado tras el "
+                                 "primer create del host");
+                    m_nativeHud.LogStep("OK", "Factory capturado (retry por tick)");
+                }
+            }
+        }
+    }
+
     // ── Step 0: Force unpause ──
     // Kenshi allows pausing (Space key) which freezes the game world. In multiplayer
     // this must be prevented — the server keeps ticking regardless. Every tick, force
@@ -7758,7 +8109,29 @@ void Core::HandleSpawnQueue() {
     // Cooldown: don't re-scan more than once every 5 seconds
     auto timeSinceLastScan = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - s_lastHeapScan);
-    if (needsScan && m_spawnManager.IsReady() && timeSinceLastScan.count() >= 5) {
+
+    // ── FIX #2 (2026-06-20): DESACOPLAR el heap scan de IsReady() ──
+    // El gate previo `&& m_spawnManager.IsReady()` bloqueaba ScanGameDataHeap cuando no había
+    // factory (caso: conectar con la partida ya cargada -> hook no dispara -> IsReady()=false).
+    // Pero ScanGameDataHeap NO necesita el factory: su Strategy 2 deriva el GameDataManager de
+    // GameWorld+0x20 (spawn_manager.cpp ~536-570). Sin escanear, m_modCandidates queda vacío,
+    // FindModTemplates no encuentra los 'Player N' y modTemplates=0 -> '[loading]' eterno.
+    // Permitimos el scan cuando: hay factory (IsReady), O hay un GameWorld válido (basta para
+    // llenar m_modCandidates y que FindModTemplates encuentre los templates).
+    bool gwValidForScan = false;
+    if (m_gameFuncs.GameWorldSingleton != 0) {
+        uintptr_t sb = m_scanner.GetBase();
+        size_t    ss = m_scanner.GetSize();
+        gwValidForScan = ValidateGameWorldGlobal(m_gameFuncs.GameWorldSingleton, sb, ss);
+    }
+    // Red de seguridad FIX-FACTORY-GW #1: si OnGameLoaded corrió antes de que el GameWorld
+    // estuviera resuelto, reintentamos la captura del factory aquí (idempotente: no-op si ya
+    // hay factory). Así IsReady() se activa en cuanto el GameWorld es válido.
+    if (!m_spawnManager.IsReady() && gwValidForScan) {
+        m_spawnManager.CaptureFactoryFromGameWorld(m_gameFuncs.GameWorldSingleton);
+    }
+    bool canScan = m_spawnManager.IsReady() || gwValidForScan;
+    if (needsScan && canScan && timeSinceLastScan.count() >= 5) {
         if (m_spawnManager.GetManagerPointer() != 0 || m_spawnManager.GetTemplateCount() < 10) {
             heapScanAttempts++;
             s_lastHeapScan = std::chrono::steady_clock::now();

@@ -37,6 +37,19 @@ struct SpawnRequest {
 
 static constexpr uint32_t MAX_SPAWN_RETRIES = 200; // ~10 seconds at 20 ticks/sec
 
+// ── FIX-FACTORY-GW: flag de activación (2026-06-20, CORREGIDO) ──
+// true  = capturar theFactory desde el PUNTERO GLOBAL theFactory (RVA 0x21345B0) sin depender
+//         del hook CharacterCreate (necesario al conectar con la partida YA cargada: no hay
+//         creates -> hook no dispara).
+// CORRECCIÓN 2026-06-20 (RE de bytes verificado): theFactory NO está en GameWorld+0x5B0
+//   (ese offset contiene un FLOAT 1.0f = 0x3F800000 -> el FIX viejo crasheaba). theFactory es un
+//   PUNTERO GLOBAL independiente en .data @ RVA 0x21345B0, que 9 callers distintos de
+//   RootObjectFactory::create (0x583400) cargan en rcx vía `mov rcx,[rip+theFactory]`. Su offset
+//   relativo a la instancia GameWorld (modBase+0x2134110) es +0x4A0 (NO +0x5B0).
+// Es VARIABLE (no constexpr) para poder DESACTIVARLO en runtime si [DIAG-FACTORY-MATCH] revela
+// que el factory leído NO coincide con el que el hook captura. Definido en spawn_manager.cpp.
+extern bool kCaptureFactoryFromGameWorld;
+
 class SpawnManager {
 public:
     // Called from entity_hooks when a character is created by the game.
@@ -70,6 +83,18 @@ public:
 private:
     // The captured RootObjectFactory instance
     void* m_factory = nullptr;
+
+    // ── FIX-FACTORY-GW (2026-06-20, CORREGIDO) ──
+    // Diagnóstico de origen del factory para verificar la captura:
+    //   theFactory (global RVA 0x21345B0)  ==  el `factory` (1er arg de process()) que el hook capturaba.
+    // m_factoryFromGameWorld: el puntero leído del global theFactory (fix #1, sin depender del hook).
+    //                         (el nombre se conserva por compat; la fuente real es el global .data).
+    // m_factoryFromHook:      el 1er arg que el hook CharacterCreate recibe (SI llega a disparar).
+    // Se comparan en OnGameCharacterCreated -> log [DIAG-FACTORY-MATCH]. Si difieren, el factory
+    // del global NO es el correcto para CallFactoryCreate y se desactiva kCaptureFactoryFromGameWorld.
+    void* m_factoryFromGameWorld = nullptr;
+    void* m_factoryFromHook = nullptr;
+    bool  m_factoryMatchLogged = false; // evita spamear el log de comparación
 
     // The original factory->process function pointer (trampoline)
     FactoryProcessFn m_origProcess = nullptr;
@@ -138,6 +163,21 @@ public:
             m_factory = factory;
         }
     }
+
+    // ── FIX-FACTORY-GW #1 (2026-06-20, CORREGIDO) ──
+    // Captura theFactory desde el PUNTERO GLOBAL theFactory (RVA 0x21345B0), SIN depender del hook
+    // CharacterCreate (que NO dispara al conectar con la partida ya cargada). Vía primaria: lee
+    // el puntero global estático modBase+0x21345B0 (robusto). Vía fallback: GW+0x4A0 (mismo address
+    // en 1.0.68; útil solo si en otra versión GameWorld fuese puntero clásico).
+    // En ambas valida que el resultado es un puntero de heap con vtable en .text -> descarta el
+    // float 1.0f que rompía el fix viejo (que leía el offset equivocado +0x5B0). 'gwSingleton' =
+    // GameFunctions.GameWorldSingleton. Devuelve true si capturó un factory plausible.
+    bool CaptureFactoryFromGameWorld(uintptr_t gwSingleton);
+
+    // [DIAG-FACTORY-MATCH] Registra el factory que el hook recibió (1er arg de process()) para
+    // compararlo con el capturado de GW+0x5B0. Llamado desde OnGameCharacterCreated. No cambia
+    // m_factory si éste ya fue puesto por la captura de GameWorld.
+    void NoteHookFactory(void* hookFactory);
     void SetOrigProcess(FactoryProcessFn fn) { m_origProcess = fn; }
     void SetOnSpawnedCallback(std::function<void(EntityID, void*)> cb) { m_onSpawned = cb; }
 
@@ -192,7 +232,10 @@ public:
     // porque ProcessSpawnQueue (game thread) las lee concurrentemente.
     void ResetForReconnect() {
         std::lock_guard lock(m_templateMutex);
-        m_factory = nullptr;                 // se recapturará vía OnGameCharacterCreated/SetFactory
+        m_factory = nullptr;                 // se recapturará vía CaptureFactoryFromGameWorld/hook/SetFactory
+        m_factoryFromGameWorld = nullptr;    // FIX-FACTORY-GW: re-armar diagnóstico en reconexión
+        m_factoryFromHook = nullptr;
+        m_factoryMatchLogged = false;        // permitir re-comparar hook vs GW en la nueva sesión
         m_factoryInputTemplates.clear();     // plantillas validadas por el factory (pueden estar liberadas)
         for (int i = 0; i < MAX_MOD_TEMPLATES; i++) m_modPlayerTemplates[i] = nullptr;
         m_modTemplateCount.store(0);

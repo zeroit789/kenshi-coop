@@ -159,7 +159,259 @@ void* SpawnManager::SpawnCharacterDirect(const Vec3* desiredPosition, int modSlo
     return nullptr;
 }
 
+// ── FIX-FACTORY-GW: definición del flag de activación (2026-06-20) ──
+// Activado por defecto. Ver declaración en spawn_manager.h.
+bool kCaptureFactoryFromGameWorld = true;
+
+// ── theFactory: PUNTERO GLOBAL en .data (RVA 0x21345B0) ── [CORREGIDO 2026-06-20]
+// RE de bytes verificado (capstone, Steam 1.0.68): theFactory es un puntero global independiente
+// en .data, NO un campo de GameWorld. 9 callers distintos de RootObjectFactory::create (0x583400)
+// lo cargan en rcx con `mov rcx, qword ptr [rip + disp]` resolviendo SIEMPRE a RVA 0x21345B0
+// (sitios 0x36B1FB, 0x36BEE5, 0x36F559, 0x36F882, 0x4D11E7, 0x4D7773, 0x54EC3E, 0x8743DC, 0x8F750F).
+// El binario estático tiene ahí una entrada de relocación (puntero), NO un float -> en runtime
+// contiene el RootObjectFactory* del heap. create() pasa ese rcx a process() (0x581770) intacto.
+//
+// El offset relativo a la instancia GameWorld (modBase+0x2134110) es +0x4A0 (== 0x21345B0).
+// ⛔ El FIX viejo usaba +0x5B0 (== 0x21346C0), que es OTRO campo y en runtime contiene un FLOAT
+//    1.0f (0x3F800000) -> al pasarlo a CallFactoryCreate como factory -> CRASH.
+static constexpr uintptr_t THEFACTORY_GLOBAL_RVA = 0x21345B0;  // dir. estática del puntero global
+static constexpr uintptr_t GW_THEFACTORY_OFFSET  = 0x4A0;      // == 0x21345B0 - 0x2134110
+
+// ── FIX-FACTORY-GW #1: captura del factory desde el global theFactory (RVA 0x21345B0) ──
+// No depende del hook CharacterCreate. Vía PRIMARIA: leer el puntero global estático
+// modBase+0x21345B0 (robusto, independiente del layout de GameWorld). Vía SECUNDARIA (fallback,
+// por si en otra versión GameWorld fuese un puntero clásico): GW+0x4A0. En ambos casos valida que
+// el resultado es un puntero de heap con vtable en .text (descarta el float que rompía el fix viejo).
+bool SpawnManager::CaptureFactoryFromGameWorld(uintptr_t gwSingleton) {
+    if (!kCaptureFactoryFromGameWorld) return false;
+    if (m_factory != nullptr) return true;   // ya capturado (por hook o por una llamada previa)
+
+    uintptr_t moduleBase = Memory::GetModuleBase();
+    if (moduleBase == 0) return false;
+    size_t moduleSize = 0x4000000; // fallback 64MB
+
+    // ── Rango REAL de cada sección PE (NO toda la imagen) ──────────────────────────────
+    // El fix viejo usaba textEnd = moduleBase + moduleSize (TODA la imagen ≈ 64MB) como
+    // "rango .text", lo cual es demasiado laxo: aceptaría una "vtable" que en realidad
+    // cayera en .rdata/.data/.bss. Aquí leemos las cabeceras de sección y calculamos:
+    //   - [textStart, textEnd)  = sección .text REAL (código)            (RVA 0x1000, ~22.4MB)
+    //   - [rdataStart,rdataEnd) = sección .rdata REAL (consts + VTABLES)  (RVA 0x1673000, ~5.3MB)
+    // IMPORTANTE (MSVC x64): las VTABLES viven en .rdata, NO en .text. Un RootObjectFactory*
+    // real tiene en su 1er qword un puntero a su vtable -> ese puntero apunta a .rdata, y las
+    // ENTRADAS de esa vtable apuntan a .text. Por eso el 1er nivel de validación acepta que la
+    // vtable esté en .rdata O .text (defensivo), y opcionalmente comprobamos que la 1ª entrada
+    // de la vtable apunte a .text (descarta floats/basura que casualmente caigan en .rdata).
+    uintptr_t textStart = moduleBase + 0x1000;     // fallback conservador
+    uintptr_t textEnd   = moduleBase + moduleSize;  // fallback (toda la imagen)
+    uintptr_t rdataStart = 0, rdataEnd = 0;
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(moduleBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                moduleSize = nt->OptionalHeader.SizeOfImage;
+                textEnd = moduleBase + moduleSize; // refrescar fallback con el tamaño real
+                // Recorrer las secciones para localizar .text y .rdata por nombre.
+                auto* sec = IMAGE_FIRST_SECTION(nt);
+                for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+                    char nm[9] = {};
+                    memcpy(nm, sec->Name, 8);
+                    uintptr_t s = moduleBase + sec->VirtualAddress;
+                    // VirtualSize puede ser 0 en binarios raros -> usar SizeOfRawData de respaldo.
+                    uintptr_t vsz = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+                    uintptr_t e = s + vsz;
+                    if (memcmp(nm, ".text", 5) == 0)  { textStart = s;  textEnd = e; }
+                    else if (memcmp(nm, ".rdata", 6) == 0) { rdataStart = s; rdataEnd = e; }
+                }
+            }
+        }
+    }
+    // Si no se halló .rdata por nombre, dejarlo vacío (la check de vtable caerá a solo-.text).
+    const uintptr_t kModuleEnd = moduleBase + moduleSize;
+
+    // ── Helper: ¿está 'a' dentro de [s, e) y el rango es válido? ──
+    auto inRange = [](uintptr_t a, uintptr_t s, uintptr_t e) -> bool {
+        return e > s && a >= s && a < e;
+    };
+
+    // Lambda de validación con LOGGING POR-CHECK (depuración del veredicto). Devuelve true
+    // SOLO si 'p' es un RootObjectFactory* plausible. Loguea exactamente qué check falla.
+    // 'tag' identifica la vía (primaria/fallback) en el log.
+    auto isPlausibleFactory = [&](uintptr_t p, const char* tag) -> bool {
+        // (1) No-null y dentro del rango canónico de user-space x64.
+        if (p <= 0x10000 || p >= 0x00007FFFFFFFFFFF) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#1 rango user-space "
+                         "(<=0x10000 o >=0x7FFF'FFFFFFFF)", tag, p);
+            return false;
+        }
+        // (2) Alineado a 8 (todo objeto C++ con vtable lo está).
+        if (p & 0x7) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#2 no alineado a 8", tag, p);
+            return false;
+        }
+        // (3) Heap fuera del módulo (un float/relleno del propio binario NO es heap).
+        if (p >= moduleBase && p < kModuleEnd) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#3 dentro del módulo "
+                         "[0x{:X},0x{:X}) (no es objeto de heap)", tag, p, moduleBase, kModuleEnd);
+            return false;
+        }
+        // (4) NUEVA — descarta el patrón "valor de 32 bits con mitad alta nula".
+        // Un puntero de heap x64 bajo ASLR NUNCA tiene los 32 bits altos a cero. El valor
+        // 0x590301A0 (constante, persistente) caía aquí: NO es un RootObjectFactory* real.
+        // El heap de un proceso x64 vive muy por encima de 0x1'00000000. Exigimos >= 0x10000000000
+        // (256 GB) que es donde residen heaps/módulos en Win x64 (módulo Kenshi ≈ 0x7FF6...).
+        if ((p >> 32) == 0) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#4 mitad alta NULA "
+                         "(valor de 32 bits, NO es puntero de heap x64 — p.ej. 0x590301A0)", tag, p);
+            return false;
+        }
+        if (p < 0x10000000000ull) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#4b por debajo del rango "
+                         "de heap x64 (<0x100'00000000)", tag, p);
+            return false;
+        }
+        // (5) El 1er qword del factory debe ser su VTABLE. En MSVC x64 la vtable vive en .rdata
+        // (sus entradas apuntan a .text). Aceptamos vtable en .rdata O .text (defensivo).
+        uintptr_t vt = 0;
+        if (!Memory::Read(p, vt)) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#5 *p ilegible (no se pudo "
+                         "leer la vtable)", tag, p);
+            return false;
+        }
+        bool vtInRdata = inRange(vt, rdataStart, rdataEnd);
+        bool vtInText  = inRange(vt, textStart, textEnd);
+        if (!vtInRdata && !vtInText) {
+            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#5 vtable=0x{:X} fuera de "
+                         ".rdata [0x{:X},0x{:X}) y .text [0x{:X},0x{:X})",
+                         tag, p, vt, rdataStart, rdataEnd, textStart, textEnd);
+            return false;
+        }
+        // (6) Refuerzo: si la vtable está en .rdata, su 1ª entrada (1er método virtual) debe
+        // apuntar a CÓDIGO (.text). Esto descarta que 'vt' sea un float/dato que casualmente
+        // caiga en .rdata. Si la lectura falla, NO rechazamos (defensivo: la check#5 ya pasó).
+        if (vtInRdata) {
+            uintptr_t firstSlot = 0;
+            if (Memory::Read(vt, firstSlot) && firstSlot != 0 && !inRange(firstSlot, textStart, textEnd)) {
+                spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#6 vtable@0x{:X} en .rdata "
+                             "pero su 1ª entrada=0x{:X} NO apunta a .text [0x{:X},0x{:X})",
+                             tag, p, vt, firstSlot, textStart, textEnd);
+                return false;
+            }
+        }
+        spdlog::info("[FIX-FACTORY-GW/{}] ACEPTADO p=0x{:X} (vtable=0x{:X}, {}): factory plausible",
+                     tag, p, vt, vtInRdata ? ".rdata" : ".text");
+        return true;
+    };
+
+    // ── Vía PRIMARIA: puntero global estático theFactory @ modBase+0x21345B0 ──
+    uintptr_t globalAddr = moduleBase + THEFACTORY_GLOBAL_RVA;
+    uintptr_t factoryPtr = 0;
+    if (Memory::Read(globalAddr, factoryPtr) && isPlausibleFactory(factoryPtr, "global")) {
+        m_factoryFromGameWorld = reinterpret_cast<void*>(factoryPtr);
+        m_factory = m_factoryFromGameWorld;   // IsReady() pasa a true sin depender del hook
+        uintptr_t vt = 0; Memory::Read(factoryPtr, vt);
+        spdlog::info("[FIX-FACTORY-GW] capturado factory=0x{:X} de theFactory global @RVA 0x{:X} "
+                     "(vt=0x{:X}) — IsReady()=true", factoryPtr, THEFACTORY_GLOBAL_RVA, vt);
+        return true;
+    }
+    spdlog::warn("SpawnManager: [FIX-FACTORY-GW] global theFactory @RVA 0x{:X} no plausible "
+                 "(valor=0x{:X}) — probando fallback GW+0x{:X}",
+                 THEFACTORY_GLOBAL_RVA, factoryPtr, GW_THEFACTORY_OFFSET);
+
+    // ── DIAG-FACTORY-SLOT: volcado de vecindad del slot global ──────────────────────────
+    // El slot @0x21345B0 contiene un valor no-puntero (p.ej. 0x590301A0). Dos hipótesis:
+    //   (A) el factory es un singleton lazy-init aún NO construido (host conectó con la partida
+    //       ya cargada -> ningún create natural llenó el slot todavía); o
+    //   (B) desfase fino de offset en esta build -> el factory real está en un qword VECINO.
+    // Volcamos ±0x40 alrededor del slot y marcamos qué qword SÍ pasaría isPlausibleFactory.
+    // Si un vecino resulta plausible, la próxima sesión revela el offset correcto SIN parchear
+    // a ciegas. Esto NO captura nada (solo diagnostica): la captura sigue gobernada por la
+    // validación endurecida. Coste: 17 lecturas SEH-safe, una sola vez por intento fallido.
+    {
+        spdlog::info("[DIAG-FACTORY-SLOT] volcado vecindad de theFactory @RVA 0x{:X} "
+                     "(modBase=0x{:X}):", THEFACTORY_GLOBAL_RVA, moduleBase);
+        for (int off = -0x40; off <= 0x40; off += 8) {
+            uintptr_t a = globalAddr + off;
+            uintptr_t v = 0;
+            bool ok = Memory::Read(a, v);
+            // ¿Este vecino sería un factory plausible? (reutiliza la misma lambda, tag "diag")
+            bool plausible = ok && isPlausibleFactory(v, "diag");
+            spdlog::info("  [DIAG-FACTORY-SLOT] RVA 0x{:X} (off {:+d}) = 0x{:016X}{}",
+                         THEFACTORY_GLOBAL_RVA + off, off, ok ? v : 0,
+                         plausible ? "  <-- PLAUSIBLE (posible factory real)" : "");
+        }
+    }
+
+    // ── Vía SECUNDARIA (fallback): resolver el objeto GameWorld y leer GW+0x4A0 ──
+    // Solo útil si en alguna versión GameWorld fuese un puntero clásico a heap (no es el caso de
+    // Steam 1.0.68, donde GW+0x4A0 == el mismo global 0x21345B0). Defensa frente a cambios de build.
+    if (gwSingleton == 0) {
+        spdlog::warn("SpawnManager: [FIX-FACTORY-GW] sin gwSingleton para el fallback — NO capturado");
+        return false;
+    }
+    uintptr_t first = 0;
+    uintptr_t gwObj = 0;
+    if (Memory::Read(gwSingleton, first) && first != 0) {
+        if (first >= textStart && first < textEnd) {
+            gwObj = gwSingleton;          // instancia directa (vtable en 1er qword)
+        } else if (first > 0x10000 && first < 0x00007FFFFFFFFFFF &&
+                   !(first >= moduleBase && first < moduleBase + moduleSize)) {
+            gwObj = first;                // puntero clásico a objeto de heap
+        }
+    }
+    if (gwObj == 0) {
+        spdlog::warn("SpawnManager: [FIX-FACTORY-GW] no se pudo resolver GameWorld desde 0x{:X} — NO capturado",
+                     gwSingleton);
+        return false;
+    }
+    factoryPtr = 0;
+    if (Memory::Read(gwObj + GW_THEFACTORY_OFFSET, factoryPtr) && isPlausibleFactory(factoryPtr, "GW+off")) {
+        m_factoryFromGameWorld = reinterpret_cast<void*>(factoryPtr);
+        m_factory = m_factoryFromGameWorld;
+        uintptr_t vt = 0; Memory::Read(factoryPtr, vt);
+        spdlog::info("[FIX-FACTORY-GW] capturado factory=0x{:X} de GW+0x{:X} (gwObj=0x{:X}, vt=0x{:X}) "
+                     "— IsReady()=true (vía fallback)", factoryPtr, GW_THEFACTORY_OFFSET, gwObj, vt);
+        return true;
+    }
+    spdlog::warn("SpawnManager: [FIX-FACTORY-GW] factory de GW+0x{:X} no plausible = 0x{:X} "
+                 "(gwObj=0x{:X}) — NO capturado", GW_THEFACTORY_OFFSET, factoryPtr, gwObj);
+    return false;
+}
+
+// ── FIX-FACTORY-GW #3: registro/comparación del factory del hook ──
+// Si el hook CharacterCreate llega a disparar, guardamos su 1er arg y lo comparamos con el
+// factory que capturamos del global theFactory (RVA 0x21345B0). Confirma o refuta la captura.
+void SpawnManager::NoteHookFactory(void* hookFactory) {
+    if (!hookFactory) return;
+    if (!m_factoryFromHook) m_factoryFromHook = hookFactory;
+
+    // Comparar una sola vez, cuando tengamos AMBOS valores.
+    if (!m_factoryMatchLogged && m_factoryFromGameWorld && m_factoryFromHook) {
+        m_factoryMatchLogged = true;
+        bool match = (m_factoryFromGameWorld == m_factoryFromHook);
+        spdlog::info("[DIAG-FACTORY-MATCH] hook=0x{:X} gw=0x{:X} match={}",
+                     reinterpret_cast<uintptr_t>(m_factoryFromHook),
+                     reinterpret_cast<uintptr_t>(m_factoryFromGameWorld),
+                     match ? "Y" : "N");
+        if (!match) {
+            // Riesgo materializado: el factory del global NO es el que usa process(). Para spawns
+            // FUTUROS preferimos el del hook (validado por el motor). Desactivamos la captura
+            // del global para nuevas conexiones (ResetForReconnect respeta m_factory limpio).
+            spdlog::error("[DIAG-FACTORY-MATCH] DISCREPANCIA: el factory de theFactory@0x21345B0 NO "
+                          "coincide con el del hook. Conmutando m_factory al del hook y desactivando "
+                          "kCaptureFactoryFromGameWorld para futuras conexiones.");
+            m_factory = m_factoryFromHook;
+            kCaptureFactoryFromGameWorld = false;
+        }
+    }
+}
+
 void SpawnManager::OnGameCharacterCreated(void* factory, void* gameData, void* character) {
+    // [DIAG-FACTORY-MATCH] Registrar/comparar el factory del hook con el capturado de GW+0x5B0.
+    // Se hace ANTES del capture-on-first-call para no perder el valor del hook si m_factory ya
+    // fue puesto por CaptureFactoryFromGameWorld.
+    NoteHookFactory(factory);
+
     // Capture factory pointer on first call
     if (!m_factory && factory) {
         m_factory = factory;

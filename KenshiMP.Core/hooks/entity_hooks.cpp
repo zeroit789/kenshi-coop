@@ -24,6 +24,15 @@ namespace kmp { extern volatile int g_lastCharacterCreateNum; }
 
 namespace kmp::entity_hooks {
 
+// ── FIX-FACTORY-EARLY: definición del flag (declarado en entity_hooks.h) ──
+// true = armar el hook desde Install() en modo loading-passthrough para capturar el
+//        factory en el 1er create de la carga (Opción A). Ver header para el porqué.
+bool kCaptureFactoryEarly = true;
+
+// ── FIX-FACTORY-EARLY: estado de captura temprana ──
+// s_earlyFactoryLogged evita spamear el log [FIX-FACTORY-EARLY] (1 línea por captura).
+static bool s_earlyFactoryLogged = false;
+
 // ── Function Types ──
 using CharacterCreateFn = void*(__fastcall*)(void* factory, void* templateData);
 using CharacterDestroyFn = void(__fastcall*)(void* character);
@@ -446,6 +455,25 @@ static void SEH_CaptureTemplateData(void* templateData) {
     }
 }
 
+// ── FIX-FACTORY-EARLY: validación "puntero de heap x64 real" ──
+// El 1er arg de RootObjectFactory::process() (RVA 0x581770) es el RootObjectFactory*
+// (this), confirmado por RE de bytes (kenshi-re-memory.md:54-67): create() guarda el
+// factory en rcx/r14 y se lo pasa a process() intacto. Aquí filtramos basura: el
+// slot global theFactory@0x21345B0 contiene en runtime un valor de 32 bits con la
+// mitad alta NULA (p.ej. 0x590301A0) que NO es un puntero de heap x64 -> ese es el
+// motivo por el que la captura vía global falla. El 1er arg del hook, en cambio, es
+// el puntero de heap real. Aceptamos solo: no-null, alineado a 8, mitad alta NO nula
+// (>= 0x100000000), dentro del rango user-space x64 y fuera del módulo.
+static bool IsRealHeapFactory(void* factory) {
+    uintptr_t p = reinterpret_cast<uintptr_t>(factory);
+    if (p <= 0x10000 || p >= 0x00007FFFFFFFFFFF) return false;  // rango user-space
+    if (p & 0x7) return false;                                   // alineado a 8 (vtable)
+    if ((p >> 32) == 0) return false;                            // mitad alta NULA = basura 32-bit
+    uintptr_t modBase = Memory::GetModuleBase();
+    if (modBase != 0 && p >= modBase && p < modBase + 0x4000000) return false; // no en módulo
+    return true;
+}
+
 // ── SEH-safe SpawnManager propagation (for already-captured pre-call data) ──
 // Called from loading passthrough after s_preCallStruct is populated.
 static void SEH_PropagateToSpawnManager(void* templateData, void* factory) {
@@ -459,6 +487,39 @@ static void SEH_PropagateToSpawnManager(void* templateData, void* factory) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // SpawnManager propagation failed — non-fatal, will retry post-load
+    }
+}
+
+// ── FIX-FACTORY-EARLY: promoción del factory capturado por el hook al SpawnManager ──
+// Llamado desde el path de passthrough en el 1er create de la carga. Valida que el
+// factory es un puntero de heap real (descarta la basura de 32 bits del global) y, si
+// lo es, lo promueve con SetFactory() -> IsReady()=true -> el heap scan y el spawn de
+// remotos arrancan. SEH-safe y barato: solo valida punteros y llama a SetFactory.
+static void SEH_PromoteEarlyFactory(void* factory) {
+    __try {
+        if (!IsRealHeapFactory(factory)) {
+            return;  // no es un factory de heap válido -> esperar al siguiente create
+        }
+        auto& spawnMgr = Core::Get().GetSpawnManager();
+        if (!spawnMgr.IsReady()) {
+            spawnMgr.SetFactory(factory);  // IsReady() pasa a true sin esperar a OnGameLoaded
+        }
+        if (!s_earlyFactoryLogged) {
+            s_earlyFactoryLogged = true;
+            uintptr_t p = reinterpret_cast<uintptr_t>(factory);
+            uintptr_t vt = 0; Memory::Read(p, vt);  // 1er qword = vtable (diagnóstico)
+            char dbg[192];
+            sprintf_s(dbg, "KMP: [FIX-FACTORY-EARLY] capturado factory=0x%llX "
+                           "(mitad alta NO nula, vt=0x%llX) en create #%d — IsReady()=true\n",
+                      (unsigned long long)p, (unsigned long long)vt,
+                      s_loadingCreateCount.load(std::memory_order_relaxed));
+            OutputDebugStringA(dbg);
+            spdlog::info("[FIX-FACTORY-EARLY] capturado factory=0x{:X} (vt=0x{:X}) en create #{} "
+                         "— promovido a SpawnManager (IsReady()=true)",
+                         p, vt, s_loadingCreateCount.load(std::memory_order_relaxed));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // promoción best-effort — no fatal, se reintenta en el siguiente create
     }
 }
 
@@ -622,6 +683,16 @@ static void* __fastcall Hook_CharacterCreate(void* factory, void* templateData) 
 
         // One-time factory pointer save (no game memory read, just saving the arg)
         if (!s_savedFactory) s_savedFactory = factory;
+
+        // ── FIX-FACTORY-EARLY: promoción del factory al SpawnManager en passthrough ──
+        // Ésta es la captura temprana: el 1er arg de process() es el RootObjectFactory*
+        // (this). En cuanto vemos un factory de heap válido, lo promovemos -> IsReady()
+        // pasa a true sin esperar a OnGameLoaded. Se intenta en CADA create hasta lograrlo
+        // (no solo en el 1º) por si el 1er create trae un arg no plausible. Coste: validar
+        // 1 puntero + (una vez) SetFactory. NO ejecuta lógica pesada — seguro en passthrough.
+        if (kCaptureFactoryEarly && factory) {
+            SEH_PromoteEarlyFactory(factory);
+        }
 
         // Capture pre-call data from the FIRST call during loading (just memcpy the arg)
         if (templateData && !s_havePreCallData) {
@@ -1199,6 +1270,29 @@ bool Install() {
             s_loadingPassthrough.store(true, std::memory_order_release);
             spdlog::info("entity_hooks: CharacterCreate installed in LOADING PASSTHROUGH mode");
             OutputDebugStringA("KMP: entity_hooks — CharacterCreate installed (loading passthrough)\n");
+
+            // ── FIX-FACTORY-EARLY: armar el hook DESDE Install() ──
+            // InstallAt() deja el hook MovRaxRsp con bypass=1 ("starts BYPASSED"): el naked
+            // detour cortocircuita y NUNCA entra al cuerpo del hook, así que la captura del
+            // factory en passthrough no ocurría durante la carga del save -> m_factory=0.
+            // Limpiamos el bypass aquí (Enable() = InterlockedExchange del flag a 0, barato y
+            // seguro) dejando s_loadingPassthrough=true: el cuerpo corre, pero solo el path
+            // ultra-ligero (timestamp + guardar factory + promover + delegar al original).
+            // Resultado: el factory se captura en el 1er create de la carga.
+            if (kCaptureFactoryEarly) {
+                if (hookMgr.Enable("CharacterCreate")) {
+                    spdlog::info("entity_hooks: [FIX-FACTORY-EARLY] hook ARMADO desde Install() "
+                                 "(bypass=0, loading passthrough) — captura temprana del factory activa");
+                    OutputDebugStringA("KMP: [FIX-FACTORY-EARLY] CharacterCreate armado en Install "
+                                       "(passthrough, captura temprana del factory)\n");
+                } else {
+                    spdlog::warn("entity_hooks: [FIX-FACTORY-EARLY] Enable() falló en Install() — "
+                                 "el hook sigue bypassed; la captura temprana NO estará activa");
+                }
+            } else {
+                spdlog::info("entity_hooks: [FIX-FACTORY-EARLY] desactivado (kCaptureFactoryEarly=false) "
+                             "— hook arranca BYPASSED (comportamiento previo)");
+            }
         }
     }
 
@@ -1241,6 +1335,10 @@ void ResumeForNetwork() {
     s_loadingCapturesDone = false;
     s_havePreCallData = false;
     s_savedFactory = nullptr;
+
+    // FIX-FACTORY-EARLY: re-armar el log de captura para la próxima carga/reconexión.
+    // (no afecta a la lógica: la promoción se rige por SpawnManager::IsReady()).
+    s_earlyFactoryLogged = false;
 
     // Propagate early faction to PlayerController if we captured one during loading
     // (must read BEFORE resetting the atomic)
