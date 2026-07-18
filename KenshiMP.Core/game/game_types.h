@@ -64,28 +64,20 @@ struct CharacterOffsets {
     int moveSpeed     = -1;      // Offset to current move speed float (derived from physics)
     int animState     = -1;      // Offset to animation state index
 
-    // ⚠ audit-02 (2026-06-18): cadena de salud PENDIENTE DE VERIFICAR para 1.0.68.
-    // La cadena CE +0x2B8 -> +0x5F8 -> +0x40 NO casa con el layout de KenshiLib:
-    //   - KenshiLib Character.h: +0x2B8 = CharacterMemory* _myMemory (NO inicio de salud).
-    //   - KenshiLib: 'MedicalSystem medical' es INLINE en Character+0x458.
-    //   - Dentro de MedicalSystem la salud por parte vive en un ogre_unordered_map 'status'(+0x8)
-    //     y/o en punteros leftLeg/rightLeg/leftArm/rightArm (+0x80..+0x98), cada uno -> HealthPartStatus.
-    //   - HealthPartStatus.flesh está en +0x40 (esto SÍ coincide con healthBase=+0x40).
-    // Es decir: el offset FINAL +0x40 es coherente (flesh), pero los dos saltos +0x2B8/+0x5F8
-    // probablemente sean de OTRA versión de Kenshi (las RVAs de KenshiLib no son 1.0.68 Steam).
-    // Por eso el /verify da FAIL en esta cadena: sigue _myMemory y lee un float arbitrario.
-    //
-    // NO se corrige a ciegas (sin el offset correcto verificado, cambiarlo rompería la lectura
-    // de salud si la cadena CE resultara válida en 1.0.68). PISTA para el RE futuro: la ruta
-    // correcta es Character+0x458 (medical inline) -> leftLeg/rightLeg/... (+0x80..) -> flesh(+0x40),
-    // o bien recorrer el hashmap 'status'. Verificar con CE en vivo sobre 1.0.68 Steam.
-    // Además la salud NO es un array plano indexable por part*8: cada HealthPartStatus es un
-    // objeto de 0x68 bytes (flesh@+0x40, fleshStun@+0x44), por lo que healthStride=8 tampoco
-    // aplica para iterar partes. PENDIENTE — ver audit-02 sección "Stats/CharStats / salud".
-    int healthChain1  = 0x2B8;   // [PENDIENTE 1.0.68] CE chain — no casa con KenshiLib (=_myMemory)
-    int healthChain2  = 0x5F8;   // [PENDIENTE 1.0.68] CE chain — sin verificar
-    int healthBase    = 0x40;    // Final offset a flesh (coincide con HealthPartStatus.flesh@+0x40)
-    int healthStride  = 8;       // [PENDIENTE] no aplica: HealthPartStatus es objeto de 0x68 B
+    // Cadena de salud CANÓNICA — verificada en BYTES sobre kenshi_x64.exe Steam 1.0.68:
+    //   Character+0x458 = MedicalSystem INLINE (by-value, NO es puntero)
+    //   partArray = *(void**) (char + 0x5F8)          // = medical(0x458) + 0x1A0 → HealthPartStatus*[]
+    //   partCount = *(int*)   (char + 0x5F0)          // = medical(0x458) + 0x198
+    //   part_i    = *(void**) (partArray + i*8)       // array de PUNTEROS, stride 8
+    //   flesh     = *(float*) (part_i + 0x40)         // fleshStun@+0x44, _maxHealth@+0x54
+    // La cadena vieja [char+0x2B8]→[+0x5F8]→+0x40 era INVÁLIDA: char+0x2B8 = CharacterMemory*
+    // (_myMemory, una copia) — un deref de más. 0x458+0x1A0 = 0x5F8, por eso "coincidía".
+    // El motor jamás escribe salud por esa ruta (confirmado: MedicalSystem::_setHealth 0x645EF0
+    // usa [rcx+0x198]/[rcx+0x1A0]; MedicalSystem::applyDamage 0x64F300 escribe [part+0x40]/[+0x44]).
+    int healthPartArray = 0x5F8;  // char → HealthPartStatus** (array de punteros)
+    int healthPartCount = 0x5F0;  // char → int, nº de partes (humanos = 7)
+    int healthBase      = 0x40;   // HealthPartStatus → flesh (float)
+    int healthStride    = 8;      // stride DENTRO del array de punteros (sizeof(void*))
 
     // Writable position chain (from KServerMod RE):
     // character -> AnimationClassHuman ptr (+animClassOffset)
@@ -405,6 +397,14 @@ uintptr_t GetPlayerFactionDirect();
 // Vía ROBUSTA para el flujo connected-then-load (no depende del nombre "Player N").
 uintptr_t GetPlayerPrimaryCharacterDirect();
 
+// [FIX-GHOST 2026-07] Comprueba si charPtr está en la lista NATIVA de personajes
+// del jugador (PlayerInterface+0x2B0, lektor<Character*>) — la fuente de verdad
+// del motor. Si un Character NO está aquí, NO es del jugador aunque su nombre
+// encaje con el patrón "Player N" (evita reclamar NPCs fantasma del mundo).
+// Devuelve:  1 = está en la lista;  0 = lista legible pero NO está;
+//           -1 = lista no disponible (juego sin cargar / lektor sin poblar).
+int IsInPlayerCharactersList(uintptr_t charPtr);
+
 // Resultado de FixCharacterFactionTo (ver abajo). Permite al orquestador decidir
 // cuándo dar por arreglado el char del host y dejar de reintentar.
 enum class FixFactionResult {
@@ -489,7 +489,16 @@ bool WritePlayerControlled(uintptr_t charPtr, bool controlled);
 //  GAME ENUMS (from fcs_enums.def)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Task types - subset of the 250+ task types relevant to multiplayer
+// Task types - subconjunto de los 291 taskTypes del enum nativo relevantes para multijugador.
+// FUENTE DE VERDAD: KenshiLib Enums.h (GPL-3.0) `enum TaskType` (índices secuenciales desde 0),
+//   verificada por convergencia con los literales del binario que ya usa producción
+//   (p.ej. USE_BED=0x62 en core.cpp, RANGED_ATTACK=0x106 en combat_hooks.cpp canUseArms).
+// ⚠ CORRECCIÓN 2026-07-13 (game-reverse-engineer): los valores >= IDLE estaban DESPLAZADOS
+//   respecto al binario real (off-by-one/varios) — ver auditoría en la wiki KENSHI. El enum NO
+//   se usaba por scope salvo TaskType::NULL_TASK (=0, intacto), así que la corrección NO altera
+//   ningún fix desplegado; solo elimina una trampa latente para código futuro y para
+//   CharacterAccessor::GetCurrentTask() (que devuelve el valor CRUDO del binario).
+//   Índices decimales anotados = valor real del binario (== KenshiLib).
 enum class TaskType : uint32_t {
     NULL_TASK = 0,
     MOVE_ON_FREE_WILL = 1,
@@ -500,21 +509,21 @@ enum class TaskType : uint32_t {
     EQUIP_WEAPON = 6,
     UNEQUIP_WEAPON = 7,
     CHOOSE_ENEMY_AND_ATTACK = 9,
-    IDLE = 13,
-    PROTECT_ALLIES = 14,
-    ATTACK_ENEMIES = 15,
-    PATROL = 21,
-    FIRST_AID_ORDER = 26,
-    LOOT_TARGET = 27,
-    HOLD_POSITION = 31,
-    FOLLOW_PLAYER_ORDER = 45,
-    OPERATE_MACHINERY = 88,
-    USE_TRAINING_DUMMY = 98,
-    USE_BED = 99,
-    USE_TURRET = 148,
-    MAN_A_TURRET = 151,
-    RANGED_ATTACK = 278,
-    SHOOT_AT_TARGET = 244,
+    IDLE = 14,                    // era 13 (mal)
+    PROTECT_ALLIES = 15,          // era 14 (mal)
+    ATTACK_ENEMIES = 16,          // era 15 (mal)
+    PATROL = 22,                  // era 21 (mal)
+    FIRST_AID_ORDER = 25,         // era 26 (mal)
+    LOOT_TARGET = 26,             // era 27 (mal)
+    HOLD_POSITION = 30,           // era 31 (mal)
+    FOLLOW_PLAYER_ORDER = 44,     // era 45 (mal)
+    OPERATE_MACHINERY = 87,       // era 88 (mal)
+    USE_TRAINING_DUMMY = 97,      // era 98 (mal)
+    USE_BED = 98,                 // era 99 (mal) — coincide con kTT_USE_BED=0x62 en core.cpp
+    USE_TURRET = 146,             // era 148 (mal)
+    MAN_A_TURRET = 149,           // era 151 (mal)
+    RANGED_ATTACK = 262,          // era 278 (mal) — 0x106, coincide con canUseArms en combat_hooks.cpp
+    SHOOT_AT_TARGET = 235,        // era 244 (mal)
 };
 
 // Attach slots for equipment (from fcs_enums.def)

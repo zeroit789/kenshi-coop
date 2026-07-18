@@ -327,6 +327,18 @@ void SyncOrchestrator::Shutdown() {
 
 void SyncOrchestrator::Reset() {
     m_active = false;
+
+    // CRÍTICO: esperar a que terminen los workers de fondo (2 hilos del TaskOrchestrator)
+    // ANTES de tocar m_frameData/m_writeBuffer/m_readBuffer. Si no, el Clear() de más abajo
+    // corre concurrente con los push_back() de los workers (BackgroundReadEntities /
+    // BackgroundInterpolate) → corrupción de heap / iteradores colgando → crash aleatorio al
+    // desconectar o reconectar. El wait normal (StageSwapBuffers del siguiente tick) no llega a
+    // ejecutarse tras Reset() porque m_pipelineStarted pasa a false, dejando el trabajo de los
+    // workers huérfano. Comprobamos m_pipelineStarted ANTES de ponerlo a false.
+    if (m_pipelineStarted) {
+        m_taskOrchestrator.WaitForFrameWork();
+    }
+
     m_pipelineStarted = false;
     m_tickCount = 0;
     m_localPlayerId = INVALID_PLAYER;

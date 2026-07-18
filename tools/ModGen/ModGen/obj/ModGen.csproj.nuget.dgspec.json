@@ -1,36 +1,30 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\tools\\ModGen\\ModGen\\ModGen.csproj": {}
+    "E:\\Aplicaciones\\Kenshi-Online\\tools\\ModGen\\ModGen\\ModGen.csproj": {}
   },
   "projects": {
-    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\tools\\ModGen\\ModGen\\ModGen.csproj": {
+    "E:\\Aplicaciones\\Kenshi-Online\\tools\\ModGen\\ModGen\\ModGen.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\tools\\ModGen\\ModGen\\ModGen.csproj",
+        "projectUniqueName": "E:\\Aplicaciones\\Kenshi-Online\\tools\\ModGen\\ModGen\\ModGen.csproj",
         "projectName": "ModGen",
-        "projectPath": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\tools\\ModGen\\ModGen\\ModGen.csproj",
-        "packagesPath": "C:\\Users\\wilde\\.nuget\\packages\\",
-        "outputPath": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\KenshiMP\\tools\\ModGen\\ModGen\\obj\\",
+        "projectPath": "E:\\Aplicaciones\\Kenshi-Online\\tools\\ModGen\\ModGen\\ModGen.csproj",
+        "packagesPath": "C:\\Users\\Zero\\.nuget\\packages\\",
+        "outputPath": "E:\\Aplicaciones\\Kenshi-Online\\tools\\ModGen\\ModGen\\obj\\",
         "projectStyle": "PackageReference",
-        "fallbackFolders": [
-          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
-        ],
         "configFilePaths": [
-          "C:\\Users\\wilde\\AppData\\Roaming\\NuGet\\NuGet.Config",
-          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
-          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
+          "C:\\Users\\Zero\\AppData\\Roaming\\NuGet\\NuGet.Config"
         ],
         "originalTargetFrameworks": [
           "net10.0"
         ],
         "sources": {
-          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
-          "C:\\Program Files\\dotnet\\library-packs": {},
           "https://api.nuget.org/v3/index.json": {}
         },
         "frameworks": {
           "net10.0": {
+            "framework": "net10.0",
             "targetAlias": "net10.0",
             "projectReferences": {}
           }
@@ -45,10 +39,11 @@
           "auditLevel": "low",
           "auditMode": "all"
         },
-        "SdkAnalysisLevel": "10.0.100"
+        "SdkAnalysisLevel": "10.0.300"
       },
       "frameworks": {
         "net10.0": {
+          "framework": "net10.0",
           "targetAlias": "net10.0",
           "dependencies": {
             "Microsoft.Extensions.DependencyInjection": {
@@ -76,7 +71,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.102/PortableRuntimeIdentifierGraph.json",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301/PortableRuntimeIdentifierGraph.json",
           "packagesToPrune": {
             "Microsoft.CSharp": "(,4.7.32767]",
             "Microsoft.VisualBasic": "(,10.4.32767]",

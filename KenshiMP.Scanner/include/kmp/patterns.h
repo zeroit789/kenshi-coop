@@ -128,6 +128,27 @@ constexpr const char* MARTIAL_ARTS_COMBAT = "48 8B C4 55 56 57 41 54 41 55 41 56
 // Firma del prólogo: __fastcall(void* uiMgr /*rcx*/, void* obj /*rdx*/, bool variant /*r8b*/).
 constexpr const char* ISSUE_ORDER = "48 8B C4 57 48 81 EC B0 00 00 00 48 C7 44 24 28 FE FF FF FF 48 89 58 18 48 89 70 20";
 
+// Character::addOrder — backend "normal/replace" VALIDADOR de órdenes (RVA 0x5D1940).
+// RE 2026-07-11/12: valida la orden ANTES de encolarla. Si el chequeo falla, muestra el
+// globo nativo ("My arm is broken!" .rdata 0x16232E8 / "I can't carry anyone with this
+// arm." 0x16232B8) y devuelve TRUE (orden "manejada") SIN encolar nada → la orden se
+// traga en silencio. Si pasa, devuelve FALSE y la orden sigue (Task → cola en 0x508380).
+// Ramas: TaskType∈{4,5,0x10,0x15} → canUseArms 0x644150 (char+0x5BD/+0x5BE);
+//        TaskType∈{0x69,0x44,0xD5,0xAA,0x94,0xE1} → [[AI+0x318]+0x166], AI=*(char+0x650).
+// Prólogo limpio (40 55 56 57, SIN mov rax,rsp). El AOB corto de 18 bytes daba 2 matches
+// (0x5D1940 y 0x7E5F80); este de 32 bytes es ÚNICO en .text (verificado estático 1.0.68).
+// Firma verificada (0 usos de r9 ni args de pila en toda la función, retorno bool en al):
+//   bool __fastcall(Character* me /*rcx*/, int taskType /*edx*/, void* subject /*r8*/)
+constexpr const char* ADD_ORDER_BACKEND = "40 55 56 57 48 8D AC 24 60 FE FF FF 48 81 EC A0 02 00 00 48 C7 44 24 20 FE FF FF FF 48 89 9C 24";
+
+// NOTA (2026-07-15): aquí había un patrón COMBAT_TARGET_RESOLVE para la RVA 0x0074A630,
+// creído "selector de objetivo de combate". La RE posterior (3 strings internos de comercio
+// + xref al literal "buyItem" + análisis del caller que referencia 'Sell_Item') confirmó que
+// 0x74A630 es BuyItem (rutina de IA de COMERCIO). Ese AOB era un SUPERCONJUNTO del de BUY_ITEM
+// que casaba en la MISMA dirección → duplicado innecesario. Eliminado. El hook de esa RVA
+// (inventory_hooks.cpp: Hook_BuyItem, sync de red + guard UAF fusionados) usa el patrón BUY_ITEM
+// de más abajo vía funcs.BuyItem. Ver la nota ampliada en el patrón BUY_ITEM (sección INVENTORY / ITEMS).
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  WORLD / ZONES
 // ═══════════════════════════════════════════════════════════════════════════
@@ -260,9 +281,19 @@ constexpr const char* ITEM_PICKUP = "48 8B C4 44 89 40 18 55 41 54 41 55 41 56 4
 // RVA: 0x00745DE0
 constexpr const char* ITEM_DROP = "40 53 48 83 EC 20 48 8B 01 45 33 C9 FF 50 28 48 8B D8 48 85 C0 74 19 4C 8D 0D ? ? ? ? 48 8D";
 
-// Buy item from shop
-// Found via "buyItem"
+// Buy item from shop — rutina de IA de COMERCIO (NPC comprando/vendiendo items)
+// Found via "buyItem" (+ xref a 'Sell_Item' desde el caller)
 // RVA: 0x0074A630
+// Firma real (RE 1.0.68): void* __fastcall(void* buyer, void* item, void* seller). El retorno es
+// un PUNTERO al item comprado (o nullptr si falla), NO `char` — declararlo `char` truncaba el
+// puntero de 64 bits a 1 byte y causaba el crash game+0x9A18DA (confirmado por RE del epílogo y
+// del caller nativo game+0x9A18B8, que desreferencia el resultado como objeto con vtable).
+// UN SOLO hook sobre esta RVA (2026-07-14): inventory_hooks::Hook_BuyItem hace a la vez la
+// sincronización de red de la compra (C2S_TradeRequest) Y el guard del use-after-free del
+// retorno (validación de la vtable del puntero devuelto contra el rango de código del juego).
+// Antes eran DOS hooks sobre la misma dirección (el guard vivía en combat_hooks.cpp), lo que
+// MinHook rechazaba en silencio por deduplicar por dirección; se fusionaron en uno. El hook se
+// instala sobre funcs.BuyItem (esta misma RVA); no hace falta un segundo patrón.
 constexpr const char* BUY_ITEM = "40 55 56 57 41 54 41 55 48 81 EC 00 01 00 00 48 C7 44 24 20 FE FF FF FF 48 89 9C 24 48 01 00 00";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -338,8 +369,13 @@ struct PointerChain {
 // v1.0.68 base offsets
 constexpr PointerChain KNOWN_CHAINS[] = {
     {"PlayerBase",  0x01AC8A90, {-1},                          "Player data base pointer"},
-    {"Health",      0x01AC8A90, {0x2B8, 0x5F8, 0x40, -1},     "Character health (float)"},
-    {"StunDamage",  0x01AC8A90, {0x2B8, 0x5F8, 0x44, -1},     "Character stun damage (float)"},
+    // MUERTAS/INVÁLIDAS (Oleada A 2026-07-12): la cadena {0x2B8, 0x5F8, ...} tiene un deref de
+    // más — char+0x2B8 es CharacterMemory* (_myMemory, una copia), NO donde el motor escribe
+    // salud. La ruta canónica es char+0x458 (MedicalSystem inline) → +0x1A0 → part+0x40
+    // (ver game_types.h healthPartArray/healthBase). Estas entradas ya no las usa nada
+    // (KNOWN_CHAINS no se consume en ningún sitio); se comentan como muertas, no se borran.
+    // {"Health",      0x01AC8A90, {0x2B8, 0x5F8, 0x40, -1},     "Character health (float) — INVÁLIDA, ver nota"},
+    // {"StunDamage",  0x01AC8A90, {0x2B8, 0x5F8, 0x44, -1},     "Character stun damage (float) — INVÁLIDA, ver nota"},
     {"Money",       0x01AC8A90, {0x298, 0x78, 0x88, -1},       "Player money (int)"},
     {"CharList",    0x01AC8A90, {0x0, -1},                      "First character, +8 per next"},
 };
@@ -449,6 +485,11 @@ struct GameFunctions {
                                             // directa: escribe AI+0x78 (target) y encola en el
                                             // Tasker del platoon vía enqueueCombatOrder(mode=4).
                                             // void(__fastcall*)(Character* me, Character* who)
+    void*  AddOrderBackend      = nullptr;  // Character::addOrder backend "normal/replace"
+                                            // (0x5D1940, thunk 0x274A26, llamado por addOrder
+                                            // 0x5D20D0). VALIDADOR: true=orden ABORTADA (tragada
+                                            // con globo nativo, sin encolar), false=orden sigue.
+                                            // bool(__fastcall*)(Character* me, int taskType, void* subject)
     void*  SetActivePlatoon     = nullptr;  // Character::setActivePlatoon (0x6213F0) — CONFIRMADO
                                             // en bytes (Steam 1.0.68). Hace el REGISTRO AI<->platoon
                                             // que el spawn del clon del mod OMITE:
@@ -461,6 +502,19 @@ struct GameFunctions {
                                             // Sin el paso 4 el AI tick no encuentra el platoon y su
                                             // Tasker (ActivePlatoon+0x98) queda HUERFANO (no consumido).
                                             // void(__fastcall*)(Character* me, void* activePlatoon, int flags)
+    void*  CombatClassUpdate    = nullptr;  // CombatClass::update(float) (0x60D650) — DIAG-COMBATSEED.
+                                            // Mangled ?update@CombatClass@@UEAAXM@Z (virtual, void, 1 float).
+                                            // Es el AI tick de combate del CombatClass: consume el array
+                                            // de percepciones (CombatClass+0x208, contador +0x200) para
+                                            // producir currentTarget (CombatClass+0x290) y disparar
+                                            // Task_MeleeAttack. Prólogo LIMPIO (40 53 48 83 EC 20 48 8B D9,
+                                            // sin mov rax,rsp) → hookeable sin el fix MovRaxRsp. El this
+                                            // (rcx) es el CombatClass; el dt va en xmm1.
+                                            // void(__fastcall*)(CombatClass* this, float dt)
+    // NOTA (2026-07-15): se eliminó el campo duplicado 'CombatTargetResolve' (0x74A630). Esa RVA
+    // es BuyItem (ver campo BuyItem más abajo). El hook de esa RVA (inventory_hooks.cpp:
+    // Hook_BuyItem, sync de red + guard UAF fusionados) usa funcs.BuyItem directamente — no
+    // necesita un puntero propio.
 
     // ── World / Zones ──
     void*  ZoneLoad             = nullptr;  // Zone loading

@@ -88,20 +88,112 @@ static bool SEH_AllyModFaction(void* character) {
     }
 }
 
+// ── Recalcula el flag de colapso médico (brazos rotos / leftArmOk) tras escribir salud ──
+// El motor cachea en MedicalSystem un BOOL "brazo OK" (char+0x458+0x166 = char+0x5BE) que
+// SOLO se refresca dentro de MedicalSystem::reassessCollapseMode. Como el mod escribe la
+// salud de las extremidades a pelo en memoria (SEH_WriteLimbHealth*), ese bool se queda
+// CONGELADO: aunque curemos/sincronicemos el brazo al 100%, el gate de "cargar a cuestas"
+// (Hook_AddOrderBackend, lee char+0x5BD/+0x5BE) lo sigue viendo roto y traga la orden.
+// Esta llamada fuerza el recálculo del flag a partir de la salud real ya escrita.
+//   RVA 0x649320: VERIFICADA en bytes sobre kenshi_x64.exe Steam 1.0.68 (prólogo de función
+//   real; el cuerpo lee partCount@MedicalSystem+0x198 y partArray@+0x1A0, lo que confirma
+//   que rcx = char+0x458). El 0x648BA0 que aparece en KenshiLib está OBSOLETO para esta build
+//   (cae a mitad de otra función). Firma: void __fastcall(MedicalSystem* this, bool medic, bool agony).
+// SOLO game thread: todos los callers de los helpers de salud pushean a CommandQueue o
+// corren en el procesamiento de spawn del game thread. SEH-safe: solo POD, nunca propaga.
+// clearStun: true cuando esta llamada sigue a una escritura de salud REAL (limpia el fleshStun
+// rancio que corrompería el cálculo de colapso); false para recálculos periódicos sin datos
+// nuevos (ver core.cpp SEH_ReassessCollapse — mismo hallazgo de la revisión adversarial: borrar
+// stun sin datos nuevos anula stun real de combate legítimo). Ambos call-sites de este fichero
+// (SEH_WriteLimbHealthToChar/SEH_WriteOnePartHealth) SIEMPRE acaban de escribir salud real, así
+// que ambos pasan true.
+static void SEH_ReassessCollapse(void* character, bool clearStun) {
+    __try {
+        uintptr_t charPtr = reinterpret_cast<uintptr_t>(character);
+        if (charPtr == 0) return;
+        // SALTAR si el char está MUERTO (char+0x5BC, byte isDead: 0=vivo, 1=muerto). La rama
+        // interna dead=1 de reassessCollapseMode puede tener efectos colaterales sobre un
+        // cadáver; NO se debe tocar +0x5BC (ver docs/reverse-engineering/kenshi-re-memory.md).
+        uint8_t isDead = 0;
+        if (!Memory::Read(charPtr + 0x5BC, isDead) || isDead != 0) return;
+        // FIX-STUNSEED: limpiar fleshStun (part+0x44) rancio antes del recálculo — ver comentario
+        // gemelo en core.cpp para el razonamiento completo (getCollapseStage resta flesh-fleshStun).
+        // Escritura LOCAL, no toca red/protocolo. Solo fleshStun; flesh (salud real) intacto.
+        if (clearStun) {
+            auto& offsets = game::GetOffsets().character;
+            if (offsets.healthPartArray >= 0 && offsets.healthBase >= 0) {
+                uintptr_t partArray = 0;
+                int count = 0;
+                if (Memory::Read(charPtr + offsets.healthPartArray, partArray) && partArray != 0 &&
+                    Memory::Read(charPtr + offsets.healthPartCount, count) && count > 0 && count <= 32) {
+                    for (int i = 0; i < count; i++) {
+                        uintptr_t part = 0;
+                        if (!Memory::Read(partArray + i * offsets.healthStride, part) || part == 0)
+                            continue;
+                        Memory::Write(part + offsets.healthBase + 4, 0.0f);
+                    }
+                }
+            }
+        }
+        // MedicalSystem vive INLINE dentro del Character en char+0x458 (NO es puntero).
+        void* medicalSystem = reinterpret_cast<void*>(charPtr + 0x458);
+        using ReassessCollapseFn = void(__fastcall*)(void* medical, bool medic, bool agony);
+        auto fn = reinterpret_cast<ReassessCollapseFn>(Memory::GetModuleBase() + 0x649320);
+        fn(medicalSystem, false, false);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Una llamada nativa fallida jamás debe tumbar el game thread.
+    }
+}
+
+// Escribe la salud (flesh) de las 7 partes por la cadena CANÓNICA MedicalSystem:
+//   partArray = *(void**)(char + 0x5F8)  →  part_i = *(void**)(partArray + i*8)  →  flesh @ part_i+0x40
+// (La cadena vieja [char+0x2B8]→[+0x5F8]→+0x40 tenía un deref de más — ver game_types.h.)
 static bool SEH_WriteLimbHealthToChar(void* character, const float health[7]) {
     __try {
         auto& offsets = game::GetOffsets().character;
         uintptr_t charPtr = reinterpret_cast<uintptr_t>(character);
-        if (offsets.healthChain1 < 0 || offsets.healthChain2 < 0 || offsets.healthBase < 0)
+        if (offsets.healthPartArray < 0 || offsets.healthBase < 0) return false;
+        uintptr_t partArray = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartArray, partArray) || partArray == 0)
             return false;
-        uintptr_t ptr1 = 0;
-        if (!Memory::Read(charPtr + offsets.healthChain1, ptr1) || ptr1 == 0) return false;
-        uintptr_t ptr2 = 0;
-        if (!Memory::Read(ptr1 + offsets.healthChain2, ptr2) || ptr2 == 0) return false;
-        for (int i = 0; i < 7; i++) {
-            int partOffset = offsets.healthBase + i * offsets.healthStride;
-            Memory::Write(ptr2 + partOffset, health[i]);
+        int count = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartCount, count)) return false;
+        if (count <= 0 || count > 32) return false;
+        int n = (count < 7) ? count : 7;
+        for (int i = 0; i < n; i++) {
+            uintptr_t part = 0;
+            if (!Memory::Read(partArray + i * offsets.healthStride, part) || part == 0)
+                continue;
+            Memory::Write(part + offsets.healthBase, health[i]);
         }
+        // Refrescar el flag de colapso UNA sola vez, tras escribir TODAS las partes
+        // (fuera del bucle — evita 7 llamadas nativas seguidas por char).
+        SEH_ReassessCollapse(character, /*clearStun=*/true);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Escribe la salud (flesh) de UNA sola parte por la cadena canónica. SEH-safe, solo POD.
+static bool SEH_WriteOnePartHealth(void* character, int partIndex, float value) {
+    __try {
+        auto& offsets = game::GetOffsets().character;
+        uintptr_t charPtr = reinterpret_cast<uintptr_t>(character);
+        if (offsets.healthPartArray < 0 || partIndex < 0) return false;
+        int count = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartCount, count) || partIndex >= count)
+            return false;
+        uintptr_t partArray = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartArray, partArray) || partArray == 0)
+            return false;
+        uintptr_t part = 0;
+        if (!Memory::Read(partArray + partIndex * offsets.healthStride, part) || part == 0)
+            return false;
+        if (!Memory::Write(part + offsets.healthBase, value))
+            return false;
+        // Refrescar el flag de colapso tras cambiar la salud de esta parte.
+        SEH_ReassessCollapse(character, /*clearStun=*/true);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -487,36 +579,47 @@ private:
         }
 
         // Clean up all entities owned by the disconnected player.
-        // Since CharacterDestroy hook is disabled (pattern found wrong function),
-        // we can't call the game's destructor. Instead, teleport stale characters
-        // underground so they're not visible, then unregister from tracking.
+        // Since CharacterDestroy hook is deferred (vtable[0]), we can't rely on the game's
+        // destructor here. Instead, teleport stale characters underground so they're not
+        // visible, then unregister from tracking.
+        // [Oleada A] Migrado a CommandQueue: WritePlayerControlled/WritePosition/Unmark tocan
+        // memoria del motor → game thread. Captura SOLO POD (playerId); las entidades se
+        // resuelven POR ID dentro de la lambda (registro vaciado → lista vacía, skip limpio).
         auto& registry = core.GetEntityRegistry();
-        auto entities = registry.GetPlayerEntities(msg.playerId);
-        for (EntityID eid : entities) {
-            void* gameObj = registry.GetGameObject(eid);
-            if (gameObj) {
-                // Clear isPlayerControlled so the character is removed from the
-                // host's squad panel — this is the key fix for "host controls both
-                // characters after second client disconnects".
-                game::WritePlayerControlled(reinterpret_cast<uintptr_t>(gameObj), false);
-                // Move character far underground so it's invisible
-                game::CharacterAccessor accessor(gameObj);
-                Vec3 underground(0.f, -10000.f, 0.f);
-                accessor.WritePosition(underground);
-                // Clear AI remote-control tracking to prevent stale pointer issues
-                ai_hooks::UnmarkRemoteControlled(gameObj);
-                spdlog::debug("PacketHandler: Cleared control + teleported entity {} underground", eid);
+        size_t entityCount = registry.GetPlayerEntities(msg.playerId).size();  // solo para el HUD
+        const PlayerID leftPlayerId = msg.playerId;
+        core.GetCommandQueue().Push({[leftPlayerId]() {
+            auto& core = Core::Get();
+            auto& registry = core.GetEntityRegistry();
+            auto entities = registry.GetPlayerEntities(leftPlayerId);
+            for (EntityID eid : entities) {
+                void* gameObj = registry.GetGameObject(eid);
+                if (gameObj) {
+                    // Clear isPlayerControlled so the character is removed from the
+                    // host's squad panel — this is the key fix for "host controls both
+                    // characters after second client disconnects".
+                    game::WritePlayerControlled(reinterpret_cast<uintptr_t>(gameObj), false);
+                    // Move character far underground so it's invisible
+                    game::CharacterAccessor accessor(gameObj);
+                    Vec3 underground(0.f, -10000.f, 0.f);
+                    accessor.WritePosition(underground);
+                    // Clear AI remote-control tracking to prevent stale pointer issues
+                    ai_hooks::UnmarkRemoteControlled(gameObj);
+                    spdlog::debug("PacketHandler: Cleared control + teleported entity {} underground", eid);
+                }
+                // BUG 2 FIX: Decrement spawn cap for each removed remote entity
+                entity_hooks::DecrementSpawnCount(leftPlayerId);
+                core.GetInterpolation().RemoveEntity(eid);
+                registry.Unregister(eid);
             }
-            // BUG 2 FIX: Decrement spawn cap for each removed remote entity
-            entity_hooks::DecrementSpawnCount(msg.playerId);
-            core.GetInterpolation().RemoveEntity(eid);
-            registry.Unregister(eid);
-        }
-        if (!entities.empty()) {
-            spdlog::info("PacketHandler: Removed {} entities from player {}",
-                         entities.size(), msg.playerId);
+            if (!entities.empty()) {
+                spdlog::info("PacketHandler: Removed {} entities from player {}",
+                             entities.size(), leftPlayerId);
+            }
+        }});
+        if (entityCount > 0) {
             core.GetOverlay().AddSystemMessage(
-                "Cleaned up " + std::to_string(entities.size()) + " remote entities");
+                "Cleaned up " + std::to_string(entityCount) + " remote entities");
         }
     }
 
@@ -694,10 +797,15 @@ private:
                     if (core.IsGameLoaded() && (bestPos.x != 0.f || bestPos.y != 0.f || bestPos.z != 0.f)) {
                         // FIXED: Enqueue position write for game thread execution
                         // Check game loaded AGAIN in lambda (may have changed)
-                        core.GetCommandQueue().Push({[existingChar, bestPos, entityId]() {
+                        // Resolución POR ID dentro de la lambda (no capturar el puntero crudo):
+                        // en desconexión, SetConnected(false) vacía el registry desde otro hilo;
+                        // con el puntero capturado por valor eso era un use-after-free potencial.
+                        core.GetCommandQueue().Push({[bestPos, entityId]() {
                             auto& core = Core::Get();
                             if (core.IsGameLoaded() && core.GetClientPhase() >= ClientPhase::GameReady) {
-                                if (!SEH_WritePositionToChar(existingChar, bestPos.x, bestPos.y, bestPos.z)) {
+                                void* ch = core.GetEntityRegistry().GetGameObject(entityId);
+                                if (!ch) return;  // registro vaciado/entidad eliminada → skip limpio
+                                if (!SEH_WritePositionToChar(ch, bestPos.x, bestPos.y, bestPos.z)) {
                                     spdlog::warn("PacketHandler: WritePosition failed for linked mod char entity {}", entityId);
                                 }
                             }
@@ -725,16 +833,19 @@ private:
                 }
 
                 // Encolar TODO el trabajo que toca memoria del motor / nativo.
-                core.GetCommandQueue().Push({[existingChar, entityId, ownerId, healthCopy, hasExtended]() {
+                // Resolución POR ID dentro de la lambda — no capturar el puntero crudo.
+                core.GetCommandQueue().Push({[entityId, ownerId, healthCopy, hasExtended]() {
                     auto& core = Core::Get();
                     auto& registry = core.GetEntityRegistry();
 
                     // REVALIDAR dentro del game thread: el juego pudo descargarse,
                     // desconectarse o el char pudo re-vincularse a otra entidad
                     // entre el encolado (hilo red) y el drenaje (hilo juego).
+                    // GetGameObject(id) devuelve null si el registry fue vaciado.
+                    void* existingChar = registry.GetGameObject(entityId);
                     if (!core.IsGameLoaded() ||
                         core.GetClientPhase() < ClientPhase::GameReady ||
-                        registry.GetNetId(existingChar) != entityId) {
+                        existingChar == nullptr) {
                         spdlog::warn("PacketHandler: Spawn-init cmd descartado (revalidación falló) entity {}", entityId);
                         return;
                     }
@@ -841,20 +952,28 @@ private:
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
 
-        // BUG 2 FIX: Decrement per-player spawn cap BEFORE unregistering
-        // so the entity info (owner) is still available.
-        auto info = core.GetEntityRegistry().GetInfo(entityId);
-        if (info.has_value() && info->isRemote) {
-            entity_hooks::DecrementSpawnCount(info->ownerPlayerId);
-        }
+        // [Oleada A] Migrado a CommandQueue: SEH_DespawnCleanup toca memoria del motor →
+        // game thread. Captura SOLO POD (entityId); resolución POR ID dentro de la lambda.
+        // Todo el bloque va junto para preservar el orden (cleanup ANTES de Unregister).
+        core.GetCommandQueue().Push({[entityId]() {
+            auto& core = Core::Get();
+            auto& registry = core.GetEntityRegistry();
 
-        void* gameObj = core.GetEntityRegistry().GetGameObject(entityId);
-        if (gameObj) {
-            SEH_DespawnCleanup(gameObj);
-        }
-        core.GetEntityRegistry().SetGameObject(entityId, nullptr);
-        core.GetInterpolation().RemoveEntity(entityId);
-        core.GetEntityRegistry().Unregister(entityId);
+            // BUG 2 FIX: Decrement per-player spawn cap BEFORE unregistering
+            // so the entity info (owner) is still available.
+            auto info = registry.GetInfo(entityId);
+            if (info.has_value() && info->isRemote) {
+                entity_hooks::DecrementSpawnCount(info->ownerPlayerId);
+            }
+
+            void* gameObj = registry.GetGameObject(entityId);
+            if (gameObj) {
+                SEH_DespawnCleanup(gameObj);
+            }
+            registry.SetGameObject(entityId, nullptr);
+            core.GetInterpolation().RemoveEntity(entityId);
+            registry.Unregister(entityId);
+        }});
     }
 
     // ── Position Update ──
@@ -983,20 +1102,23 @@ private:
         auto& registry = core.GetEntityRegistry();
         auto& funcs = core.GetGameFunctions();
 
-        void* targetObj = registry.GetGameObject(msg.targetId);
-        if (!targetObj) return;
-
-        bool appliedViaFunction = false;
+        // Early-out barato en hilo de red (el registry tiene lock propio); la lambda
+        // vuelve a resolver por ID en el game thread (nunca captura el puntero crudo).
+        if (!registry.GetGameObject(msg.targetId)) return;
 
         // Try to apply damage via the game's native damage function.
         // ApplyDamage dereferences attacker, so only call with a valid attacker.
-        // FIXED: Queue all game memory writes for game thread execution
-        // Capture by VALUE only - references would be stale when command executes
-        core.GetCommandQueue().Push({[targetObj, msg]() {
+        // FIXED: Queue all game memory writes for game thread execution.
+        // Captura SOLO POD por valor; punteros resueltos POR ID dentro de la lambda.
+        core.GetCommandQueue().Push({[msg]() {
             auto& core = Core::Get();
             auto& funcs = core.GetGameFunctions();
             auto& registry = core.GetEntityRegistry();
             bool appliedViaFunction = false;
+
+            // Resolver el target POR ID dentro del game thread — registro vaciado → skip limpio.
+            void* targetObj = registry.GetGameObject(msg.targetId);
+            if (!targetObj) return;
 
             if (funcs.ApplyDamage) {
                 void* attackerObj = (msg.attackerId != INVALID_ENTITY)
@@ -1014,22 +1136,9 @@ private:
                 }
             }
 
-            // Fallback: write health directly to character memory
+            // Fallback: escribir la salud de UNA parte por la cadena canónica MedicalSystem.
             if (!appliedViaFunction) {
-                auto& offsets = game::GetOffsets().character;
-                uintptr_t charPtr = reinterpret_cast<uintptr_t>(targetObj);
-
-                if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                    uintptr_t ptr1 = 0;
-                    if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                        uintptr_t ptr2 = 0;
-                        if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                            int partOffset = offsets.healthBase +
-                                static_cast<int>(msg.bodyPart) * offsets.healthStride;
-                            Memory::Write(ptr2 + partOffset, msg.resultHealth);
-                        }
-                    }
-                }
+                SEH_WriteOnePartHealth(targetObj, static_cast<int>(msg.bodyPart), msg.resultHealth);
             }
         }});
 
@@ -1057,19 +1166,23 @@ private:
         auto& registry = core.GetEntityRegistry();
         auto& funcs = core.GetGameFunctions();
 
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        if (!entityObj) return;
+        // Early-out barato en hilo de red; la lambda re-resuelve por ID en el game thread.
+        if (!registry.GetGameObject(msg.entityId)) return;
 
-        bool appliedNative = false;
         if (funcs.CharacterDeath) {
-            void* killerObj = (msg.killerId != INVALID_ENTITY)
-                ? registry.GetGameObject(msg.killerId) : nullptr;
-            // FIXED: Queue death execution for game thread
-            // Capture by VALUE - get Core via singleton in lambda
-            core.GetCommandQueue().Push({[entityObj, killerObj, msg]() {
+            // FIXED: Queue death execution for game thread.
+            // Captura SOLO POD (msg); entityObj/killerObj resueltos POR ID dentro de la lambda.
+            core.GetCommandQueue().Push({[msg]() {
                 auto& core = Core::Get();
                 auto& funcs = core.GetGameFunctions();
+                auto& registry = core.GetEntityRegistry();
                 bool appliedNative = false;
+
+                // Resolver POR ID dentro del game thread — registro vaciado → skip limpio.
+                void* entityObj = registry.GetGameObject(msg.entityId);
+                if (!entityObj) return;
+                void* killerObj = (msg.killerId != INVALID_ENTITY)
+                    ? registry.GetGameObject(msg.killerId) : nullptr;
 
                 // Try native death fn. Pass killerObj even if nullptr — the
                 // game's CharacterDeath at 0x7A6200 accepts nullptr killer
@@ -1092,33 +1205,19 @@ private:
                 }
 
                 if (!appliedNative) {
-                    // Fallback: set all 7 body part health values to -100 via health chain.
-                    // This triggers the game's own death detection (health < 0 on vital part).
-                    // The isAlive offset is -1 (undiscovered), so we use the verified
-                    // health chain: char+0x2B8 -> +0x5F8 -> +0x40 + part*8
-                    auto& offsets = game::GetOffsets().character;
-                    uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-                    if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                        uintptr_t ptr1 = 0;
-                        if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                            uintptr_t ptr2 = 0;
-                            if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                                // Write -100 to all 7 body parts (head, chest, stomach, left arm, right arm, left leg, right leg)
-                                for (int i = 0; i < 7; i++) {
-                                    int partOffset = offsets.healthBase + i * offsets.healthStride;
-                                    float deathHealth = -100.f;
-                                    Memory::Write(ptr2 + partOffset, deathHealth);
-                                }
-                                spdlog::info("PacketHandler: Death fallback — set all body parts to -100 for entity {}", msg.entityId);
-                            }
-                        }
+                    // Fallback: poner las 7 partes a -100 por la cadena canónica MedicalSystem.
+                    // Esto dispara la detección de muerte propia del juego (salud < 0 en parte vital).
+                    float deathHealth[7];
+                    for (int i = 0; i < 7; i++) deathHealth[i] = -100.f;
+                    if (SEH_WriteLimbHealthToChar(entityObj, deathHealth)) {
+                        spdlog::info("PacketHandler: Death fallback — set all body parts to -100 for entity {}", msg.entityId);
                     }
 
                     // Also try isAlive flag if we ever discover it
+                    auto& offsets = game::GetOffsets().character;
                     if (offsets.isAlive >= 0) {
                         bool dead = false;
-                        Memory::Write(charPtr + offsets.isAlive, dead);
+                        Memory::Write(reinterpret_cast<uintptr_t>(entityObj) + offsets.isAlive, dead);
                     }
                 }
             }});
@@ -1148,47 +1247,47 @@ private:
         auto& registry = core.GetEntityRegistry();
         auto& funcs = core.GetGameFunctions();
 
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        bool appliedNativeKO = false;
-        if (entityObj && funcs.CharacterKO) {
-            void* attackerObj = (msg.attackerId != INVALID_ENTITY)
-                ? registry.GetGameObject(msg.attackerId) : nullptr;
-            // Set echo suppression flag so Hook_CharacterKO doesn't
-            // re-queue this KO as a new C2S event.
-            auto koFn = reinterpret_cast<game::func_types::CharacterKOFn>(funcs.CharacterKO);
-            bool koCrashed = false;
-            combat_hooks::SetServerSourcedKO(true);
-            __try {
-                koFn(entityObj, attackerObj, static_cast<int>(msg.bodyPart));
-                appliedNativeKO = true;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                koCrashed = true;
-            }
-            combat_hooks::SetServerSourcedKO(false);
-            if (koCrashed) {
-                spdlog::warn("PacketHandler: Native CharacterKO crashed for entity {} — using fallback",
-                             msg.entityId);
-            }
-        }
-        if (entityObj && !appliedNativeKO) {
-            // Fallback: write the health value directly to trigger KO state
-            auto& offsets = game::GetOffsets().character;
-            uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
+        // [Oleada A] Migrado a CommandQueue: la llamada nativa KO y el fallback de salud
+        // tocaban memoria del motor DIRECTAMENTE desde el hilo de RED. Ahora todo corre en
+        // el game thread, con captura SOLO POD (msg) y resolución POR ID dentro de la lambda.
+        if (registry.GetGameObject(msg.entityId)) {
+            core.GetCommandQueue().Push({[msg]() {
+                auto& core = Core::Get();
+                auto& funcs = core.GetGameFunctions();
+                auto& registry = core.GetEntityRegistry();
 
-            if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                uintptr_t ptr1 = 0;
-                if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                    uintptr_t ptr2 = 0;
-                    if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                        // msg.bodyPart is actually the KO *reason* (0=blood loss,
-                        // 1=head trauma, 2=other), NOT a body part index.
-                        // The health value sent is always chest health, so write
-                        // to body part index 0 (chest).
-                        int partOffset = offsets.healthBase + 0 * offsets.healthStride;
-                        Memory::Write(ptr2 + partOffset, msg.resultHealth);
+                // Resolver POR ID dentro del game thread — registro vaciado → skip limpio.
+                void* entityObj = registry.GetGameObject(msg.entityId);
+                if (!entityObj) return;
+
+                bool appliedNativeKO = false;
+                if (funcs.CharacterKO) {
+                    void* attackerObj = (msg.attackerId != INVALID_ENTITY)
+                        ? registry.GetGameObject(msg.attackerId) : nullptr;
+                    // Set echo suppression flag so Hook_CharacterKO doesn't
+                    // re-queue this KO as a new C2S event.
+                    auto koFn = reinterpret_cast<game::func_types::CharacterKOFn>(funcs.CharacterKO);
+                    bool koCrashed = false;
+                    combat_hooks::SetServerSourcedKO(true);
+                    __try {
+                        koFn(entityObj, attackerObj, static_cast<int>(msg.bodyPart));
+                        appliedNativeKO = true;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        koCrashed = true;
+                    }
+                    combat_hooks::SetServerSourcedKO(false);
+                    if (koCrashed) {
+                        spdlog::warn("PacketHandler: Native CharacterKO crashed for entity {} — using fallback",
+                                     msg.entityId);
                     }
                 }
-            }
+                if (!appliedNativeKO) {
+                    // Fallback: msg.bodyPart es en realidad el MOTIVO del KO (0=blood loss,
+                    // 1=head trauma, 2=other), NO un índice de parte. La salud enviada es
+                    // siempre la del pecho → escribir la parte 0 (chest) por la cadena canónica.
+                    SEH_WriteOnePartHealth(entityObj, 0, msg.resultHealth);
+                }
+            }});
         }
 
         // Update entity registry — write KO health to chest (body part 0)
@@ -1225,13 +1324,7 @@ private:
 
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
-        void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
-        if (!gameObj) return;
-
-        // Write the stat value directly to the character's stats memory
-        game::CharacterAccessor accessor(gameObj);
-        uintptr_t statsPtr = accessor.GetStatsPtr();
-        if (statsPtr == 0) return;
+        if (!core.GetEntityRegistry().GetGameObject(msg.entityId)) return;
 
         // Each stat is a float at statsPtr + (statIndex * 4)
         // The stat index maps to the StatsOffsets fields
@@ -1268,7 +1361,21 @@ private:
         }
 
         if (statOffset >= 0) {
-            Memory::Write(statsPtr + statOffset, msg.statValue);
+            // [Oleada A] Migrado a CommandQueue: la lectura del stats-ptr y la escritura del
+            // stat tocan memoria del motor → game thread. Captura SOLO POD; el personaje se
+            // resuelve POR ID dentro de la lambda (registro vaciado → skip limpio).
+            const EntityID statEntityId = msg.entityId;
+            const float statValue = msg.statValue;
+            core.GetCommandQueue().Push({[statEntityId, statOffset, statValue]() {
+                auto& core = Core::Get();
+                if (!core.IsGameLoaded()) return;
+                void* gameObj = core.GetEntityRegistry().GetGameObject(statEntityId);
+                if (!gameObj) return;
+                game::CharacterAccessor accessor(gameObj);
+                uintptr_t statsPtr = accessor.GetStatsPtr();
+                if (statsPtr == 0) return;
+                Memory::Write(statsPtr + statOffset, statValue);
+            }});
         }
     }
 
@@ -1456,31 +1563,22 @@ private:
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
         auto& registry = core.GetEntityRegistry();
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        if (!entityObj) return;
+        if (!registry.GetGameObject(msg.entityId)) return;
 
-        // Write health values directly to the character's health memory
-        auto& offsets = game::GetOffsets().character;
-        uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-        if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-            __try {
-                uintptr_t ptr1 = 0;
-                if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                    uintptr_t ptr2 = 0;
-                    if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                        for (int i = 0; i < static_cast<int>(BodyPart::Count); i++) {
-                            int partOffset = offsets.healthBase + i * offsets.healthStride;
-                            Memory::Write(ptr2 + partOffset, msg.health[i]);
-                        }
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                spdlog::warn("PacketHandler: SEH exception writing health update for entity {}", msg.entityId);
+        // [Oleada A] Migrado a CommandQueue: la escritura de salud toca memoria del motor →
+        // game thread. Captura SOLO POD (msg); el personaje se resuelve POR ID dentro de la
+        // lambda. La escritura usa la cadena canónica MedicalSystem (SEH_WriteLimbHealthToChar).
+        core.GetCommandQueue().Push({[msg]() {
+            auto& core = Core::Get();
+            if (!core.IsGameLoaded()) return;
+            void* entityObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
+            if (!entityObj) return;
+            if (!SEH_WriteLimbHealthToChar(entityObj, msg.health)) {
+                spdlog::warn("PacketHandler: health update write failed for entity {}", msg.entityId);
             }
-        }
+        }});
 
-        // Update entity registry with the health values
+        // Update entity registry with the health values (lock interno propio → hilo de red OK)
         registry.UpdateLimbHealth(msg.entityId, msg.health);
     }
 
@@ -1492,32 +1590,23 @@ private:
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
 
-        // Store limb health in entity registry
+        // Store limb health in entity registry (lock interno propio → hilo de red OK)
         auto& registry = core.GetEntityRegistry();
         registry.UpdateLimbHealth(msg.entityId, msg.health);
 
-        // Write limb health values to the game character's memory
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        if (entityObj) {
-            auto& offsets = game::GetOffsets().character;
-            uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-            if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                __try {
-                    uintptr_t ptr1 = 0;
-                    if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                        uintptr_t ptr2 = 0;
-                        if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                            for (int i = 0; i < 7; i++) {
-                                int partOffset = offsets.healthBase + i * offsets.healthStride;
-                                Memory::Write(ptr2 + partOffset, msg.health[i]);
-                            }
-                        }
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    spdlog::warn("PacketHandler: SEH exception writing limb health for entity {}", msg.entityId);
+        // [Oleada A] Migrado a CommandQueue: la escritura de salud toca memoria del motor →
+        // game thread. Captura SOLO POD (msg); el personaje se resuelve POR ID dentro de la
+        // lambda. La escritura usa la cadena canónica MedicalSystem (SEH_WriteLimbHealthToChar).
+        if (registry.GetGameObject(msg.entityId)) {
+            core.GetCommandQueue().Push({[msg]() {
+                auto& core = Core::Get();
+                if (!core.IsGameLoaded()) return;
+                void* entityObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
+                if (!entityObj) return;
+                if (!SEH_WriteLimbHealthToChar(entityObj, msg.health)) {
+                    spdlog::warn("PacketHandler: limb health write failed for entity {}", msg.entityId);
                 }
-            }
+            }});
         }
 
         spdlog::debug("PacketHandler: Limb health for entity {} (chest={:.1f})",
@@ -1550,17 +1639,22 @@ private:
 
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
-        void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
-        if (!gameObj) return;
+        if (!core.GetEntityRegistry().GetGameObject(msg.entityId)) return;
+        if (msg.slot >= static_cast<uint8_t>(EquipSlot::Count)) return;
 
-        game::CharacterAccessor accessor(gameObj);
-        uintptr_t invPtr = accessor.GetInventoryPtr();
-        if (invPtr == 0) return;
-
-        game::InventoryAccessor inventory(invPtr);
-        if (msg.slot < static_cast<uint8_t>(EquipSlot::Count)) {
+        // [Oleada A] Migrado a CommandQueue: SetEquipment escribe memoria del motor →
+        // game thread. Captura SOLO POD (msg); resolución POR ID dentro de la lambda.
+        core.GetCommandQueue().Push({[msg]() {
+            auto& core = Core::Get();
+            if (!core.IsGameLoaded()) return;
+            void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
+            if (!gameObj) return;
+            game::CharacterAccessor accessor(gameObj);
+            uintptr_t invPtr = accessor.GetInventoryPtr();
+            if (invPtr == 0) return;
+            game::InventoryAccessor inventory(invPtr);
             inventory.SetEquipment(static_cast<EquipSlot>(msg.slot), msg.itemTemplateId);
-        }
+        }});
     }
 
     // ── Chat ──
@@ -1600,21 +1694,27 @@ private:
 
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
-        void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
-        if (!gameObj) return;
+        if (!core.GetEntityRegistry().GetGameObject(msg.entityId)) return;
 
-        game::CharacterAccessor accessor(gameObj);
-        uintptr_t invPtr = accessor.GetInventoryPtr();
-        if (invPtr == 0) return;
-
-        game::InventoryAccessor inventory(invPtr);
-        if (msg.action == 0) {
-            // Add item - write directly to inventory memory
-            inventory.AddItem(msg.itemTemplateId, msg.quantity);
-        } else if (msg.action == 1) {
-            // Remove item
-            inventory.RemoveItem(msg.itemTemplateId, msg.quantity);
-        }
+        // [Oleada A] Migrado a CommandQueue: AddItem/RemoveItem escriben memoria del motor →
+        // game thread. Captura SOLO POD (msg); resolución POR ID dentro de la lambda.
+        core.GetCommandQueue().Push({[msg]() {
+            auto& core = Core::Get();
+            if (!core.IsGameLoaded()) return;
+            void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
+            if (!gameObj) return;
+            game::CharacterAccessor accessor(gameObj);
+            uintptr_t invPtr = accessor.GetInventoryPtr();
+            if (invPtr == 0) return;
+            game::InventoryAccessor inventory(invPtr);
+            if (msg.action == 0) {
+                // Add item - write directly to inventory memory
+                inventory.AddItem(msg.itemTemplateId, msg.quantity);
+            } else if (msg.action == 1) {
+                // Remove item
+                inventory.RemoveItem(msg.itemTemplateId, msg.quantity);
+            }
+        }});
     }
 
     static void HandleTradeResult(PacketReader& reader) {
@@ -1807,8 +1907,16 @@ private:
 
         auto& core = Core::Get();
         if (!core.IsGameLoaded()) return;
-        void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
-        if (gameObj) {
+        if (!core.GetEntityRegistry().GetGameObject(msg.entityId)) return;
+
+        // [Oleada A] Migrado a CommandQueue: la lectura del functionality-ptr y la escritura
+        // del estado de puerta tocan memoria del motor → game thread. Captura SOLO POD (msg);
+        // el edificio se resuelve POR ID dentro de la lambda.
+        core.GetCommandQueue().Push({[msg]() {
+            auto& core = Core::Get();
+            if (!core.IsGameLoaded()) return;
+            void* gameObj = core.GetEntityRegistry().GetGameObject(msg.entityId);
+            if (!gameObj) return;
             // Buildings in Kenshi have a functionality pointer that contains door state.
             // BuildingOffsets::functionality = 0xC0 → door state is at functionality+0x10
             auto& offsets = game::GetOffsets().building;
@@ -1824,7 +1932,7 @@ private:
             } else {
                 spdlog::debug("PacketHandler: No functionality ptr for building {} — door state not written", msg.entityId);
             }
-        }
+        }});
     }
 
     // ── Admin Response ──
@@ -1957,15 +2065,18 @@ void ProcessDeferredSpawn(const DeferredSpawn& ds) {
         }
 
         // Posición + inicialización completa en UN solo comando de game thread.
-        core.GetCommandQueue().Push({[existingChar, spawnPos, dsEntityId, dsOwnerId,
+        // Resolución POR ID dentro de la lambda — no capturar el puntero crudo.
+        core.GetCommandQueue().Push({[spawnPos, dsEntityId, dsOwnerId,
                                       healthCopy, dsHasHealth]() {
             auto& core = Core::Get();
             auto& registry = core.GetEntityRegistry();
 
-            // REVALIDAR en el game thread (ver HandleEntitySpawn).
+            // REVALIDAR en el game thread (ver HandleEntitySpawn). GetGameObject(id)
+            // devuelve null si el registry fue vaciado (desconexión) → skip limpio.
+            void* existingChar = registry.GetGameObject(dsEntityId);
             if (!core.IsGameLoaded() ||
                 core.GetClientPhase() < ClientPhase::GameReady ||
-                registry.GetNetId(existingChar) != dsEntityId) {
+                existingChar == nullptr) {
                 spdlog::warn("ProcessDeferredSpawn: cmd descartado (revalidación falló) entity {}", dsEntityId);
                 return;
             }

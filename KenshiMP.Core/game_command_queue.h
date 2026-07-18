@@ -37,9 +37,9 @@ public:
         }
 
         for (auto& cmd : local) {
-            if (cmd.execute) {
-                cmd.execute();
-            }
+            // Usar el ejecutor pasado por el caller (con SEH), no llamar directo: antes el
+            // parámetro fn se IGNORABA y una excepción en una lambda abortaba el resto del tick.
+            if (cmd.execute) fn(cmd);
         }
     }
 

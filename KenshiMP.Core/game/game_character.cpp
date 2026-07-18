@@ -195,24 +195,26 @@ Quat CharacterAccessor::GetRotation() const {
 float CharacterAccessor::GetHealth(BodyPart part) const {
     auto& offsets = GetOffsets().character;
 
-    // Method 1: Direct offset (if scanner found it)
+    // Method 1: Direct offset (if scanner found it).
+    // NOTA: el modelo "array plano de floats" NO existe en 1.0.68 (la salud vive en
+    // HealthPartStatus* individuales) — offsets.health es siempre -1, esta rama nunca
+    // se activa. Se conserva solo como compatibilidad si un scanner futuro lo poblara.
     if (offsets.health >= 0) {
         float health = 0.f;
         Memory::Read(m_ptr + offsets.health + static_cast<int>(part) * offsets.healthStride, health);
         return health;
     }
 
-    // Method 2: CE pointer chain: char+2B8 -> +5F8 -> +40 + (part * stride)
-    if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-        uintptr_t ptr1 = 0;
-        if (!Memory::Read(m_ptr + offsets.healthChain1, ptr1) || ptr1 == 0) return 0.f;
-
-        uintptr_t ptr2 = 0;
-        if (!Memory::Read(ptr1 + offsets.healthChain2, ptr2) || ptr2 == 0) return 0.f;
-
+    // Cadena canónica MedicalSystem (inline en char+0x458):
+    // [char+0x5F8] = HealthPartStatus** → [array + part*8] → flesh @ +0x40
+    if (offsets.healthPartArray >= 0 && offsets.healthBase >= 0) {
+        uintptr_t partArray = 0;
+        if (!Memory::Read(m_ptr + offsets.healthPartArray, partArray) || partArray == 0) return 0.f;
+        uintptr_t partPtr = 0;
+        if (!Memory::Read(partArray + static_cast<int>(part) * offsets.healthStride, partPtr) || partPtr == 0)
+            return 0.f;
         float health = 0.f;
-        int partOffset = offsets.healthBase + static_cast<int>(part) * offsets.healthStride;
-        Memory::Read(ptr2 + partOffset, health);
+        Memory::Read(partPtr + offsets.healthBase, health);
         return health;
     }
 
@@ -960,6 +962,70 @@ uintptr_t GetPlayerPrimaryCharacterDirect() {
     if (vtable < modBase || vtable >= modBase + modSize) return 0; // no es objeto del juego
 
     return firstChar;
+}
+
+// ── IsInPlayerCharactersList ──
+// [FIX-GHOST 2026-07] Comprueba si charPtr está en la lista NATIVA de personajes
+// del jugador (PlayerInterface+0x2B0, lektor<Character*>). Misma cadena y mismas
+// guardas de puntero que GetPlayerPrimaryCharacterDirect, pero iterando TODAS las
+// entradas del lektor en vez de solo data[0].
+// Motivo: FindAndClaimModCharacters reclamaba como entidad LOCAL cualquier char
+// cuyo nombre encajase con "Player N" — incluidos NPCs fantasma del mundo que solo
+// COMPARTEN el patrón de nombre. Esta función da el criterio de verdad del motor.
+// Devuelve:  1 = está;  0 = lista legible pero NO está;  -1 = lista no disponible.
+int IsInPlayerCharactersList(uintptr_t charPtr) {
+    if (charPtr == 0) return 0;
+
+    uintptr_t gameWorldAddr = GetResolvedGameWorld();
+    if (gameWorldAddr == 0) return -1;
+
+    // Rango del módulo para distinguir punteros de heap (mismas guardas que arriba).
+    uintptr_t modBase = Memory::GetModuleBase();
+    size_t modSize = 0x4000000; // 64MB fallback
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE)
+                modSize = nt->OptionalHeader.SizeOfImage;
+        }
+    }
+    auto isValidHeapPtr = [modBase, modSize](uintptr_t val) -> bool {
+        if (val < 0x10000 || val >= 0x00007FFFFFFFFFFF) return false;
+        if ((val & 0x7) != 0) return false;
+        if (val >= modBase && val < modBase + modSize) return false;
+        return true;
+    };
+
+    const auto& offsets = GetOffsets();
+
+    // Caso (a) puntero a GameWorld vs (b) instancia embebida: deref una vez y valida.
+    uintptr_t gameWorld = 0;
+    if (!(Memory::Read(gameWorldAddr, gameWorld) && isValidHeapPtr(gameWorld))) {
+        gameWorld = gameWorldAddr; // caso (b)
+    }
+
+    // GameWorld -> player (PlayerInterface*)
+    uintptr_t playerIface = 0;
+    if (!Memory::Read(gameWorld + offsets.world.player, playerIface) || !isValidHeapPtr(playerIface))
+        return -1;
+
+    // PlayerInterface -> playerCharacters (lektor<Character*>): size@+0x08, data@+0x10.
+    uintptr_t lektorBase = playerIface + offsets.playerInterface.playerCharacters; // +0x2B0
+    uint32_t size = 0; uintptr_t dataPtr = 0;
+    if (!Memory::Read(lektorBase + 0x08, size))   return -1;
+    if (!Memory::Read(lektorBase + 0x10, dataPtr)) return -1;
+    if (size == 0 || size > 100000)               return -1; // aún sin poblar / basura
+    if (!isValidHeapPtr(dataPtr))                 return -1;
+
+    // Recorrer las entradas comparando punteros (cap de seguridad: 64 chars de jugador).
+    uint32_t count = (size < 64) ? size : 64;
+    for (uint32_t i = 0; i < count; i++) {
+        uintptr_t entry = 0;
+        if (!Memory::Read(dataPtr + i * sizeof(uintptr_t), entry)) continue;
+        if (entry == charPtr) return 1; // confirmado: es un personaje REAL del jugador
+    }
+    return 0; // lista legible y poblada, pero este char NO es del jugador
 }
 
 // ── DiagDumpPlayerFaction — SONDA v2 ──

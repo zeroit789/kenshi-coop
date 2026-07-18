@@ -43,6 +43,15 @@ bool IsRemoteControlled(void* character) {
     return s_remoteControlled.count(character) > 0;
 }
 
+// Cambio 3.2: vacía el set de remote-controlled bajo el mismo lock.
+// Llamado en desconexión / recarga de save en caliente: los punteros marcados pertenecen
+// a Characters de la sesión anterior que el motor ya liberó; dejarlos marcados suprimiría
+// la IA de NPCs locales nuevos si el motor recicla esas direcciones.
+void ClearRemoteControlled() {
+    std::lock_guard lock(s_remoteMutex);
+    s_remoteControlled.clear();
+}
+
 // Diagnóstico (solo lectura): tamaño actual del set de remote-controlled.
 // Pensado para [DIAG-REMOTE]: si el host está vivo y solo (sin peers) este valor
 // debería ser 0; >0 con el host marcado = anomalía que bloquearía su combate/IA.

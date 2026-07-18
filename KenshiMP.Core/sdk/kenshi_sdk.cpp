@@ -153,21 +153,16 @@ bool KenshiSDK::WritePosition(uintptr_t gamePtr, const Vec3& pos) {
 
 bool KenshiSDK::WriteHealth(uintptr_t gamePtr, BodyPart part, float value) {
     if (gamePtr == 0) return false;
-
     auto& offsets = game::GetOffsets().character;
-
-    // Use the CE-verified health chain: char+0x2B8 → +0x5F8 → +0x40+(part*8)
-    uintptr_t ptr1 = 0;
-    if (!Memory::Read(gamePtr + offsets.healthChain1, ptr1) || ptr1 == 0)
+    // Cadena canónica MedicalSystem (ver game_types.h):
+    // partArray = [char+0x5F8] → part_i = [partArray + part*8] → flesh @ part_i+0x40
+    uintptr_t partArray = 0;
+    if (!Memory::Read(gamePtr + offsets.healthPartArray, partArray) || partArray == 0)
         return false;
-
-    uintptr_t ptr2 = 0;
-    if (!Memory::Read(ptr1 + offsets.healthChain2, ptr2) || ptr2 == 0)
+    uintptr_t partPtr = 0;
+    if (!Memory::Read(partArray + static_cast<int>(part) * offsets.healthStride, partPtr) || partPtr == 0)
         return false;
-
-    int partOffset = offsets.healthBase +
-        static_cast<int>(part) * offsets.healthStride;
-    return Memory::Write(ptr2 + partOffset, value);
+    return Memory::Write(partPtr + offsets.healthBase, value);
 }
 
 bool KenshiSDK::WriteName(uintptr_t gamePtr, const std::string& name) {

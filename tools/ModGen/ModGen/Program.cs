@@ -80,6 +80,134 @@ if (args.Length > 0 && args[0] == "basefac")
     return;
 }
 
+// ── Modo "fixhub" (Onyx 2026-07-11) ──────────────────────────────────────────
+// Fix de los NPCs fantasma "Player 1"/"Player 2" (wiki: Sesion-2026-07-11, secc. 7b):
+// el .mod registra un override del town "The Hub" cuya categoría 'bar squads' apunta a
+// los squads de jugador 11-kenshi-online.mod (Player 1 squad) y 13-kenshi-online.mod
+// (Player 2 squad). El motor NATIVO puebla el bar del Hub con esos squads al streamear
+// la zona → los fantasmas aparecen de pie junto al jugador nada más cargar.
+// Este modo QUITA esas dos referencias del registro override de The Hub. El registro
+// base del juego (gamedata.base) NO se toca: el override simplemente deja de añadirlas.
+//
+// USO:
+//   dotnet run -c Release -- fixhub --dry-run     # solo informa qué se eliminaría (no escribe NADA)
+//   dotnet run -c Release -- fixhub               # aplica de verdad (backup .bak-pre-hubfix antes)
+//   dotnet run -c Release -- fixhub [--dry-run] <ruta1.mod> [<ruta2.mod> ...]   # rutas explícitas
+if (args.Length > 0 && args[0] == "fixhub")
+{
+    bool dryRun = args.Contains("--dry-run");
+
+    // StringIds de los squads de jugador a quitar de 'bar squads' de The Hub.
+    var squadIdsToRemove = new[] { "11-kenshi-online.mod", "13-kenshi-online.mod" };
+
+    // Rutas por defecto: las 2 copias DESPLEGADAS (las que carga el juego: data\ y
+    // mods\kenshi-online\) + las 3 del repo (fuente/dist/16 jugadores), para que un
+    // redeploy futuro no reintroduzca los fantasmas. Mismo patrón de cobertura que
+    // tools/set_player_squad_faction_nameless.py.
+    const string RepoRoot = @"E:\Aplicaciones\Kenshi-Online";
+    const string SteamKenshi = @"E:\SteamLibrary\steamapps\common\Kenshi";
+    var defaultPaths = new[]
+    {
+        Path.Combine(SteamKenshi, "data", "kenshi-online.mod"),                   // desplegado data\ (objetivo 1 del fix)
+        Path.Combine(SteamKenshi, "mods", "kenshi-online", "kenshi-online.mod"),  // desplegado mods\ (objetivo 2 del fix)
+        Path.Combine(RepoRoot, "kenshi-online.mod"),                              // fuente del repo (2 jugadores)
+        Path.Combine(RepoRoot, "dist", "kenshi-online.mod"),                      // dist del repo
+        Path.Combine(RepoRoot, "kenshi-online-16.mod"),                           // candidato 16 jugadores
+    };
+    var explicitPaths = args.Skip(1).Where(x => x != "--dry-run").ToArray();
+    var targets = explicitPaths.Length > 0 ? explicitPaths : defaultPaths;
+
+    Console.WriteLine("=== fixhub: quitar 'Player 1/2 squad' de 'bar squads' de The Hub ===");
+    Console.WriteLine($"    Modo: {(dryRun ? "DRY-RUN (no escribe nada)" : "APLICAR (con backup .bak-pre-hubfix)")}\n");
+
+    int touched = 0; // archivos con cambios (aplicados o pendientes en dry-run)
+    foreach (var modPath in targets)
+    {
+        Console.WriteLine($"Archivo: {modPath}");
+        if (!File.Exists(modPath)) { Console.WriteLine("  SKIP (no existe)\n"); continue; }
+
+        // Lectura completa del .mod con OpenConstructionSet (mismo mecanismo probado
+        // que usa el flujo principal de ModGen: read-modify-write vía ModFile).
+        var dataF = await new ModFile(modPath).ReadDataAsync();
+
+        // Diccionario id→item para imprimir nombres legibles en el informe
+        // (tolerante a StringIds duplicados, como en el modo 'basefac').
+        var byIdF = new Dictionary<string, Item>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in dataF.Items) byIdF[it.StringId] = it;
+        string NameOfF(string sid) => byIdF.TryGetValue(sid, out var it) ? $"\"{it.Name}\" [{it.Type}]" : "(externo/?)";
+
+        // 1) Localizar los registros Town "The Hub" (override del mod). No asumimos el
+        //    StringId: se busca por tipo + nombre y se verifica la categoría real.
+        var hubs = dataF.Items.Where(i => i.Type == ItemType.Town
+            && i.Name.Equals("The Hub", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (hubs.Count == 0) { Console.WriteLine("  SKIP (este .mod no tiene registro Town 'The Hub')\n"); continue; }
+
+        int removedHere = 0;
+        foreach (var hub in hubs)
+        {
+            Console.WriteLine($"  Town \"{hub.Name}\" ({hub.StringId}) — categorías: [{string.Join(", ", hub.ReferenceCategories.Select(c => c.Name))}]");
+            foreach (var cat in hub.ReferenceCategories.Where(c => c.Name.Equals("bar squads", StringComparison.OrdinalIgnoreCase)))
+            {
+                // Informe completo de la categoría ANTES de tocar nada: qué hay y qué cae.
+                foreach (var r in cat.References)
+                {
+                    bool kill = squadIdsToRemove.Contains(r.TargetId, StringComparer.OrdinalIgnoreCase);
+                    Console.WriteLine($"    bar squads -> {NameOfF(r.TargetId)} ({r.TargetId}) [v0={r.Value0} v1={r.Value1} v2={r.Value2}]{(kill ? "   <<< ELIMINAR" : "")}");
+                }
+                // Eliminación de las referencias objetivo (solo en modo real).
+                var toRemove = cat.References
+                    .Where(r => squadIdsToRemove.Contains(r.TargetId, StringComparer.OrdinalIgnoreCase)).ToList();
+                foreach (var r in toRemove)
+                {
+                    if (!dryRun) cat.References.Remove(r);
+                    removedHere++;
+                }
+            }
+        }
+
+        // 2) Escaneo informativo: cualquier OTRO registro que aún referencie esos squads.
+        //    (Esperado: el gamestart 'Multiplayer' apunta a 11- vía 'squad' — ese NO se toca,
+        //    es el squad de spawn del host, no un poblador del bar.)
+        foreach (var it in dataF.Items)
+        {
+            if (hubs.Contains(it)) continue;
+            foreach (var cat in it.ReferenceCategories)
+                foreach (var r in cat.References)
+                    if (squadIdsToRemove.Contains(r.TargetId, StringComparer.OrdinalIgnoreCase))
+                        Console.WriteLine($"  [INFO] otra referencia (NO se toca): [{it.Type}] \"{it.Name}\" ({it.StringId}) cat '{cat.Name}' -> {r.TargetId}");
+        }
+
+        if (removedHere == 0) { Console.WriteLine("  Nada que eliminar en 'bar squads' de The Hub (¿ya parcheado?)\n"); continue; }
+
+        if (dryRun)
+        {
+            Console.WriteLine($"  [DRY-RUN] se eliminarían {removedHere} referencia(s) de 'bar squads' de The Hub. No se escribe.\n");
+            touched++;
+            continue;
+        }
+
+        // 3) Backup (una sola vez, no se machaca si ya existe) y escritura.
+        var backup = modPath + ".bak-pre-hubfix";
+        if (!File.Exists(backup)) { File.Copy(modPath, backup); Console.WriteLine($"  Backup -> {backup}"); }
+        await new ModFile(modPath).WriteDataAsync(dataF);
+
+        // 4) Verificación por relectura fiel: no debe quedar ninguna referencia 11-/13-
+        //    en 'bar squads' de ningún The Hub del archivo escrito.
+        var verifyF = await new ModFile(modPath).ReadDataAsync();
+        var leftover = verifyF.Items
+            .Where(i => i.Type == ItemType.Town && i.Name.Equals("The Hub", StringComparison.OrdinalIgnoreCase))
+            .SelectMany(i => i.ReferenceCategories.Where(c => c.Name.Equals("bar squads", StringComparison.OrdinalIgnoreCase)))
+            .SelectMany(c => c.References)
+            .Count(r => squadIdsToRemove.Contains(r.TargetId, StringComparer.OrdinalIgnoreCase));
+        Console.WriteLine(leftover == 0
+            ? $"  ESCRITO y VERIFICADO: {removedHere} referencia(s) eliminadas ({verifyF.Items.Count} items en el archivo).\n"
+            : $"  *** ERROR DE VERIFICACIÓN: quedan {leftover} referencias tras escribir — restaurar desde {backup} ***\n");
+        touched++;
+    }
+    Console.WriteLine($"Hecho. {touched} archivo(s) {(dryRun ? "con cambios pendientes (dry-run)" : "parcheados")}.");
+    return;
+}
+
 var src = new ModFile(SrcPath);
 var data = await src.ReadDataAsync();
 Console.WriteLine($"Read {data.Items.Count} items from kenshi-online.mod (lastId={data.LastId}, type={data.Type})");

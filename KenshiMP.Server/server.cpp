@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>  // strnlen — usado para acotar lectura de buffers de texto sin null-terminar
 #include <thread>
 
 namespace kmp {
@@ -118,6 +119,13 @@ bool GameServer::Start(const ServerConfig& config) {
 }
 
 void GameServer::Stop() {
+    // H3: bloquear el mutex durante todo el apagado. El hilo de consola
+    // (comandos status/players/etc.) también toma m_mutex y accede a m_players/m_host,
+    // así que sin este lock un comando tecleado justo durante el shutdown leería
+    // estructuras a medio destruir. m_mutex es recursive_mutex: las llamadas internas
+    // que vuelven a bloquear (p.ej. SaveWorld/BroadcastSystemMessage) no causan deadlock.
+    std::lock_guard lock(m_mutex);
+
     // Deregister from master server
     SendMasterDeregister();
     if (m_masterPeer) {
@@ -2207,6 +2215,16 @@ void GameServer::HandleCombatKO(ConnectedPlayer& player, PacketReader& reader) {
     }
     if (!victimIsReporter && !attackerIsReporter) return;
 
+    // H5: validar la salud recibida antes de guardarla y retransmitirla. Mismo criterio
+    // que HandlePositionUpdate: rechazar NaN/inf (un cliente malicioso podría envenenar
+    // el estado de otros clientes) y acotar a un rango plausible con std::clamp.
+    if (std::isnan(chestHealth) || std::isinf(chestHealth)) {
+        spdlog::warn("GameServer: KO de '{}' con chestHealth invalido (NaN/inf) para entidad {}",
+                     player.name, entityId);
+        return;
+    }
+    chestHealth = std::clamp(chestHealth, -1000.0f, 1000.0f);
+
     spdlog::info("GameServer: Player '{}' reports entity {} KO (attacker={}, reason={}, health={:.1f})",
                  player.name, entityId, attackerId, reason, chestHealth);
 
@@ -2282,9 +2300,23 @@ void GameServer::HandleLimbHealth(ConnectedPlayer& player, PacketReader& reader)
     auto it = m_entities.find(msg.entityId);
     if (it == m_entities.end() || it->second.owner != player.id) return;
 
-    // Store limb health values on server entity
+    // H5: rechazar el paquete si cualquier valor de salud de miembro es NaN/inf
+    // (mismo criterio que HandlePositionUpdate). Evita propagar valores corruptos
+    // del cliente al estado del servidor y al resto de clientes.
     for (int i = 0; i < 7; i++) {
-        it->second.limbHealth[i] = msg.health[i];
+        if (std::isnan(msg.health[i]) || std::isinf(msg.health[i])) {
+            spdlog::warn("GameServer: LimbHealth de '{}' con valor invalido (NaN/inf) para entidad {}",
+                         player.name, msg.entityId);
+            return;
+        }
+    }
+
+    // Store limb health values on server entity — acotar cada valor a un rango
+    // plausible con std::clamp y sanear también msg.health[] (se retransmite más abajo).
+    for (int i = 0; i < 7; i++) {
+        float h = std::clamp(msg.health[i], -1000.0f, 1000.0f);
+        msg.health[i] = h;
+        it->second.limbHealth[i] = h;
     }
 
     spdlog::debug("GameServer: Player '{}' limb health for entity {} (chest={:.1f})",
@@ -2474,7 +2506,11 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
     case 0: { // Kick
         auto* target = GetPlayer(msg.targetPlayerId);
         if (target && target->id != m_hostPlayerId) {
-            std::string reason = msg.textParam[0] ? msg.textParam : "Kicked by host";
+            // H6: construir el string acotando la lectura a sizeof(textParam) con strnlen,
+            // por si el cliente no null-terminó el buffer (evita over-read más allá de 128 bytes).
+            std::string reason = msg.textParam[0]
+                ? std::string(msg.textParam, strnlen(msg.textParam, sizeof(msg.textParam)))
+                : std::string("Kicked by host");
             spdlog::info("GameServer: Host kicked player '{}': {}", target->name, reason);
             BroadcastSystemMessage(target->name + " was kicked: " + reason);
 
@@ -2503,7 +2539,10 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
     case 1: { // Ban
         auto* target = GetPlayer(msg.targetPlayerId);
         if (target && target->id != m_hostPlayerId) {
-            std::string reason = msg.textParam[0] ? msg.textParam : "Baneado por el host";
+            // H6: acotar la lectura con strnlen por si el buffer no viene null-terminado.
+            std::string reason = msg.textParam[0]
+                ? std::string(msg.textParam, strnlen(msg.textParam, sizeof(msg.textParam)))
+                : std::string("Baneado por el host");
             std::string bannedName = target->name;
             std::string bannedIP   = AddressToIPString(target->peer->address);
 
@@ -2568,7 +2607,8 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
         break;
     }
     case 4: { // Announce
-        std::string announcement = msg.textParam;
+        // H6: acotar la lectura con strnlen por si el buffer no viene null-terminado.
+        std::string announcement(msg.textParam, strnlen(msg.textParam, sizeof(msg.textParam)));
         if (!announcement.empty()) {
             BroadcastSystemMessage("[HOST] " + announcement);
             responseText = "Announced.";

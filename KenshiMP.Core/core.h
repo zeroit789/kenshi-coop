@@ -23,6 +23,8 @@
 #include "sdk/kenshi_sdk.h"
 #include "sdk/visual_proxy.h"
 #include "hooks/entity_hooks.h"
+#include "hooks/char_tracker_hooks.h"
+#include "hooks/ai_hooks.h"
 #include "game_command_queue.h"
 #include <spdlog/spdlog.h>
 #include <atomic>
@@ -63,9 +65,28 @@ void ResetKeepaliveTimer();
 // Defined in core.cpp — re-arma el fix de facción del host en disconnect / nueva carga
 void ResetHostFactionFix();
 
+// Defined in core.cpp — purga los cachés de Nameless (s_cachedNamelessFaction/FR,
+// s_namelessResolveState) en disconnect / nueva carga. Sin esto, tras recargar un save el motor
+// libera/recrea las facciones y esos punteros quedan colgando — los hooks isAlly/isEnemy seguirían
+// "sustituyendo por Nameless" contra memoria reciclada (hallazgo de la revisión de interacciones,
+// 2026-07-13). ResolveNamelessFactionOnce es idempotente y se re-arma solo tras esto.
+void ResetNamelessResolve();
+
+// Defined in core.cpp — re-arma el [FIX-HOSTREL]: pasada one-shot que reescribe a -100 las
+// relaciones de facción CORRUPTAS del host (37 entries explícitas que deberían ser hostiles pero
+// quedaron en neutral 0.00/-10, heredadas de un clon corrupto, y que ANULAN el defaultRelation=-100
+// → ningún NPC contraataca al host, "todos huyen"). Se re-arma en disconnect / nueva carga por si el
+// motor recarga las relaciones al cargar un save (hallazgo RE en vivo, 2026-07-13).
+void ResetHostFactionRelationsFix();
+
 // Defined in core.cpp — re-arma el SEED de char+0xD0 (lastProcessed) del host
 // (Fase 4: desbloqueo del AI tick de combate) en disconnect / nueva carga.
 void ResetHostSimSeedFix();
+
+// Defined in core.cpp — re-arma el SEED de char+0x4C0 (timestamp medico) del host
+// (FIX-MEDSEED: desbloquea el consumo de comida/necesidades evitando dt<0 en
+// MedicalSystem::periodicUpdate 0x64DA70) en disconnect / nueva carga.
+void ResetHostMedSeedFix();
 
 // Defined in core.cpp — re-arma el FIX-CONTROL (SetControlledChar 0x802520: vincula la
 // facción del host como "controlada por el jugador", faction+0x250=PI → el gate de la rama
@@ -79,6 +100,20 @@ void ResetHostControlledCharFix();
 // kEnableCombatClassFix (OFF por defecto). Se re-arma en disconnect / nueva carga.
 void ResetHostCombatClassFix();
 
+// Defined in core.cpp — re-arma el [FIX-COMBATARM] (arranca la máquina de estados de combate del
+// host llamando a CombatClass::startupState() [vtable slot +0x50] una vez, para que nextMove
+// (CC+0x1F4) / combatState (CC+0x1F0) dejen de contener basura sin inicializar y el host pueda
+// iniciar combate "en frío" sin usar antes un muñeco de entrenamiento). Incluye red de seguridad
+// (saneado defensivo de nextMove/combatState). Se re-arma en disconnect / nueva carga.
+void ResetHostCombatArmFix();
+
+// Defined in core.cpp — re-arma el [FIX-ARMHAND] (repara el handle de brazo del AI del host:
+// AI+0x318 = Character+0x458, escritura de puntero de 8 bytes a una región que ya existe dentro
+// del propio Character). Sin esto el chequeo GOAP dice "brazo en estado pésimo" aunque los brazos
+// estén sanos → el host no puede cargar/secuestrar, hacer primeros auxilios ni autocurarse.
+// Se re-arma en disconnect / nueva carga.
+void ResetHostArmHandFix();
+
 // Defined in core.cpp — re-arma el [AUTOTEST] de combate (dispara attackTarget 0x5CB0A0 sobre
 // el host contra un NPC enemigo cercano, una vez por carga) en disconnect / nueva carga.
 void ResetHostCombatAutotest();
@@ -88,6 +123,19 @@ void ResetHostCombatAutotest();
 // del mod omite → su Tasker queda huérfano y el AI tick no consume las órdenes de combate).
 // CAUSA RAÍZ Fase 4 (orden encolada pero amIdle=1). Se re-arma en disconnect / nueva carga.
 void ResetHostPlatoonFix();
+
+// Defined in core.cpp — re-arma el [DIAG-CLONESQUAD] (detección del CharacterHuman DUPLICADO
+// en el squad del host: mismo char+0x40 template + char+0x0C==1 + mismo ActivePlatoon que el
+// char real → clon que reencola GET_OUT_OF_BED sin fin, causa raíz del bug de la cama, wiki
+// secc. 21). Solo diagnóstico (no despawnea: no hay función nativa segura). Se re-arma en
+// disconnect / nueva carga.
+void ResetHostSquadCloneDetect();
+
+// Defined in core.cpp — re-arma el [FIX-CLONESQUAD-DESPAWN] (despawn REAL del clon del squad
+// del host: erase de la lektor PlayerInterface + GameWorld::removeObject 0x799AF0). Gating
+// anti-falso-positivo por estabilidad (≥3 ticks con el mismo clon). Acción DESTRUCTIVA y
+// one-shot; se re-arma en disconnect / nueva carga (junto a ResetHostSquadCloneDetect).
+void ResetHostSquadCloneDespawn();
 
 class Core {
 public:
@@ -146,7 +194,10 @@ public:
                 // (0x722EF0 UI/MyGUI) quedó refutado y su hook NO se instala — su Enable sería
                 // no-op, así que ya no se invoca.
                 HookManager::Get().Enable("PushOrder");
-                spdlog::info("Core: Combat hooks ENABLED (game loaded, incl. PushOrder DIAG)");
+                // [DIAG-COMBATSEED] Activa el hook de CombatClass::update 0x60D650 (AI tick de
+                // combate) para capturar el estado del CombatClass del host (frío vs tras entrenar).
+                HookManager::Get().Enable("CombatClassUpdate");
+                spdlog::info("Core: Combat hooks ENABLED (game loaded, incl. PushOrder + CombatSeed DIAG)");
             } else {
                 spdlog::info("Core: Combat hooks DEFERRED (game not loaded — will enable on load)");
             }
@@ -198,6 +249,12 @@ public:
 
             // Reset shared-save sync
             shared_save_sync::Reset();
+
+            // Cambio 2.4 / 3.2: purgar cachés de personajes al desconectar. Los Character de la
+            // sesión anterior serán liberados por el motor → dejar entradas colgadas provocaría
+            // UAF (tracker) o suprimir la IA de NPCs locales nuevos (remote-controlled).
+            char_tracker_hooks::Clear();
+            ai_hooks::ClearRemoteControlled();
 
             // Clear stale spawn queue from previous session
             m_spawnManager.ClearSpawnQueue();

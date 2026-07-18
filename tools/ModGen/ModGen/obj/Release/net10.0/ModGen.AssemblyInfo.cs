@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ModGen")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b73a3d40bd72f54c4ba08dfa26f9531e1f418e83")]
 [assembly: System.Reflection.AssemblyProductAttribute("ModGen")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ModGen")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

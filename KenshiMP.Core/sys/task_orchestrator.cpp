@@ -59,6 +59,11 @@ void TaskOrchestrator::Stop() {
         while (!m_tasks.empty()) m_tasks.pop();
     }
     m_pendingFrameWork.store(0);
+    // Despertar a cualquier hilo bloqueado en WaitForFrameWork() durante el teardown — antes solo
+    // se notificaba m_taskCV, nunca m_frameCV, así que un waiter podía quedarse colgado para
+    // siempre si Stop() corría mientras esperaba frame work.
+    { std::lock_guard<std::mutex> lk(m_frameMutex); }
+    m_frameCV.notify_all();
 
     spdlog::info("TaskOrchestrator: Stopped");
 }
@@ -115,6 +120,14 @@ void TaskOrchestrator::WorkerLoop() {
         // If this was frame work, decrement counter and notify game thread
         if (task.isFrameWork) {
             if (m_pendingFrameWork.fetch_sub(1, std::memory_order_acq_rel) <= 1) {
+                // Lost-wakeup fix: sin tomar m_frameMutex aquí, hay una ventana de nanosegundos
+                // donde el waiter (WaitForFrameWork) evalúa el predicado justo antes de este
+                // fetch_sub/notify y se bloquea DESPUÉS del notify -> notificación perdida ->
+                // cuelgue permanente (nadie vuelve a postear frame work tras un Reset()). El
+                // lock-vacío basta: fuerza a que el notify espere a que el waiter esté o bien ya
+                // dentro de wait() (lo despierta) o bien aún no haya entrado (verá el predicado
+                // ya actualizado al re-evaluar). No protege datos, solo serializa con el waiter.
+                { std::lock_guard<std::mutex> lk(m_frameMutex); }
                 m_frameCV.notify_all();
             }
         }

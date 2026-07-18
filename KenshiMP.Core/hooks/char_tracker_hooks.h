@@ -18,6 +18,11 @@ struct TrackedChar {
 
 const TrackedChar* FindByName(const std::string& name);
 const TrackedChar* FindByPtr(void* characterPtr);
+
+// Purga una entrada concreta del tracker (llamado desde el destroy-hook del motor).
+void RemoveByPtr(void* ptr);
+// Vacía todo el tracker (llamado en desconexión / recarga de save en caliente).
+void Clear();
 void* GetLocalPlayerAnimClass();
 void* GetRemotePlayerAnimClass(const std::string& name);
 void SetOnNewCharacter(std::function<void(const TrackedChar&)> callback);

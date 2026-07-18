@@ -203,6 +203,18 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     reg("PushOrder", "combat", "Tasker::pushOrder — inserta orden en el map del Tasker del platoon",
         nullptr, nullptr, 0,
         0x00674300, &funcs.PushOrder);
+    // ── Character::addOrder backend "normal/replace" (0x5D1940) — DIAG-ADDORDER-BACKEND ──
+    // RE 2026-07-11/12: VALIDADOR de órdenes. Si el chequeo de brazos falla devuelve true
+    // (orden "manejada") SIN encolar → la orden de atacar/comer/cargar se traga en silencio
+    // con globo nativo ("My arm is broken!" / "I can't carry anyone with this arm.").
+    // Si pasa devuelve false y la orden sigue su camino normal (Task → cola 0x508380).
+    // AOB de 32 bytes ÚNICO en .text (el prólogo corto de 18 daba 2 matches). Prólogo limpio
+    // sin mov rax,rsp → hookeable sin el fix MovRaxRsp. Solo usa rcx/edx/r8 (verificado:
+    // 0 usos de r9/args de pila en los 0x783 bytes de la función).
+    reg("AddOrderBackend", "combat",
+        "Character::addOrder backend normal/replace — validador que traga órdenes (bool en al)",
+        patterns::ADD_ORDER_BACKEND, nullptr, 0,
+        0x005D1940, &funcs.AddOrderBackend);
     // ── Character::attackTarget (0x5CB0A0) — ya usada por el [AUTOTEST] vía RVA directa ──
     // Se registra también en GameFunctions para que el resto del mod la tenga resuelta.
     reg("AttackTarget", "combat", "Character::attackTarget — orden de ataque directa (encola mode=4)",
@@ -218,6 +230,24 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     reg("SetActivePlatoon", "combat", "Character::setActivePlatoon — registro AI<->platoon (FIX-PLATOON)",
         nullptr, nullptr, 0,
         0x006213F0, &funcs.SetActivePlatoon);
+    // ── CombatClass::update(float) (0x60D650) — DIAG-COMBATSEED (solo diagnóstico) ──
+    // Mangled ?update@CombatClass@@UEAAXM@Z: virtual, void, 1 float (dt en xmm1, this en rcx).
+    // Es el AI tick del CombatClass: consume el array de percepciones (CombatClass+0x208, contador
+    // +0x200) para producir currentTarget (CombatClass+0x290) y disparar Task_MeleeAttack. El hook
+    // DIAG-COMBATSEED (combat_hooks.cpp) lo instrumenta SOLO para el CombatClass del HOST y loguea
+    // el estado (contador de percepciones, currentTarget, AI+0x28) para localizar qué campo cambia
+    // entre "host en frío" y "host tras golpear el muñeco de entrenamiento". SOLO lee/loguea, no muta.
+    // Prólogo LIMPIO (40 53 48 83 EC 20 48 8B D9, sin mov rax,rsp) → hookeable sin el fix MovRaxRsp.
+    reg("CombatClassUpdate", "combat", "CombatClass::update(float) — AI tick de combate (DIAG-COMBATSEED)",
+        nullptr, nullptr, 0,
+        0x0060D650, &funcs.CombatClassUpdate);
+    // NOTA (2026-07-15): aquí había un registro "CombatTargetResolve" para la RVA 0x0074A630
+    // que era un DUPLICADO de la misma dirección ya registrada como "BuyItem" (ver más abajo,
+    // categoría "inventory", string xref "buyItem"). La RE posterior confirmó que 0x74A630 es
+    // BuyItem (rutina de IA de COMERCIO), no un selector de objetivo de combate. El hook de esa
+    // RVA (inventory_hooks.cpp: Hook_BuyItem, sync de red + guard UAF fusionados) se instala sobre
+    // funcs.BuyItem — no hace falta un segundo registro de la misma RVA bajo otro nombre. Registro
+    // eliminado para quitar la doble etiqueta; funcs.BuyItem sigue resolviendo 0x74A630 igual que antes.
 
     // ── World / Zones ──
     reg("ZoneLoad", "world", "Zone loading",

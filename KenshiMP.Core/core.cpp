@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <unordered_set>   // [FIX-HOSTREL] dedup de nodos del boost::unordered_map (cadena 'next' compartida)
 #include <csignal>
 #include <cstring>   // strcmp / memcpy (usados por SEH_ReadMsvcStr / SEH_IsNamelessFaction)
 #include <Windows.h>
@@ -636,6 +637,17 @@ static bool SEH_InterpolationUpdate(Interpolation* interp, float dt) {
     }
 }
 
+// Ejecuta UN comando de la cola con SEH propio — un puntero malo en una lambda no debe
+// tirar el resto de la ráfaga ni el resto del tick.
+static bool SEH_RunGameCommand(kmp::GameCommand* cmd) {
+    __try {
+        cmd->execute();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // SEH-protected offset prober runner.
 // Iterates characters to find a player and NPC, then runs the unified prober.
 // No C++ objects with destructors — uses only POD locals.
@@ -1063,6 +1075,24 @@ bool Core::InitHooks() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // [AUDITORÍA 12-jul] world_hooks::Install() NO se llama a propósito
+    // (todavía). NO basta con añadir la llamada aquí:
+    //   - ZoneUnload (RVA 0x2EF1F0) tiene prólogo `mov rax,rsp` (48 8B C4,
+    //     verificado en logs) → InstallAt lo dejaría en BYPASS permanente
+    //     (Phase 6) y NADIE llama Enable("ZoneUnload") en todo el proyecto,
+    //     así que la limpieza de entidades al descargar zona seguiría sin
+    //     correr igualmente.
+    //   - ZoneLoad (RVA 0x377710) tiene prólogo limpio (40 55 56 57...) →
+    //     quedaría ACTIVO desde el arranque, disparando en cada carga de
+    //     zona durante el loading, sin verificación en vivo previa.
+    // Activarlo requiere su propia sesión: Install() + Enable() de ambos
+    // en OnGameLoaded + verificación en vivo del trampoline de ZoneUnload
+    // (mismo riesgo de crash que ItemDrop/BuyItem). Mientras tanto,
+    // ProcessDeferredZoneEvents() en OnGameTick drena un ring vacío (inofensivo).
+    // Nota: building_hooks::Install() está en la misma situación (sin call site).
+    // ═══════════════════════════════════════════════════════════════════
+
     m_nativeHud.LogStep("OK", "All hooks installed");
 
     return allOk;
@@ -1317,13 +1347,28 @@ void Core::OnLoadingGapDetected() {
             m_frameData[0].Clear();
             m_frameData[1].Clear();
             m_pipelineStarted = false;
+            // Cambio 4: purgar cachés de personajes también en recarga de save en caliente.
+            // Antes esto solo se hacía en el disconnect; sin ello, los punteros cacheados de la
+            // partida anterior (own/other en shared_save_sync, tracker, remote-controlled) quedan
+            // colgados sobre memoria que el motor libera al cargar la nueva save → UAF y el bug de
+            // "no puedo pegar en frío". Se replica el mismo orden que el path de disconnect.
+            shared_save_sync::Reset();
+            char_tracker_hooks::Clear();
+            ai_hooks::ClearRemoteControlled();
             game::ResetProbeState();  // animClassOffset may differ between saves
             ResetHostFactionFix();    // re-armar el fix de facción del host para la nueva partida
+            ResetNamelessResolve();   // purgar cachés de Nameless (Faction*/FR* pueden reciclarse)
+            ResetHostFactionRelationsFix(); // re-armar el FIX-HOSTREL (relaciones corruptas) por si el motor recarga las relaciones al cargar el save
             ResetHostSimSeedFix();    // re-armar el seed de char+0xD0 (AI tick combate) para la nueva partida
+            ResetHostMedSeedFix();    // re-armar el seed de char+0x4C0 (timestamp medico/comida) para la nueva partida
             ResetHostControlledCharFix(); // re-armar el FIX-CONTROL (SetControlledChar) para la nueva partida
             ResetHostCombatClassFix();    // re-armar el FIX-COMBATCLASS (CombatClass del host) para la nueva partida
+            ResetHostCombatArmFix();      // re-armar el FIX-COMBATARM (arranque de la máquina de combate del host) para la nueva partida
+            ResetHostArmHandFix();        // re-armar el FIX-ARMHAND (handle de brazo AI+0x318=Character+0x458) para la nueva partida
             ResetHostPlatoonFix();        // re-armar el FIX-PLATOON (re-enlace AI<->platoon) para la nueva partida
             ResetHostCombatAutotest();    // re-armar el [AUTOTEST] de combate para la nueva partida
+            ResetHostSquadCloneDetect();  // re-armar el [DIAG-CLONESQUAD] (detección del clon del squad) para la nueva partida
+            ResetHostSquadCloneDespawn(); // re-armar el [FIX-CLONESQUAD-DESPAWN] (despawn real del clon) para la nueva partida
         }
 
         // Apply faction patch BEFORE loading starts — this determines which
@@ -1524,7 +1569,10 @@ void Core::OnGameLoaded() {
         // aquí también (ruta "conectado antes de cargar") para confirmar si la orden de ataque
         // del host entra en su Tasker.
         HookManager::Get().Enable("PushOrder");
-        spdlog::info("Core: Deferred ResumeForNetwork — entity hooks enabled post-load (incl. PushOrder DIAG)");
+        // [DIAG-COMBATSEED] Activa también aquí (ruta "conectado antes de cargar") el hook de
+        // CombatClass::update 0x60D650 para capturar el estado de combate del CombatClass del host.
+        HookManager::Get().Enable("CombatClassUpdate");
+        spdlog::info("Core: Deferred ResumeForNetwork — entity hooks enabled post-load (incl. PushOrder + CombatSeed DIAG)");
         m_nativeHud.LogStep("NET", "Sync starting (connected before load)");
         m_nativeHud.AddSystemMessage("Game loaded — syncing with server...");
     }
@@ -1901,8 +1949,8 @@ void Core::OnGameLoaded() {
         fmtOff("equipment", co.equipment);
         fmtOff("isPlayerControlled", co.isPlayerControlled);
         fmtOff("health", co.health);
-        fmtOff("healthChain1", co.healthChain1);
-        fmtOff("healthChain2", co.healthChain2);
+        fmtOff("healthPartArray", co.healthPartArray);
+        fmtOff("healthPartCount", co.healthPartCount);
         fmtOff("healthBase", co.healthBase);
         fmtOff("moneyChain1", co.moneyChain1);
         fmtOff("moneyChain2", co.moneyChain2);
@@ -2175,6 +2223,29 @@ void Core::FindAndClaimModCharacters() {
 
         if (charSlot == mySlot) {
             // ── This is MY character ──
+            // [FIX-GHOST 2026-07] Antes de reclamar como entidad LOCAL DEL JUGADOR,
+            // verificar contra la fuente de verdad del motor (PI+0x2B0): un NPC
+            // fantasma del mundo puede llamarse "Player N" sin ser del jugador.
+            // Reclamarlo desviaba TODOS los fixes del host (facción, platoon,
+            // hostilidad) al fantasma y congelaba al personaje real.
+            //   1 = confirmado del jugador → reclamar.
+            //   0 = NPC fantasma → ignorar (sigue siendo entidad normal del mundo).
+            //  -1 = lista aún no disponible → no reclamar todavía; el scan se
+            //       reintenta (45 intentos) y ClaimHostPrimaryCharacter cubre el hueco.
+            int inPlayerList = game::IsInPlayerCharactersList(character.GetPtr());
+            if (inPlayerList != 1) {
+                if (inPlayerList == 0) {
+                    spdlog::warn("Core: '{}' encaja con 'Player {}' pero NO está en PI+0x2B0 "
+                                 "(lista nativa del jugador) — es un NPC fantasma del mundo, "
+                                 "NO se reclama como personaje del jugador", charName, charSlot);
+                } else {
+                    spdlog::info("Core: '{}' encaja con 'Player {}' pero la lista PI+0x2B0 aún "
+                                 "no está disponible — claim aplazado al siguiente intento",
+                                 charName, charSlot);
+                }
+                continue;
+            }
+
             // Offset position so players don't spawn inside each other.
             // Arrange in a circle with 3m radius based on slot number.
             float angle = static_cast<float>(charSlot - 1) * (6.2831853f / 16.f); // 2*PI / 16
@@ -2499,6 +2570,27 @@ static bool SEH_ReadSimClockFloat(uintptr_t modBase, float* outClock) {
     return ok;
 }
 
+// Igual que SEH_ReadSimClockFloat pero devuelve el reloj como DOUBLE (8 bytes) sin degradar a
+// float. Misma resolución del puntero (SimClock = *(modBase+0x21303D0); reloj en SimClock+0xA0),
+// pero el timestamp médico char+0x4C0 es un double y el helper nativo 0x791CA0 calcula
+// dt = SimClock(double) - char+0x4C0(double) SIN clamp: si sembráramos un float redondeado por
+// encima del reloj real, dt saldría negativo (el mismo bug que arreglamos). Por eso aquí se lee
+// y se siembra en doble precisión exacta.
+static bool SEH_ReadSimClockDouble(uintptr_t modBase, double* outClock) {
+    bool ok = false;
+    __try {
+        uintptr_t scPtr = 0;
+        if (Memory::Read(modBase + 0x21303D0, scPtr) && scPtr > 0x10000) {
+            double clk = 0.0;
+            if (Memory::Read(scPtr + 0xA0, clk) && clk >= 0.0 && clk < 1.0e9) {
+                *outClock = clk;
+                ok = true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    return ok;
+}
+
 // Siembra char+0xD0 (lastProcessed) = relojSim en UN char, SOLO si está "atrasado":
 // char+0xD0 == 0.0  ó  diff(reloj - char+0xD0) > 12.0  (la condición exacta que manda el AI
 // tick a la rama cleanup en 0x5CCE76). Si ya está dentro de la ventana (diff<=12 y !=0) no
@@ -2578,6 +2670,189 @@ static void SeedHostCharLastProcessedTick(Core& core) {
         spdlog::warn("[FIX-SIMSEED] sin completar tras {} intentos "
                      "(sembrados={} yaCorrectos={} ilegibles={} simClock={:.4f})",
                      s_hostSimSeedAttempts, seeded, alreadyOk, unreadable, simClock);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+//  [FIX-MEDSEED] El host (y su squad) nunca comen — hermano del FIX-SIMSEED, otro offset.
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PROBLEMA (RE confirmado, agente RE 2026-07-12):
+//   MedicalSystem::periodicUpdate (RVA 0x64DA70) deriva su dt de un timestamp propio del char:
+//     MedicalSystem+0x68 == char+0x458+0x68 == char+0x4C0 (double, horas de juego).
+//   El helper nativo 0x791CA0 calcula dt = SimClock - *(char+0x4C0) SIN ningún clamp, y solo
+//   re-estampa char+0x4C0 al final de periodicUpdate si este llega a ejecutarse. Si char+0x4C0
+//   queda con basura (memoria no inicializada del clon reclamado por el mod) o con un valor
+//   "futuro" respecto al reloj de simulación, dt sale NEGATIVO → el hambre SUBE en vez de bajar
+//   → el personaje nunca llega al umbral para comer.
+//
+// FIX (mismo mecanismo que el FIX-SIMSEED de combate, aplicado a char+0x4C0 en vez de char+0xD0):
+//   sembrar char+0x4C0 = SimClock actual la primera vez que vemos/reclamamos el char del host, de
+//   modo que el primer dt sea ≈0 (>=0). A partir de ahí periodicUpdate re-estampa el campo solo y
+//   se auto-mantiene, igual que char+0xD0 en el combate. Write de 8 bytes bajo SEH; NO tocamos
+//   estructura compartida del motor (char+0x4C0 es estado del propio char). One-shot re-armable,
+//   throttled, SOLO host (mismos 2 call-sites que el FIX-SIMSEED).
+//
+// Guard de idempotencia: COPIA del FIX-SIMSEED (atómico one-shot re-armable + throttle 250ms +
+//   máx intentos). Igual que aquel NO toca chars ya "sanos" (prev dentro de ventana), este solo
+//   siembra el char cuyo prev produciría dt<0. La condición "malo" difiere del combate porque el
+//   combate va atado a un gate de 12h del motor (rama cleanup) que en el subsistema médico NO
+//   existe: aquí "malo" = el valor daría dt negativo (prev fuera de [0, SimClock], NaN incluido).
+static std::atomic<bool> s_hostMedSeeded{false};
+static int s_hostMedSeedAttempts = 0;
+static auto s_lastHostMedSeedTry = std::chrono::steady_clock::now();
+static constexpr int HOST_MEDSEED_MAX_ATTEMPTS = 240; // ~igual que el FIX-SIMSEED de combate
+
+void ResetHostMedSeedFix() {
+    s_hostMedSeeded.store(false);
+    s_hostMedSeedAttempts = 0;
+    s_lastHostMedSeedTry = std::chrono::steady_clock::now();
+}
+
+// Siembra char+0x4C0 (timestamp médico) = SimClock en UN char, SOLO si el valor actual daría un
+// dt negativo en el helper médico 0x791CA0 (que hace dt = SimClock - *(char+0x4C0) sin clamp).
+//   "malo" = !(prev >= 0.0 && prev <= simClock): cubre basura negativa, timestamp "futuro"
+//   (prev > simClock → dt<0) y NaN (toda comparación false → malo). Si 0<=prev<=simClock el dt ya
+//   sale >=0 (correcto) → NO tocar, igual que el FIX-SIMSEED no toca chars ya en ventana.
+// Devuelve: 1=sembrado, 0=ya correcto, -1=no legible. POD, sin objetos C++ en el __try.
+static int SEH_SeedCharMedicalTimestamp(uintptr_t charPtr, double simClock, double* outPrev) {
+    int result = -1;
+    __try {
+        double prev = 0.0;
+        if (!Memory::Read(charPtr + 0x4C0, prev)) { return -1; }
+        *outPrev = prev;
+        bool bad = !(prev >= 0.0 && prev <= simClock);
+        if (!bad) { result = 0; return 0; }          // dt ya sería >=0 → no tocar
+        if (Memory::Write(charPtr + 0x4C0, simClock)) // seed = reloj → dt≈0 → el hambre baja
+            result = 1;
+        else
+            result = -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { result = -1; }
+    return result;
+}
+
+// Orquesta el seed de char+0x4C0 para los chars locales del host. Copia exacta del patrón del
+// FIX-SIMSEED (throttle ~250ms, one-shot re-armable, solo host, itera GetPlayerEntities del
+// jugador local). Llamado desde OnGameTick (ambas ramas), justo tras SeedHostCharLastProcessedTick.
+static void SeedHostCharMedicalTimestampTick(Core& core) {
+    if (s_hostMedSeeded.load()) return;                          // ya hecho esta partida
+    if (s_hostMedSeedAttempts >= HOST_MEDSEED_MAX_ATTEMPTS) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastHostMedSeedTry < std::chrono::milliseconds(250)) return;
+    s_lastHostMedSeedTry = now;
+    s_hostMedSeedAttempts++;
+
+    // 1) Reloj de simulación actual como DOUBLE (mismo origen que el FIX-SIMSEED, pero sin
+    //    degradar a float: char+0x4C0 es un double y necesita precisión exacta).
+    uintptr_t modBase = Memory::GetModuleBase();
+    double simClock = -1.0;
+    if (!SEH_ReadSimClockDouble(modBase, &simClock)) {
+        // Aún no hay reloj resoluble → reintentar en el próximo throttle.
+        return;
+    }
+
+    // 2) Iterar los GameObjects locales del host y sembrar el que produciría dt negativo.
+    auto& registry = core.GetEntityRegistry();
+    auto localEntities = registry.GetPlayerEntities(core.GetLocalPlayerId());
+    if (localEntities.empty()) return; // el char del host aún no está registrado
+
+    int seeded = 0, alreadyOk = 0, unreadable = 0;
+    double lastPrev = 0.0;
+    for (EntityID eid : localEntities) {
+        void* gameObj = registry.GetGameObject(eid);
+        if (!gameObj) continue;
+        uintptr_t charPtr = reinterpret_cast<uintptr_t>(gameObj);
+        double prev = 0.0;
+        int r = SEH_SeedCharMedicalTimestamp(charPtr, simClock, &prev);
+        if (r == 1) { seeded++; lastPrev = prev; }
+        else if (r == 0) alreadyOk++;
+        else unreadable++;
+    }
+
+    // One-shot: hecho cuando TODOS los chars locales están correctos (sembrados o ya sanos) y al
+    // menos uno se pudo leer.
+    if (unreadable == 0 && (seeded + alreadyOk) > 0) {
+        s_hostMedSeeded.store(true);
+        spdlog::info("[FIX-MEDSEED] char+0x4C0 (timestamp medico) sembrado en chars del host — "
+                     "simClock={:.4f} (sembrados={} yaCorrectos={} prevDelUltimo={:.4f}, intento {}). "
+                     "Fuerza dt>=0 en MedicalSystem::periodicUpdate (0x64DA70) -> el hambre baja y "
+                     "el personaje come.",
+                     simClock, seeded, alreadyOk, lastPrev, s_hostMedSeedAttempts);
+        if (seeded > 0)
+            core.GetNativeHud().AddSystemMessage("Sistema de comida/necesidades desbloqueado");
+    } else if (s_hostMedSeedAttempts == HOST_MEDSEED_MAX_ATTEMPTS) {
+        spdlog::warn("[FIX-MEDSEED] sin completar tras {} intentos "
+                     "(sembrados={} yaCorrectos={} ilegibles={} simClock={:.4f})",
+                     s_hostMedSeedAttempts, seeded, alreadyOk, unreadable, simClock);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+//  [FIX-ARMSEED] "No puedo coger a cuestas a nadie con este brazo" — hermano del FIX-MEDSEED.
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PROBLEMA (RE confirmado, agente RE 2026-07-12):
+//   El gate de "cargar a cuestas" (Hook_AddOrderBackend) lee un BOOL cacheado "brazo OK"
+//   (leftArmOk/rightArmOk en char+0x458+0x166 = char+0x5BE) que SOLO recalcula la función nativa
+//   MedicalSystem::reassessCollapseMode (RVA 0x649320). Ese bool arranca con la basura del clon
+//   reclamado por el mod y NO se refresca solo.
+//
+//   El fix previo (SEH_ReassessCollapse) ya se dispara tras escribir salud de extremidades por
+//   red (SEH_WriteLimbHealthDirect + su gemelo en packet_handler.cpp). PERO ese camino SOLO corre
+//   cuando LLEGA una escritura de salud por red. Si el brazo del char está al 100% y NUNCA se ha
+//   dañado, NUNCA hay escritura de salud → el fix NUNCA se ejecuta para ese char → el bool
+//   cacheado se queda mal para siempre → el gate cree que el brazo está roto aunque esté sano.
+//   Es el MISMO problema de timing que el FIX-MEDSEED (esperar un evento de red que puede no
+//   llegar nunca): hay que SEMBRAR el estado correcto sin depender de ese evento.
+//
+// FIX (mismo patrón de timing que FIX-SIMSEED/FIX-MEDSEED, aplicado al flag de colapso):
+//   re-lanzar reassessCollapseMode sobre los chars locales del host de forma periódica, para que
+//   el bool char+0x5BE se recalcule aunque no haya llegado ninguna escritura de salud. Reutiliza
+//   SEH_ReassessCollapse (EXACTAMENTE el mismo helper que usa SEH_WriteLimbHealthDirect), que ya
+//   comprueba isDead internamente y está protegido por SEH — no duplicamos lógica.
+//
+// Guard de idempotencia: A DIFERENCIA de FIX-SIMSEED/FIX-MEDSEED, este NO es one-shot. El bool
+//   leftArmOk/rightArmOk puede volver a quedar mal en cualquier momento tras un colapso real
+//   posterior, y el propio motor lo recalcula bien tras daño real; por eso re-sembrar de vez en
+//   cuando es una red de seguridad inofensiva: reassessCollapseMode es IDEMPOTENTE (si el flag ya
+//   está bien, no cambia nada) y barato. Por tanto: SOLO throttle largo (~2.5s), SIN flag "hecho"
+//   y SIN límite de intentos. SOLO host (mismos 2 call-sites que FIX-SIMSEED/FIX-MEDSEED).
+
+// Forward declaration del helper de recálculo de colapso. Su definición static vive más abajo en
+// este mismo fichero (junto a SEH_WriteLimbHealthDirect, ~L7900). static → misma unidad de
+// traducción, sin colisión de enlazado; declararlo aquí permite reutilizarlo sin duplicar código.
+// clearStun: solo debe ir a true cuando la llamada sigue a una escritura de salud REAL por red
+// (fleshStun rancio); el tick periódico de abajo (sin datos nuevos) debe pasar false — si no,
+// borraría stun real que el motor esté acumulando en el host por combate legítimo (haciéndolo
+// inmune al derribo). Hallazgo de la revisión adversarial de esta misma sesión.
+static void SEH_ReassessCollapse(void* character, bool clearStun);
+
+// Timer del throttle (NO hay flag one-shot ni contador de intentos: es idempotente, ver arriba).
+static auto s_lastHostArmSeedTry = std::chrono::steady_clock::now();
+
+// Re-lanza reassessCollapseMode sobre los chars locales del host cada ~2.5s para mantener el bool
+// cacheado "brazo OK" (char+0x5BE) sincronizado con la salud real de las extremidades. Copia del
+// patrón de SeedHostCharMedicalTimestampTick pero SIN one-shot ni límite de intentos (idempotente).
+// Llamado desde OnGameTick (ambas ramas), justo tras SeedHostCharMedicalTimestampTick.
+static void SeedHostCharArmFlagsTick(Core& core) {
+    // Throttle: cada ~2.5s basta como red de seguridad; recalcular cada tick sería derrochar.
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastHostArmSeedTry < std::chrono::milliseconds(2500)) return;
+    s_lastHostArmSeedTry = now;
+
+    // Iterar los GameObjects locales del host. GetPlayerEntities(localPlayerId) devuelve TODAS las
+    // entidades cuyo ownerPlayerId == jugador local, así que cubre tanto el char real ("Zero") como
+    // el/los fantasmas ("Player 1") — el mismo conjunto que ya recorren FIX-SIMSEED y FIX-MEDSEED.
+    auto& registry = core.GetEntityRegistry();
+    auto localEntities = registry.GetPlayerEntities(core.GetLocalPlayerId());
+    if (localEntities.empty()) return; // el char del host aún no está registrado
+
+    for (EntityID eid : localEntities) {
+        void* gameObj = registry.GetGameObject(eid);
+        if (!gameObj) continue;
+        // Reutiliza el MISMO helper que SEH_WriteLimbHealthDirect: comprueba isDead y está bajo SEH.
+        // clearStun=false: este tick NO sigue a ninguna escritura de salud por red — no hay stun
+        // "rancio" que limpiar, y borrarlo aquí anularía stun real de combate legítimo del host.
+        SEH_ReassessCollapse(gameObj, /*clearStun=*/false);
     }
 }
 
@@ -3031,20 +3306,52 @@ static void FixHostAiNullTick(Core& core) {
     const uintptr_t aiVtblAbs = modBase + 0x16FA3E8;     // vtable AI (char+0x650), CombatStructSnapshot::kAIVtableRVA
 
     // Resolver data[] y size de la lista del jugador para el ángulo "char equivocado".
-    // (Mismo camino que GetPlayerPrimaryCharacterDirect: GameWorld→player(PI)→PI+0x2B0 lektor.)
+    // Mismo camino ROBUSTO que GetPlayerPrimaryCharacterDirect / DetectHostSquadCloneTick:
+    //   GameWorld → +player (PI). El lektor playerCharacters está EMBEBIDO en PI con offsets
+    //   ABSOLUTOS (verificado por RTTI + lecturas en vivo 2026-07-14):
+    //     size = *(uint32*)(PI + 0x2B8)   ·   data = *(Character**)(PI + 0x2C0)
+    // PI+0x2B0 es un puntero opaco (vtable/alloc interno), NO la base de una sub-estructura con
+    // size/data relativos: por eso NO se dereferencia ni se le suman +0x08/+0x10.
+    //
+    // BUG que se corrige aquí (idéntico al ya arreglado en DetectHostSquadCloneTick): el guard de
+    // puntero anterior ("> 0x10000") NO excluía el rango del módulo. Con GameWorld EMBEBIDO,
+    // *(gwAddr) es el vtable in-module del objeto; el guard débil lo aceptaba como 'gw', corrompía
+    // la cadena gw→pi y dejaba listData=0 en bucle. El guard correcto (heap-ptr REAL: alineado y
+    // FUERA del rango del módulo) es el que usan todos los resolvers que funcionan.
     uintptr_t listData = 0; int listN = 0;
     {
         uintptr_t gwAddr = game::GetResolvedGameWorld();
         if (gwAddr != 0) {
-            uintptr_t gw = 0;
-            if (!(Memory::Read(gwAddr, gw) && gw > 0x10000)) gw = gwAddr;
+            // Rango del módulo para distinguir un heap-ptr del juego de un puntero in-module (vtable).
+            // (modBase ya validado != 0 arriba.) Tamaño real vía cabecera PE, con fallback de 64MB.
+            size_t modSize = 0x4000000; // 64MB fallback
+            {
+                auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE)
+                        modSize = nt->OptionalHeader.SizeOfImage;
+                }
+            }
+            // heap-ptr del juego: por encima de 64KB, alineado a 8 y FUERA del rango del módulo.
+            auto isHeap = [modBase, modSize](uintptr_t v) -> bool {
+                if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+                if ((v & 0x7) != 0) return false;
+                if (v >= modBase && v < modBase + modSize) return false; // vtable/objeto in-module
+                return true;
+            };
+
             const auto& off = game::GetOffsets();
+            // GameWorld: caso (a) puntero a GameWorld (deref una vez) vs (b) objeto embebido.
+            uintptr_t gw = 0;
+            if (!(Memory::Read(gwAddr, gw) && isHeap(gw))) gw = gwAddr;
+
             uintptr_t pi = 0;
-            if (Memory::Read(gw + off.world.player, pi) && pi > 0x10000) {
-                uintptr_t lek = pi + off.playerInterface.playerCharacters; // +0x2B0
+            if (Memory::Read(gw + off.world.player, pi) && isHeap(pi)) {
+                // Lektor embebido: size@PI+0x2B8 (uint32) · data@PI+0x2C0 (Character**). ABSOLUTO.
                 uint32_t sz = 0; uintptr_t dp = 0;
-                if (Memory::Read(lek + 0x08, sz) && Memory::Read(lek + 0x10, dp)) {
-                    if (sz > 0 && sz <= 100000) { listData = dp; listN = (int)sz; }
+                if (Memory::Read(pi + 0x2B8, sz) && Memory::Read(pi + 0x2C0, dp)) {
+                    if (sz > 0 && sz <= 100000 && isHeap(dp)) { listData = dp; listN = (int)sz; }
                 }
             }
         }
@@ -3111,6 +3418,608 @@ static void FixHostAiNullTick(Core& core) {
                      "resolver el appearance (GameDataCopyStandalone*) antes de activar el flag.",
                      s_aiNullAttempts);
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// [DIAG-CLONESQUAD] — CAMA (GET_OUT_OF_BED): el host tiene un CharacterHuman DUPLICADO
+//                     dentro de su propio squad (causa raíz sección 21 de la wiki, 2026-07-13).
+// ══════════════════════════════════════════════════════════════════════════════════
+// CAUSA (RE en vivo, bug reproducido con el host durmiendo, PID 552): el ActivePlatoon del
+// host contiene DOS instancias "Player 1" derivadas del MISMO GameData template:
+//   - la REAL, controlada por el jugador  (char+0x0C == 0),
+//   - un CLON no controlado                (char+0x0C == 1) — mismo char+0x40 (template),
+//     misma facción, mismo char+0x658 (ActivePlatoon). Su AI sí recibe tick (pertenece al
+//     Platoon del host), y cuando "duerme" en una cama su Task GET_OUT_OF_BED (0x74) se
+//     reencola sin fin (~86.910 veces) porque nadie ejecuta la acción de levantarse sobre él.
+//
+// ESTA PASADA ES SOLO DIAGNÓSTICO (lectura + log), NO ejecuta despawn. Motivo (decisión de
+// seguridad, ver resumen del executor 2026-07-13): NO existe en el proyecto ninguna función
+// NATIVA de despawn/eliminación de personaje reutilizable. El único "despawn" del proyecto
+// (packet_handler.cpp SEH_DespawnCleanup) solo teletransporta bajo tierra a chars REMOTOS
+// para ocultarlos + limpia el registro del mod; NO retira el char del mundo/squad ni cancela
+// su Task, así que aplicarlo al clon del host (que comparte template con el char real) sería
+// arriesgado y NO resolvería el bucle. Como esto es PERSISTENCIA de personajes (no un flag),
+// se implementa solo la detección; la acción de despawn queda pendiente de una sesión de RE
+// que localice la función nativa segura de retirada de miembro (candidatas a investigar:
+// SquadAddMember 0x928423 / la ruta de reclamo del host que crea el clon — evitar la
+// duplicación de origen, opción preferente 21.6.1). NUNCA escribir char+0x5BC (isDead) a mano.
+//
+// SEGURIDAD/THREAD: idéntico patrón que FixHostAiNullTick — SOLO host, HILO DE LÓGICA
+// (OnGameTick), bajo SEH en helper POD (sin objetos C++ en el __try → evita C2712). One-shot
+// re-armable (se re-arma en recarga de save / nueva conexión), throttle ~2s.
+
+// Toggle: detección pura (solo lectura + log). Default true — jamás escribe memoria del juego.
+static constexpr bool kDetectHostSquadClone = true;
+
+// Estado one-shot re-armable del [DIAG-CLONESQUAD].
+static std::atomic<bool> s_squadCloneDone{false};
+static int  s_squadCloneAttempts = 0;
+static auto s_lastSquadCloneTry  = std::chrono::steady_clock::now();
+static constexpr int SQUADCLONE_MAX_ATTEMPTS = 90; // ~3 min a throttle 2s (roster ya poblado mucho antes)
+
+// Re-arma el [DIAG-CLONESQUAD] para una partida/conexión nueva (mismo patrón que el resto).
+void ResetHostSquadCloneDetect() {
+    s_squadCloneDone.store(false);
+    s_squadCloneAttempts = 0;
+    s_lastSquadCloneTry = std::chrono::steady_clock::now();
+}
+
+// Snapshot POD del escaneo (vive dentro del __try; sin objetos C++ → evita C2712).
+struct SquadCloneSnapshot {
+    uintptr_t hostChar          = 0;  // char controlado real (data[0] de la lista PI+0x2C0)
+    int       hostMark          = -1; // char+0x0C del host controlado (esperado 0)
+    uintptr_t hostGameData      = 0;  // char+0x40 (GameData template) del host controlado
+    uintptr_t hostActivePlatoon = 0;  // char+0x658 (ActivePlatoon) del host controlado
+    uintptr_t listData          = 0;  // PI+0x2C0 — buffer nativo Character** (data[i]=*(listData+i*8))
+    int       memberCount       = 0;  // PI+0x2B8 — size de la lista playerCharacters (nº de data[i])
+    int       scanned           = 0;  // miembros efectivamente recorridos
+    // Duplicado detectado (si lo hay) — NUEVO criterio: data[i] (i>0) con GameData IDÉNTICO a data[0].
+    uintptr_t cloneChar          = 0; // data[i] (i>0) con char+0x40 == GameData del host
+    int       cloneMark          = -1; // char+0x0C del clon (el real tenía 0, NO 1 → ya no se exige)
+    uintptr_t cloneGameData      = 0;
+    uintptr_t cloneAi            = 0; // clon+0x650 (la AI del bucle GET_OUT_OF_BED)
+    uintptr_t cloneActivePlatoon = 0; // clon+0x658 (DISTINTO al del host → ya no se exige que coincida)
+    int       cloneSlot          = -1; // índice i dentro de la lista nativa del jugador
+    float     clonePosX          = 0.0f; // clon+0x48 (Vec3 cacheado read-only) — solo para el log
+    float     clonePosY          = 0.0f;
+    float     clonePosZ          = 0.0f;
+    int       failReason         = 0;  // 0 ok · -1 excepción · -2 roster no resoluble
+};
+
+// Escanea la lista NATIVA de personajes del jugador buscando el clon.
+// SOLO LECTURA. Fuente (confirmada por lectura en vivo 2026-07-14, offsets de PlayerInterface):
+//   PI+0x2B8 = size (uint32) · PI+0x2C0 = data (Character**) · data[i] = *(listData + i*8).
+// El caller resuelve listData/listN (GameWorld+0x580 PI → size@PI+0x2B8, data@PI+0x2C0 ABSOLUTOS;
+// PI+0x2B0 NO se dereferencia)
+// FUERA del __try. data[0] es el host controlado real (== hostChar). Se recorre TODA la lista, no
+// solo el ActivePlatoon del host: el clon real vive en OTRO ActivePlatoon distinto, por eso el
+// detector antiguo (solo ActivePlatoon del host, mark==1, mismo platoon) nunca lo encontraba.
+static void SEH_DiagHostSquadClone(uintptr_t hostChar, int gameDataOff,
+                                   uintptr_t listData, int listN, SquadCloneSnapshot* out) {
+    auto isHeap = [](uintptr_t v) -> bool {
+        if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+        if ((v & 0x7) != 0) return false;
+        return true;
+    };
+    __try {
+        if (!isHeap(hostChar)) { out->failReason = -2; return; }
+        out->hostChar = hostChar;
+
+        // Marcador controlado/clon del host real (char+0x0C, low byte; esperado 0). Solo informativo.
+        uint32_t hmarkRaw = 0xFFFFFFFF;
+        Memory::Read(hostChar + 0x0C, hmarkRaw);
+        out->hostMark = (int)(hmarkRaw & 0xFF);
+
+        // Template (GameData*, char+0x40) y ActivePlatoon (char+0x658) del host real.
+        uintptr_t hgd = 0, hap = 0;
+        Memory::Read(hostChar + gameDataOff, hgd); out->hostGameData      = hgd; // +0x40
+        Memory::Read(hostChar + 0x658, hap);       out->hostActivePlatoon = hap; // char+0x658
+        // Sin GameData del host no hay comparación posible (el ActivePlatoon ya NO es requisito).
+        if (!isHeap(hgd)) { out->failReason = -2; return; }
+
+        // Lista nativa del jugador (PI+0x2C0 data / PI+0x2B8 size), ya resuelta por el caller.
+        out->listData    = listData;
+        out->memberCount = listN;
+        if (!isHeap(listData) || listN <= 0 || listN > 4096) { out->failReason = -2; return; }
+
+        int cap = listN; if (cap > 256) cap = 256; // techo de seguridad
+        for (int i = 1; i < cap; i++) {            // i>0: data[0] es el host, nunca "el clon"
+            uintptr_t m = 0;
+            if (!Memory::Read(listData + (uintptr_t)i * 8, m) || !isHeap(m)) continue;
+            out->scanned++;
+            if (m == hostChar) continue; // el propio host real (por si apareciera repetido)
+
+            uintptr_t mgd = 0;
+            Memory::Read(m + gameDataOff, mgd); // GameData del candidato (char+0x40)
+
+            // NUEVO CRITERIO (más robusto que el antiguo): mismo GameData template que data[0] (host).
+            //   Se ELIMINAN las exigencias de mark(+0x0C)==1 y de "mismo ActivePlatoon": ambas se
+            //   demostraron NO fiables esta noche (el clon real tenía mark==0 y otro ActivePlatoon).
+            if (isHeap(mgd) && mgd == hgd) {
+                uint32_t mmarkRaw = 0xFFFFFFFF; uintptr_t mai = 0, map = 0;
+                Memory::Read(m + 0x0C, mmarkRaw);
+                Memory::Read(m + 0x650, mai); // AI del clon (la del bucle GET_OUT_OF_BED)
+                Memory::Read(m + 0x658, map); // ActivePlatoon del clon (distinto al del host)
+                // Posición cacheada read-only del clon (char+0x48 = Vec3 x,y,z) — barata, solo log.
+                Memory::Read(m + 0x48 + 0x0, out->clonePosX);
+                Memory::Read(m + 0x48 + 0x4, out->clonePosY);
+                Memory::Read(m + 0x48 + 0x8, out->clonePosZ);
+                out->cloneChar          = m;
+                out->cloneMark          = (int)(mmarkRaw & 0xFF);
+                out->cloneGameData      = mgd;
+                out->cloneAi            = mai;
+                out->cloneActivePlatoon = map;
+                out->cloneSlot          = i;
+                break; // uno basta
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->failReason = -1;
+    }
+}
+
+// Orquesta el [DIAG-CLONESQUAD]. Mismo patrón que FixHostAiNullTick: throttle ~2s, one-shot
+// re-armable, SOLO host, en el HILO DE LÓGICA. NO escribe memoria del juego (detección pura).
+static void DetectHostSquadCloneTick(Core& core) {
+    if (!kDetectHostSquadClone) return;
+    if (s_squadCloneDone.load()) return;                     // ya detectado y logueado (estable)
+    if (s_squadCloneAttempts >= SQUADCLONE_MAX_ATTEMPTS) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastSquadCloneTry < std::chrono::milliseconds(2000)) return; // throttle ~2s
+    s_lastSquadCloneTry = now;
+    s_squadCloneAttempts++;
+
+    uintptr_t hostChar = game::GetPlayerPrimaryCharacterDirect();
+    if (hostChar <= 0x10000) return;                         // char aún no resoluble → reintentar
+
+    const int gameDataOff = game::GetOffsets().character.gameDataPtr; // +0x40
+
+    // Resolver la lista NATIVA del jugador FUERA del SEH, con el MISMO camino ROBUSTO que
+    // GetPlayerPrimaryCharacterDirect / SEH_ReadPrimaryDiag ([DIAG-PRIMARY], que SÍ acierta):
+    //   GameWorld → +0x580 (player) → PlayerInterface.
+    // El lektor playerCharacters está EMBEBIDO en PlayerInterface: size y data son offsets
+    // ABSOLUTOS desde PI (verificado por RTTI + lecturas directas en vivo 2026-07-14):
+    //   size = *(uint32*)(PI + 0x2B8)      ·      data = *(Character**)(PI + 0x2C0)
+    // PI+0x2B0 es un puntero opaco (vtable/alloc interno), NO la base de una sub-estructura con
+    // size/data relativos: por eso NO se dereferencia ni se le suman +0x08/+0x10.
+    //
+    // BUG que se corrige aquí: el guard de puntero anterior ("> 0x10000") NO excluía el rango del
+    // módulo. Con GameWorld EMBEBIDO (caso b), *(gwAddr) es el vtable in-module del objeto; el
+    // guard débil lo aceptaba como 'gw', corrompía la cadena gw→pi y dejaba listData=0 en bucle
+    // (60+ reintentos). El guard correcto (heap-ptr REAL: alineado y FUERA del módulo) es el que
+    // usan todos los resolvers que funcionan. Si aún no resuelve, listData/listN=0 → el escaneo
+    // marca failReason=-2 (roster no resoluble) y reintenta en el próximo throttle.
+    uintptr_t listData = 0; int listN = 0;
+    {
+        uintptr_t gwAddr = game::GetResolvedGameWorld();
+        if (gwAddr != 0) {
+            // Rango del módulo para distinguir un heap-ptr del juego de un puntero in-module (vtable).
+            uintptr_t modBase = Memory::GetModuleBase();
+            size_t    modSize = 0x4000000; // 64MB fallback
+            {
+                auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE)
+                        modSize = nt->OptionalHeader.SizeOfImage;
+                }
+            }
+            // heap-ptr del juego: por encima de 64KB, alineado a 8 y FUERA del rango del módulo.
+            auto isHeap = [modBase, modSize](uintptr_t v) -> bool {
+                if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+                if ((v & 0x7) != 0) return false;
+                if (v >= modBase && v < modBase + modSize) return false; // vtable/objeto in-module
+                return true;
+            };
+
+            const auto& off = game::GetOffsets();
+            // GameWorld: caso (a) puntero a GameWorld (deref una vez) vs (b) objeto embebido.
+            uintptr_t gw = 0;
+            if (!(Memory::Read(gwAddr, gw) && isHeap(gw))) gw = gwAddr;
+
+            uintptr_t pi = 0;
+            if (Memory::Read(gw + off.world.player, pi) && isHeap(pi)) {
+                // Lektor embebido: size@PI+0x2B8 (uint32) · data@PI+0x2C0 (Character**). ABSOLUTO.
+                uint32_t sz = 0; uintptr_t dp = 0;
+                if (Memory::Read(pi + 0x2B8, sz) && Memory::Read(pi + 0x2C0, dp)) {
+                    if (sz > 0 && sz <= 100000 && isHeap(dp)) { listData = dp; listN = (int)sz; }
+                }
+            }
+        }
+    }
+
+    SquadCloneSnapshot fx{};
+    SEH_DiagHostSquadClone(hostChar, gameDataOff, listData, listN, &fx);
+
+    if (fx.failReason == -1) {
+        if (s_squadCloneAttempts <= 3 || s_squadCloneAttempts % 30 == 0)
+            spdlog::warn("[DIAG-CLONESQUAD] excepción durante el escaneo (host=0x{:X}) — reintento {}.",
+                         hostChar, s_squadCloneAttempts);
+        return;
+    }
+    if (fx.failReason == -2) {
+        // Roster aún no poblado (justo tras la carga) → reintentar en el próximo throttle.
+        if (s_squadCloneAttempts <= 3 || s_squadCloneAttempts % 30 == 0)
+            spdlog::info("[DIAG-CLONESQUAD] lista del jugador aún no resoluble "
+                         "(hostChar=0x{:X} hostAP=0x{:X} listData=0x{:X} listN={}) — reintento {}.",
+                         fx.hostChar, fx.hostActivePlatoon, fx.listData, fx.memberCount,
+                         s_squadCloneAttempts);
+        return;
+    }
+
+    if (fx.cloneChar != 0) {
+        // DUPLICADO CONFIRMADO (nuevo criterio: mismo GameData que data[0]). Log UNA vez → one-shot.
+        s_squadCloneDone.store(true);
+        spdlog::warn("[DIAG-CLONESQUAD] *** DUPLICADO DETECTADO en la lista del jugador *** "
+                     "hostReal=0x{:X}(mark={}) clon=0x{:X}(mark={}) slot={} | "
+                     "GameData(+0x40) host=0x{:X} clon=0x{:X} (IDÉNTICO → criterio del fix) | "
+                     "ActivePlatoon(+0x658) host=0x{:X} clon=0x{:X} (DISTINTO: el clon vive en otro "
+                     "platoon, por eso el detector antiguo no lo veía) | clonAI(+0x650)=0x{:X} "
+                     "(la del bucle GET_OUT_OF_BED) | clonPos=({:.1f},{:.1f},{:.1f}) | listN={}. "
+                     "ACCIÓN DE DESPAWN NO EJECUTADA a propósito (solo diagnóstico; el despawn real "
+                     "queda para otra fase). (intento {})",
+                     fx.hostChar, fx.hostMark, fx.cloneChar, fx.cloneMark, fx.cloneSlot,
+                     fx.hostGameData, fx.cloneGameData, fx.hostActivePlatoon, fx.cloneActivePlatoon,
+                     fx.cloneAi, fx.clonePosX, fx.clonePosY, fx.clonePosZ, fx.memberCount,
+                     s_squadCloneAttempts);
+        return;
+    }
+
+    // No hay duplicado (todavía, o en absoluto). Log escaso mientras seguimos vigilando.
+    if (s_squadCloneAttempts <= 3 || s_squadCloneAttempts % 30 == 0) {
+        spdlog::info("[DIAG-CLONESQUAD] sin duplicado: host=0x{:X}(mark={}) GameData=0x{:X} "
+                     "ActivePlatoon=0x{:X} listData=0x{:X} listN={} scanned={} (intento {}).",
+                     fx.hostChar, fx.hostMark, fx.hostGameData, fx.hostActivePlatoon,
+                     fx.listData, fx.memberCount, fx.scanned, s_squadCloneAttempts);
+    }
+    if (s_squadCloneAttempts == SQUADCLONE_MAX_ATTEMPTS) {
+        spdlog::info("[DIAG-CLONESQUAD] vigilancia agotada tras {} intentos sin detectar duplicado "
+                     "(squad del host con 1 solo 'Player 1', o roster no estabilizado). Se re-arma en "
+                     "recarga de save / nueva conexión.", s_squadCloneAttempts);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// [FIX-CLONESQUAD-DESPAWN] — DESPAWN REAL del CharacterHuman duplicado del squad del host.
+// ══════════════════════════════════════════════════════════════════════════════════
+// Complementa a [DIAG-CLONESQUAD] (que solo detecta+loguea): aquí SÍ se retira el clon del
+// mundo. Diseño validado por RE exhaustiva (2026-07-14). Acción DESTRUCTIVA → protegida por:
+//
+//   1) GATING ANTI-FALSO-POSITIVO: NO se despawnea con una sola detección. Se exige estabilidad
+//      ≥3 ticks CONSECUTIVOS con el MISMO puntero de clon y el MISMO GameData. Si el puntero
+//      cambia o desaparece entre ticks (transitorio de carga/desconexión), el contador se
+//      resetea a 0 y se espera de nuevo.
+//
+//   2) GUARDS DE SEGURIDAD (TODOS deben pasar, RE-CONFIRMADOS en vivo cada tick, sin cachear):
+//        · clon != 0, heap-ptr válido y alineado.
+//        · clon != host  y  clon != data[0]  (data[0] es SIEMPRE el host: jamás el slot 0).
+//        · clon.GameData(+0x40) == host.GameData(+0x40)  (criterio del duplicado).
+//        · clon.faction(+0x10) == host.faction(+0x10).
+//        · clon.ActivePlatoon(+0x658) != host.ActivePlatoon(+0x658)  (el clon vive en OTRO
+//          platoon; si coincidieran → aborta por sospecha).
+//        · clon.isDead(+0x5BC) == 0  (si ya está muerto, no tocar).
+//
+//   3) ORDEN EXACTO DE LA ACCIÓN (crítico):
+//        PRIMERO  erase del clon de la lektor PlayerInterface (data@PI+0x2C0 / size@PI+0x2B8):
+//                 localizar el slot j con data[j]==cloneChar (comparación de PUNTERO, sin
+//                 dereferenciar), compactar con memmove(data+j, data+j+1, (size-1-j)*8), poner a
+//                 0 el último slot y escribir size-1 en PI+0x2B8. NO se toca capacidad, NO realloc,
+//                 NO se libera memoria del array. Así ninguna lista sostiene el puntero cuando
+//                 removeObject lo libere.
+//        DESPUÉS  GameWorld::removeObject nativo (RVA 0x799AF0, AOB-verificada):
+//                 void __fastcall(void* gw, void* obj, bool r8b, const char* reason).
+//                 r8b=false CONFIRMADO (82% de 85 callers nativos; el análogo semántico
+//                 "deleteDuplicatedBuildings" también usa false; con false el 'reason' se propaga
+//                 al log). gw = GameWorld resuelto (embebido base+0x2134110, puntero directo).
+//                 'reason' DEBE ser un literal static (vida útil persistente, no un buffer de stack).
+//
+// SEGURIDAD/THREAD: idéntico patrón que DetectHostSquadCloneTick/FixHostAiNullTick — SOLO host,
+// HILO DE LÓGICA (OnGameTick), bajo SEH en helper POD (sin objetos C++ en el __try → evita
+// C2712). One-shot re-armable (ResetHostSquadCloneDespawn en recarga de save / nueva conexión).
+
+// Toggle de seguridad. Acción DESTRUCTIVA (retira un char del mundo). Default true.
+static constexpr bool kDespawnHostSquadClone = true;
+
+// GameWorld::removeObject — RVA verificada por AOB (2026-07-14).
+static constexpr uintptr_t kRemoveObjectRVA = 0x799AF0;
+using RemoveObjectFn = void(__fastcall*)(void* gw, void* obj, bool r8b, const char* reason);
+
+// Estado one-shot re-armable + gating de estabilidad (≥3 ticks con el MISMO clon).
+static std::atomic<bool> s_squadCloneDespawnDone{false};
+static int       s_squadCloneDespawnStable   = 0;   // ticks consecutivos con el mismo clon+GameData
+static uintptr_t s_squadCloneDespawnLastPtr  = 0;   // puntero del clon observado el tick anterior
+static uintptr_t s_squadCloneDespawnLastGD   = 0;   // GameData(+0x40) del clon el tick anterior
+static int       s_squadCloneDespawnAttempts = 0;
+static auto      s_lastSquadCloneDespawnTry  = std::chrono::steady_clock::now();
+static constexpr int SQUADCLONE_DESPAWN_STABLE_TICKS = 3;   // estabilidad mínima antes de actuar
+static constexpr int SQUADCLONE_DESPAWN_MAX_ATTEMPTS = 120; // ~4 min a throttle 2s
+
+// Re-arma el [FIX-CLONESQUAD-DESPAWN] para una partida/conexión nueva (mismo patrón que el resto).
+void ResetHostSquadCloneDespawn() {
+    s_squadCloneDespawnDone.store(false);
+    s_squadCloneDespawnStable   = 0;
+    s_squadCloneDespawnLastPtr  = 0;
+    s_squadCloneDespawnLastGD   = 0;
+    s_squadCloneDespawnAttempts = 0;
+    s_lastSquadCloneDespawnTry  = std::chrono::steady_clock::now();
+}
+
+// Snapshot POD del despawn (vive dentro del __try; sin objetos C++ → evita C2712).
+struct SquadCloneDespawnSnapshot {
+    uintptr_t hostChar          = 0;
+    uintptr_t hostGameData      = 0;  // +0x40
+    uintptr_t hostFaction       = 0;  // +0x10
+    uintptr_t hostActivePlatoon = 0;  // +0x658
+    uintptr_t cloneChar         = 0;
+    uintptr_t cloneGameData     = 0;  // +0x40 (== hostGameData si es el clon)
+    uintptr_t cloneFaction      = 0;  // +0x10
+    uintptr_t cloneActivePlatoon= 0;  // +0x658
+    int       cloneIsDead       = -1; // +0x5BC (0=vivo, 1=muerto)
+    int       cloneSlot         = -1; // índice hallado en el escaneo de re-localización
+    int       curSize           = -1; // size re-leído en vivo (PI+0x2B8) al hacer commit
+    int       newSize           = -1; // size tras compactar (curSize-1)
+    int       guardsOk          = 0;  // 1 si TODOS los guards pasaron
+    int       erased            = 0;  // 1 si se compactó la lista PlayerInterface
+    int       removed           = 0;  // 1 si se llamó a removeObject
+    int       failReason        = 0;  // 0 ok · -1 excepción · -2 no resoluble / abortado
+};
+
+// Re-resuelve el clon EN VIVO, valida TODOS los guards y (si commit && guards) ejecuta el
+// despawn en el ORDEN EXACTO: erase de la lista PRIMERO, removeObject DESPUÉS. SOLO LECTURA si
+// commit=false. Todo bajo SEH; POD, sin objetos C++ con destructor dentro del __try (evita C2712).
+// El caller resuelve listData/listN/pi/gw FUERA del __try (mismo camino robusto que el detector).
+static void SEH_DespawnHostSquadClone(uintptr_t hostChar, int gameDataOff,
+                                      uintptr_t listData, int listN, uintptr_t pi,
+                                      uintptr_t gw, RemoveObjectFn removeFn,
+                                      bool commit, SquadCloneDespawnSnapshot* out) {
+    // heap-ptr del juego: por encima de 64KB y alineado a 8 (aquí NO se excluye el rango del
+    // módulo a propósito: gw es el GameWorld EMBEBIDO base+0x2134110, in-module y válido).
+    auto isHeap = [](uintptr_t v) -> bool {
+        if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+        if ((v & 0x7) != 0) return false;
+        return true;
+    };
+    // Motivo del despawn: DEBE ser static (vida útil persistente). removeObject lo propaga al log;
+    // un buffer de stack sería inválido tras retornar de esta función.
+    static const char kReason[] = "kenshi-coop: despawn clon de squad del host";
+
+    __try {
+        if (!isHeap(hostChar)) { out->failReason = -2; return; }
+        out->hostChar = hostChar;
+
+        // Host: GameData(+0x40), faction(+0x10), ActivePlatoon(+0x658) — re-leídos en vivo ESTE tick.
+        uintptr_t hgd = 0, hfac = 0, hap = 0;
+        Memory::Read(hostChar + gameDataOff, hgd);  out->hostGameData      = hgd;
+        Memory::Read(hostChar + 0x10,        hfac); out->hostFaction       = hfac;
+        Memory::Read(hostChar + 0x658,       hap);  out->hostActivePlatoon = hap;
+        if (!isHeap(hgd)) { out->failReason = -2; return; } // sin GameData del host no hay comparación
+
+        if (!isHeap(listData) || listN <= 0 || listN > 4096) { out->failReason = -2; return; }
+
+        // data[0] es SIEMPRE el host: nunca candidato a despawn (guard duro más abajo).
+        uintptr_t data0 = 0;
+        Memory::Read(listData, data0);
+
+        // Re-localizar el clon por el criterio GameData-idéntico (i>0), igual que el detector.
+        uintptr_t clone = 0, cgd = 0; int cslot = -1;
+        int cap = listN; if (cap > 256) cap = 256; // techo de seguridad
+        for (int i = 1; i < cap; i++) {            // i>0: data[0] es el host, nunca "el clon"
+            uintptr_t m = 0;
+            if (!Memory::Read(listData + (uintptr_t)i * 8, m) || !isHeap(m)) continue;
+            if (m == hostChar) continue;           // el propio host (por si apareciera repetido)
+            uintptr_t mgd = 0;
+            Memory::Read(m + gameDataOff, mgd);    // GameData del candidato (char+0x40)
+            if (isHeap(mgd) && mgd == hgd) { clone = m; cgd = mgd; cslot = i; break; }
+        }
+        if (clone == 0) { out->failReason = -2; return; } // clon no presente este tick → transitorio
+
+        out->cloneChar     = clone;
+        out->cloneGameData = cgd;
+        out->cloneSlot     = cslot;
+
+        // Guards del clon: faction(+0x10), ActivePlatoon(+0x658), isDead(+0x5BC) — en vivo.
+        uintptr_t cfac = 0, cap658 = 0; uint32_t deadRaw = 0xFFFFFFFF;
+        Memory::Read(clone + 0x10,  cfac);    out->cloneFaction        = cfac;
+        Memory::Read(clone + 0x658, cap658);  out->cloneActivePlatoon  = cap658;
+        Memory::Read(clone + 0x5BC, deadRaw); out->cloneIsDead         = (int)(deadRaw & 0xFF);
+
+        // ── GUARDS DE SEGURIDAD (TODOS deben pasar antes de actuar) ──
+        bool ok = true;
+        ok = ok && isHeap(clone);                       // heap-ptr válido y alineado
+        ok = ok && (clone != hostChar);                 // no es el host
+        ok = ok && (data0  != clone);                   // no es el slot 0 (host)
+        ok = ok && (cgd == hgd);                        // GameData idéntico (re-confirmado este tick)
+        ok = ok && isHeap(hfac) && (cfac == hfac);      // misma facción
+        ok = ok && isHeap(hap) && isHeap(cap658) && (cap658 != hap); // platoon DISTINTO (si igual: abortar)
+        ok = ok && (out->cloneIsDead == 0);             // vivo (si ya muerto, no tocar)
+        out->guardsOk = ok ? 1 : 0;
+
+        if (!commit || !ok) return; // solo lectura, o guards no superados → nada que mutar
+
+        // Validar removeObject ANTES de tocar la lista: así erase y removeObject son atómicos
+        // (ocurren ambos o ninguno). Evita dejar la lista compactada sin retirar el objeto.
+        if (removeFn == nullptr || !isHeap(gw)) { out->failReason = -2; return; }
+
+        // Re-leer el size AUTORITATIVO en vivo (PI+0x2B8) justo antes de compactar.
+        uint32_t curSz = 0;
+        if (!Memory::Read(pi + 0x2B8, curSz) || curSz == 0 || curSz > 4096) {
+            out->failReason = -2; return;
+        }
+        out->curSize = (int)curSz;
+
+        // Buscar el slot j con data[j] == cloneChar (comparación de PUNTERO, sin dereferenciar).
+        int j = -1;
+        for (uint32_t k = 0; k < curSz; k++) {
+            uintptr_t m = 0;
+            if (Memory::Read(listData + (uintptr_t)k * 8, m) && m == clone) { j = (int)k; break; }
+        }
+        if (j <= 0) { out->failReason = -2; return; } // no hallado, o es el slot 0 (host) → abortar
+
+        // ── PRIMERO: erase del clon de la lektor PlayerInterface (compactar sin realloc) ──
+        // data[] es el buffer nativo Character** (in-process); la escritura va bajo este __try.
+        auto* dataPtr = reinterpret_cast<uintptr_t*>(listData);
+        size_t tail = (size_t)(curSz - 1 - (uint32_t)j);          // nº de slots a desplazar
+        if (tail > 0) memmove(dataPtr + j, dataPtr + j + 1, tail * sizeof(uintptr_t));
+        dataPtr[curSz - 1] = 0;                                    // limpiar el último slot
+        Memory::Write(pi + 0x2B8, (uint32_t)(curSz - 1));         // nuevo size (NO se toca capacidad)
+        out->newSize = (int)(curSz - 1);
+        out->erased  = 1;
+
+        // ── DESPUÉS: removeObject nativo (r8b=false CONFIRMADO). gw = GameWorld directo ──
+        removeFn(reinterpret_cast<void*>(gw), reinterpret_cast<void*>(clone),
+                 /*r8b=*/false, kReason);
+        out->removed = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->failReason = -1;
+    }
+}
+
+// Orquesta el [FIX-CLONESQUAD-DESPAWN]. Mismo patrón que DetectHostSquadCloneTick: throttle ~2s,
+// one-shot re-armable, SOLO host, HILO DE LÓGICA. Re-resuelve TODO en vivo cada tick (no cachea
+// punteros entre ticks salvo el contador de estabilidad). Primera pasada solo-lectura para el
+// gating; segunda pasada (commit) solo cuando la estabilidad llega a ≥3 ticks.
+static void DespawnHostSquadCloneTick(Core& core) {
+    if (!kDespawnHostSquadClone) return;
+    if (s_squadCloneDespawnDone.load()) return;                   // ya despawneado (one-shot)
+    if (s_squadCloneDespawnAttempts >= SQUADCLONE_DESPAWN_MAX_ATTEMPTS) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastSquadCloneDespawnTry < std::chrono::milliseconds(2000)) return; // throttle ~2s
+    s_lastSquadCloneDespawnTry = now;
+    s_squadCloneDespawnAttempts++;
+
+    uintptr_t hostChar = game::GetPlayerPrimaryCharacterDirect();
+    if (hostChar <= 0x10000) {                                    // char aún no resoluble
+        s_squadCloneDespawnStable = 0; s_squadCloneDespawnLastPtr = 0; s_squadCloneDespawnLastGD = 0;
+        return;
+    }
+
+    const int gameDataOff = game::GetOffsets().character.gameDataPtr; // +0x40
+
+    // Resolver PI, listData/listN y gw EN VIVO, con el MISMO camino ROBUSTO que
+    // DetectHostSquadCloneTick (GameWorld → +player PI; size@PI+0x2B8, data@PI+0x2C0 ABSOLUTOS;
+    // guard heap-ptr REAL que excluye el rango del módulo para no confundir un vtable in-module).
+    uintptr_t listData = 0; int listN = 0; uintptr_t pi = 0; uintptr_t gwResolved = 0;
+    {
+        uintptr_t gwAddr = game::GetResolvedGameWorld();
+        if (gwAddr != 0) {
+            uintptr_t modBase = Memory::GetModuleBase();
+            size_t    modSize = 0x4000000; // 64MB fallback
+            {
+                auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE)
+                        modSize = nt->OptionalHeader.SizeOfImage;
+                }
+            }
+            auto isHeap = [modBase, modSize](uintptr_t v) -> bool {
+                if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+                if ((v & 0x7) != 0) return false;
+                if (v >= modBase && v < modBase + modSize) return false; // vtable/objeto in-module
+                return true;
+            };
+
+            const auto& off = game::GetOffsets();
+            // GameWorld: caso (a) puntero a GameWorld (deref una vez) vs (b) objeto embebido.
+            uintptr_t gw = 0;
+            if (!(Memory::Read(gwAddr, gw) && isHeap(gw))) gw = gwAddr;
+            gwResolved = gw;
+
+            uintptr_t piLocal = 0;
+            if (Memory::Read(gw + off.world.player, piLocal) && isHeap(piLocal)) {
+                pi = piLocal;
+                uint32_t sz = 0; uintptr_t dp = 0;
+                if (Memory::Read(pi + 0x2B8, sz) && Memory::Read(pi + 0x2C0, dp)) {
+                    if (sz > 0 && sz <= 100000 && isHeap(dp)) { listData = dp; listN = (int)sz; }
+                }
+            }
+        }
+    }
+
+    // Puntero a la función nativa removeObject (base + RVA, mismo estilo que el resto del mod).
+    RemoveObjectFn removeFn = reinterpret_cast<RemoveObjectFn>(Memory::GetModuleBase() + kRemoveObjectRVA);
+
+    // ── 1ª PASADA: SOLO LECTURA + guards (commit=false) → decide la estabilidad ──
+    SquadCloneDespawnSnapshot fx{};
+    SEH_DespawnHostSquadClone(hostChar, gameDataOff, listData, listN, pi, gwResolved,
+                              removeFn, /*commit=*/false, &fx);
+
+    if (fx.failReason == -1) { // excepción → tratar como transitorio, resetear estabilidad
+        s_squadCloneDespawnStable = 0; s_squadCloneDespawnLastPtr = 0; s_squadCloneDespawnLastGD = 0;
+        if (s_squadCloneDespawnAttempts <= 3 || s_squadCloneDespawnAttempts % 30 == 0)
+            spdlog::warn("[FIX-CLONESQUAD-DESPAWN] excepción durante la re-resolución (host=0x{:X}) — "
+                         "reintento {}.", hostChar, s_squadCloneDespawnAttempts);
+        return;
+    }
+
+    // Sin clon presente o guards no superados → transitorio: resetear el contador de estabilidad.
+    if (fx.cloneChar == 0 || fx.guardsOk != 1) {
+        if (s_squadCloneDespawnStable != 0 &&
+            (s_squadCloneDespawnAttempts <= 5 || s_squadCloneDespawnAttempts % 30 == 0))
+            spdlog::info("[FIX-CLONESQUAD-DESPAWN] candidato inestable/ausente (clon=0x{:X} guardsOk={} "
+                         "isDead={}) → estabilidad reseteada. (intento {})",
+                         fx.cloneChar, fx.guardsOk, fx.cloneIsDead, s_squadCloneDespawnAttempts);
+        s_squadCloneDespawnStable  = 0;
+        s_squadCloneDespawnLastPtr = 0;
+        s_squadCloneDespawnLastGD  = 0;
+        return;
+    }
+
+    // Gating de estabilidad: MISMO puntero + MISMO GameData que el tick anterior → cuenta; si
+    // cambió (candidato nuevo) → reinicia a 1 registrando el nuevo candidato.
+    if (fx.cloneChar == s_squadCloneDespawnLastPtr && fx.cloneGameData == s_squadCloneDespawnLastGD) {
+        s_squadCloneDespawnStable++;
+    } else {
+        s_squadCloneDespawnLastPtr = fx.cloneChar;
+        s_squadCloneDespawnLastGD  = fx.cloneGameData;
+        s_squadCloneDespawnStable  = 1; // primera observación estable de este candidato
+    }
+
+    if (s_squadCloneDespawnStable < SQUADCLONE_DESPAWN_STABLE_TICKS) {
+        spdlog::info("[FIX-CLONESQUAD-DESPAWN] clon 0x{:X} confirmado (slot={} faction=0x{:X} "
+                     "platoon(clon)=0x{:X} platoon(host)=0x{:X}) estabilidad {}/{} — a la espera de "
+                     "más ticks antes de despawnear. (intento {})",
+                     fx.cloneChar, fx.cloneSlot, fx.cloneFaction, fx.cloneActivePlatoon,
+                     fx.hostActivePlatoon, s_squadCloneDespawnStable, SQUADCLONE_DESPAWN_STABLE_TICKS,
+                     s_squadCloneDespawnAttempts);
+        return;
+    }
+
+    // ── ≥3 ticks estables → 2ª PASADA con COMMIT: re-confirma guards en vivo, ERASE luego removeObject ──
+    SquadCloneDespawnSnapshot cx{};
+    SEH_DespawnHostSquadClone(hostChar, gameDataOff, listData, listN, pi, gwResolved,
+                              removeFn, /*commit=*/true, &cx);
+
+    if (cx.failReason == -1) { // excepción durante el commit → resetear y reintentar
+        s_squadCloneDespawnStable = 0; s_squadCloneDespawnLastPtr = 0; s_squadCloneDespawnLastGD = 0;
+        spdlog::warn("[FIX-CLONESQUAD-DESPAWN] excepción durante el COMMIT (host=0x{:X} clon=0x{:X}) — "
+                     "estabilidad reseteada, reintento {}.", hostChar, fx.cloneChar,
+                     s_squadCloneDespawnAttempts);
+        return;
+    }
+    if (cx.guardsOk != 1 || cx.removed != 1) {
+        // La re-confirmación en vivo (o la localización del slot) no fue segura entre pasadas →
+        // abortar este tick, resetear la estabilidad y dejar que se re-verifique desde cero.
+        s_squadCloneDespawnStable = 0; s_squadCloneDespawnLastPtr = 0; s_squadCloneDespawnLastGD = 0;
+        spdlog::warn("[FIX-CLONESQUAD-DESPAWN] COMMIT abortado (guardsOk={} erased={} removed={} "
+                     "clon=0x{:X} failReason={}) — la re-confirmación en vivo no fue segura. Se "
+                     "reintentará. (intento {})",
+                     cx.guardsOk, cx.erased, cx.removed, cx.cloneChar, cx.failReason,
+                     s_squadCloneDespawnAttempts);
+        return;
+    }
+
+    // ── ÉXITO (one-shot). Erase de la lektor PRIMERO, removeObject DESPUÉS — confirmado ──
+    s_squadCloneDespawnDone.store(true);
+    spdlog::warn("[FIX-CLONESQUAD-DESPAWN] clon 0x{:X} despawneado (host 0x{:X} intacto) | slot={} "
+                 "size {}→{} | faction=0x{:X} platoon(clon)=0x{:X} platoon(host)=0x{:X} | erase de "
+                 "la lektor PlayerInterface PRIMERO, GameWorld::removeObject(0x{:X}) DESPUÉS "
+                 "(r8b=false). (intento {})",
+                 cx.cloneChar, cx.hostChar, cx.cloneSlot, cx.curSize, cx.newSize, cx.cloneFaction,
+                 cx.cloneActivePlatoon, cx.hostActivePlatoon,
+                 Memory::GetModuleBase() + kRemoveObjectRVA, s_squadCloneDespawnAttempts);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════
@@ -3316,6 +4225,427 @@ static void FixHostCombatClassTick(Core& core) {
         spdlog::warn("[FIX-COMBATCLASS] sin completar tras {} intentos (called={} combatPre=0x{:X} "
                      "combatPost=0x{:X}). Revisar firma de CharBody::create 0x621460.",
                      s_combatClassAttempts, fx.called, fx.combatPre, fx.combatPost);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// [FIX-COMBATARM] — Arranca la máquina de estados de combate del host (startupState)
+// ══════════════════════════════════════════════════════════════════════════════════
+// CAUSA (RE en vivo 2026-07-14, desensamblado + lecturas de memoria):
+//   El host no puede iniciar combate "en frío" hasta que usa un muñeco de entrenamiento. El
+//   campo nextMove (CombatClass+0x1F4, swordStateEnum) nace con BASURA sin inicializar (p.ej.
+//   0xF9FA7C1D) porque la máquina de estados de combate del host NUNCA ejecutó su primer ciclo.
+//   CombatClass::startupState() (vtable slot +0x50) es quien arranca esa máquina y deja
+//   nextMove/combatState (CC+0x1F0) en valores válidos (enum pequeño 0..11, ver swordStateEnum).
+//   El muñeco de entrenamiento fuerza ese primer ciclo de forma natural; el reclamo normal del
+//   host (ClaimHostPrimaryCharacter) NO lo hace. Este fix lo fuerza por código UNA vez.
+//
+//   Cadena de resolución (misma que FIX-COMBATCLASS / [DIAG-ATTACK]):
+//     CharBody   = *(host + 0x648)
+//     CombatClass= *(CharBody + 0x8)          ; vtable esperada = modBase + 0x16F67B8
+//     startupState = *(*(CombatClass) + 0x50) ; SIEMPRE por vtable, NUNCA por RVA fija
+//       (las RVAs de esta zona de CombatClass NO son estables entre sesiones/deltas — verificado
+//        esta noche; por eso se resuelve el puntero desde la vtable del propio objeto).
+//   Firma confirmada (KenshiLib CombatClass.h): bool CombatClass::startupState();  // solo `this`.
+//
+// SEGURIDAD:
+//   • Precondiciones (baratas) antes de llamar: CombatClass es heap válido, su vtable coincide con
+//     la de CombatClass conocida (0x16F67B8), y `me` (CombatClass+0x188, back-ptr al Character) es
+//     heap válido y == host (evita llamar sobre un objeto reusado/erróneo).
+//   • RED DE SEGURIDAD: si tras la llamada (o si no se pudo llamar) nextMove (CC+0x1F4) sigue fuera
+//     del rango razonable del enum (leído como uint32 > 0x40 → cubre basura y negativos), se escribe
+//     nextMove=0 y combatState=0 (CHOP_WEAPON, valor de enum válido) como saneado defensivo.
+//   • Thread safety: HILO DE LÓGICA (OnGameTick), igual que FIX-COMBATCLASS/FIX-PLATOON (NUNCA red).
+//   • One-shot re-armable (ResetHostCombatArmFix), throttle 250ms, tope de intentos, todo bajo SEH.
+//   • Corre DESPUÉS de FIX-COMBATCLASS (que crea la CombatClass si nació NULL): necesita que la
+//     CombatClass ya exista para poder arrancar su máquina de estados.
+
+// Toggle maestro del FIX-COMBATARM. DEFAULT TRUE.
+static constexpr bool kEnableCombatArmFix = true;
+
+// Firma de CombatClass::startupState() (resuelta SIEMPRE por vtable slot +0x50, no por RVA).
+//   rcx = CombatClass* (this). Devuelve bool. Sin más argumentos.
+using CombatStartupStateFn = bool(__fastcall*)(void* combatClass);
+
+// Estado one-shot del FIX-COMBATARM (re-armable en disconnect / nueva carga).
+static std::atomic<bool> s_combatArmFixDone{false};
+static int  s_combatArmAttempts = 0;
+static auto s_lastCombatArmTry  = std::chrono::steady_clock::now();
+static constexpr int COMBATARM_MAX_ATTEMPTS = 240; // ~varios segundos (≈throttle 250ms), como FIX-COMBATCLASS
+
+// Re-arma el FIX-COMBATARM para una partida/conexión nueva (mismo patrón que FIX-COMBATCLASS).
+void ResetHostCombatArmFix() {
+    s_combatArmFixDone.store(false);
+    s_combatArmAttempts = 0;
+    s_lastCombatArmTry = std::chrono::steady_clock::now();
+}
+
+// Snapshot POD del FIX-COMBATARM (vive dentro del __try; sin objetos C++ → evita C2712).
+struct CombatArmFixSnapshot {
+    uintptr_t charBody      = 0;  // host+0x648
+    uintptr_t combat        = 0;  // *(CharBody+0x8) = CombatClass*
+    int       combatOk      = 0;  // 1 si CombatClass válido y vtable == 0x16F67B8
+    uintptr_t combatVtbl    = 0;  // *(CombatClass) (vtable) — de aquí sale startupState (+0x50)
+    uintptr_t startupFn     = 0;  // *(vtable+0x50) — puntero a CombatClass::startupState
+    uintptr_t me            = 0;  // CombatClass+0x188 (Character* back-ptr) — debe == host
+    int       meOk          = 0;  // 1 si me es heap válido y == host
+    uint32_t  nextMovePre   = 0;  // CC+0x1F4 ANTES (basura si la máquina no arrancó)
+    uint32_t  combatStatePre= 0;  // CC+0x1F0 ANTES
+    uint32_t  nextMovePost  = 0;  // CC+0x1F4 DESPUÉS de startupState / saneado
+    uint32_t  combatStatePost=0;  // CC+0x1F0 DESPUÉS
+    int       called        = 0;  // 1 startupState llamado OK · -1 excepción dentro de la llamada
+    int       sanitized     = 0;  // 1 si la red de seguridad reescribió nextMove/combatState a 0
+};
+
+// Rango de código del JUEGO (kenshi_x64.exe): [inicio de .text, fin de .rdata). Un puntero de
+// FUNCIÓN válido del juego (p.ej. CombatClass::startupState) SIEMPRE cae aquí: vive en la sección
+// .text del módulo. Se usa para validar startupFn en SEH_FixCombatArm (mismo criterio que el guard
+// UAF de BuyItem en inventory_hooks.cpp). Se calcula una vez recorriendo las secciones PE.
+static uintptr_t s_combatArmGameTextLo = 0, s_combatArmGameRdataHi = 0;
+
+// Calcula [.text, .rdata) del EXE del juego recorriendo sus secciones PE. Idempotente. Se llama
+// FUERA del __try de SEH_FixCombatArm (no crea objetos C++ con destructor dentro del guard).
+static void EnsureCombatArmGameCodeRange() {
+    if (s_combatArmGameTextLo && s_combatArmGameRdataHi) return;   // ya calculado antes
+    HMODULE h = GetModuleHandleW(nullptr);      // el propio kenshi_x64.exe (no el mod inyectado)
+    auto base = reinterpret_cast<uintptr_t>(h);
+    auto dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    auto sec  = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        char name[9] = {0}; memcpy(name, sec[i].Name, 8);       // nombre de sección (máx 8 chars)
+        uintptr_t lo = base + sec[i].VirtualAddress;
+        uintptr_t hi = lo + sec[i].Misc.VirtualSize;
+        if (!strcmp(name, ".text"))  s_combatArmGameTextLo  = lo;   // inicio del código nativo
+        if (!strcmp(name, ".rdata")) s_combatArmGameRdataHi = hi;   // fin de datos de solo lectura
+    }
+    // Fallbacks defensivos si el PE no expone esas secciones con esos nombres exactos.
+    if (!s_combatArmGameTextLo)  s_combatArmGameTextLo  = base + 0x1000;
+    if (!s_combatArmGameRdataHi) s_combatArmGameRdataHi = base + 0x1673000 + 0x54A4CB;
+}
+
+// Lee el cluster de combate del host, resuelve startupState por vtable, lo llama (si procede) y
+// aplica la red de seguridad. TODO bajo SEH. combatVtblAbs = vtable CombatClass absoluta (validar).
+static void SEH_FixCombatArm(uintptr_t chr, uintptr_t combatVtblAbs, CombatArmFixSnapshot* out) {
+    auto isHeap = [](uintptr_t v) -> bool {
+        if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+        if ((v & 0x7) != 0) return false;   // punteros del juego alineados a 8
+        return true;
+    };
+    __try {
+        if (!isHeap(chr)) return;
+
+        // CharBody (host+0x648) — debe existir.
+        uintptr_t body = 0;
+        if (!Memory::Read(chr + 0x648, body) || !isHeap(body)) return;
+        out->charBody = body;
+
+        // CombatClass = *(CharBody+0x8). Si es NULL, aún no hay CombatClass (FIX-COMBATCLASS no
+        // corrió todavía) → no aplicable: reintentar.
+        uintptr_t combat = 0;
+        if (!Memory::Read(body + 0x8, combat) || !isHeap(combat)) return;
+        out->combat = combat;
+
+        // vtable del CombatClass — debe coincidir con la conocida (0x16F67B8). De ella sale
+        // startupState en el slot +0x50 (resolución SIEMPRE por vtable, nunca por RVA fija).
+        uintptr_t vtbl = 0;
+        if (!Memory::Read(combat, vtbl) || !isHeap(vtbl)) return;
+        out->combatVtbl = vtbl;
+        if (vtbl != combatVtblAbs) return;   // vtable inesperada → NO tocar (objeto no es CombatClass)
+        out->combatOk = 1;
+
+        // `me` (CombatClass+0x188) = Character* back-ptr. Debe ser heap válido y == host: garantiza
+        // que este CombatClass pertenece REALMENTE al char del host (evita objeto reusado/erróneo).
+        uintptr_t me = 0;
+        Memory::Read(combat + 0x188, me);
+        out->me = me;
+        if (!isHeap(me) || me != chr) return; // precondición barata fallida → no llamar startupState
+        out->meOk = 1;
+
+        // Estado ANTES (evidencia): nextMove (CC+0x1F4) y combatState (CC+0x1F0).
+        Memory::Read(combat + 0x1F4, out->nextMovePre);
+        Memory::Read(combat + 0x1F0, out->combatStatePre);
+
+        // Resolver startupState por la vtable del propio objeto: slot en byte-offset +0x50.
+        // OJO: aquí validamos un puntero de FUNCIÓN, no de heap. isHeap() está diseñado para punteros
+        // de HEAP y RECHAZA SIEMPRE cualquier dirección dentro del módulo del juego (por diseño:
+        // detecta objetos que en realidad caen en código/vtable). Pero un entry point de función
+        // VIVE en .text del módulo → isHeap(fnAddr) lo rechazaba SIEMPRE aunque fuese válido (bug
+        // confirmado en vivo: Memory::Read devolvía un puntero legítimo y no-nulo, pero isHeap lo
+        // tumbaba y startupFn quedaba en 0x0 → la máquina de estados nunca se armaba). Criterio
+        // correcto (mismo que el guard UAF de BuyItem): fnAddr debe caer en el rango de código del
+        // JUEGO [.text, .rdata). SIN exigir alineación a 8: un entry point de función no la garantiza.
+        uintptr_t fnAddr = 0;
+        if (Memory::Read(vtbl + 0x50, fnAddr) &&
+            fnAddr >= s_combatArmGameTextLo && fnAddr < s_combatArmGameRdataHi) {
+            out->startupFn = fnAddr;
+            CombatStartupStateFn fn = reinterpret_cast<CombatStartupStateFn>(fnAddr);
+            // Llamada nativa UNA vez: arranca la máquina de estados de combate del host.
+            fn(reinterpret_cast<void*>(combat));   // rcx = CombatClass (this)
+            out->called = 1;
+        }
+
+        // Re-leer el resultado tras la llamada (o sin llamada si startupFn no era válido).
+        Memory::Read(combat + 0x1F4, out->nextMovePost);
+        Memory::Read(combat + 0x1F0, out->combatStatePost);
+
+        // RED DE SEGURIDAD: si nextMove sigue fuera del rango del enum (uint32 > 0x40 → cubre basura
+        // tipo 0xF9FA7C1D y negativos interpretados como grandes), sanear a 0 (CHOP_WEAPON, válido).
+        if (out->nextMovePost > 0x40) {
+            uint32_t zero = 0;
+            Memory::Write(combat + 0x1F4, zero);   // nextMove   = 0
+            Memory::Write(combat + 0x1F0, zero);   // combatState= 0
+            out->sanitized = 1;
+            // Reflejar el saneado en el snapshot para el log.
+            Memory::Read(combat + 0x1F4, out->nextMovePost);
+            Memory::Read(combat + 0x1F0, out->combatStatePost);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->called = -1;
+    }
+}
+
+// Orquesta el FIX-COMBATARM. Mismo patrón que FixHostCombatClassTick: throttle 250ms, one-shot
+// re-armable, SOLO host, en el HILO DE LÓGICA (OnGameTick). Idempotente (one-shot).
+static void FixHostCombatArmTick(Core& core) {
+    if (!kEnableCombatArmFix) return;                           // toggle maestro
+    if (s_combatArmFixDone.load()) return;                      // ya resuelto (arrancado/saneado)
+    if (s_combatArmAttempts >= COMBATARM_MAX_ATTEMPTS) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastCombatArmTry < std::chrono::milliseconds(250)) return;
+    s_lastCombatArmTry = now;
+
+    uintptr_t modBase = Memory::GetModuleBase();
+    if (modBase == 0) return;
+
+    // Rango de código del juego [.text,.rdata) para validar el puntero de función startupState dentro
+    // de SEH_FixCombatArm. Se calcula aquí (fuera del __try) porque recorre las secciones PE una vez.
+    EnsureCombatArmGameCodeRange();
+
+    // char primario del host (mismo helper que el resto del mod / FIX-COMBATCLASS / [DIAG-ATTACK]).
+    uintptr_t hostChar = game::GetPlayerPrimaryCharacterDirect();
+    if (hostChar <= 0x10000) return;                            // host aún no resoluble → reintentar
+
+    // A partir de aquí HAY host real → intento REAL: contarlo.
+    s_combatArmAttempts++;
+
+    const uintptr_t combatVtblAbs = modBase + 0x16F67B8;        // vtable CombatClass (*(CharBody+0x8))
+
+    CombatArmFixSnapshot fx{};
+    SEH_FixCombatArm(hostChar, combatVtblAbs, &fx);
+
+    // RVAs relativos para el log (independientes del ASLR).
+    auto rva = [modBase](uintptr_t a) -> uintptr_t { return (a > modBase) ? (a - modBase) : 0; };
+
+    if (fx.called == 1) {
+        // startupState se ejecutó (con o sin saneado posterior): cerrar one-shot.
+        s_combatArmFixDone.store(true);
+        spdlog::info(
+            "[FIX-COMBATARM] APLICADO ✓ char=0x{:X} CombatClass=0x{:X}(vtblOk={}) me=0x{:X}(ok={}) | "
+            "startupState=vtbl+0x50 (fn=0x{:X} rva=0x{:X}) | nextMove(CC+0x1F4): 0x{:X} -> 0x{:X} | "
+            "combatState(CC+0x1F0): 0x{:X} -> 0x{:X} | saneado={} (intento {}). La máquina de estados "
+            "de combate del host queda arrancada → puede iniciar combate en frío sin muñeco.",
+            hostChar, fx.combat, fx.combatOk, fx.me, fx.meOk, fx.startupFn, rva(fx.startupFn),
+            fx.nextMovePre, fx.nextMovePost, fx.combatStatePre, fx.combatStatePost, fx.sanitized,
+            s_combatArmAttempts);
+        core.GetNativeHud().AddSystemMessage("Sistema de combate del jugador armado");
+    } else if (fx.sanitized == 1) {
+        // No se pudo llamar startupState (fn no resuelto) PERO la red de seguridad saneó la basura:
+        // también cerramos el one-shot (nextMove/combatState quedan en un valor válido).
+        s_combatArmFixDone.store(true);
+        spdlog::warn(
+            "[FIX-COMBATARM] startupState NO llamado (fn=0x{:X}) pero RED DE SEGURIDAD aplicada: "
+            "nextMove(CC+0x1F4) 0x{:X} -> 0x{:X}, combatState(CC+0x1F0) 0x{:X} -> 0x{:X} en char=0x{:X} "
+            "(intento {}).",
+            fx.startupFn, fx.nextMovePre, fx.nextMovePost, fx.combatStatePre, fx.combatStatePost,
+            hostChar, s_combatArmAttempts);
+    } else if (fx.called == -1) {
+        if (s_combatArmAttempts <= 5 || s_combatArmAttempts % 60 == 0) {
+            spdlog::warn("[FIX-COMBATARM] excepción dentro de startupState/saneado (char=0x{:X} "
+                         "CombatClass=0x{:X} vtbl=0x{:X} fn=0x{:X}) — reintento {}.",
+                         hostChar, fx.combat, fx.combatVtbl, fx.startupFn, s_combatArmAttempts);
+        }
+    } else {
+        // Aún no aplicable (sin CombatClass, vtable inesperada, o `me` no coincide) → reintentar.
+        if (s_combatArmAttempts <= 5 || s_combatArmAttempts % 60 == 0) {
+            spdlog::info("[FIX-COMBATARM] aún no aplicable (char=0x{:X} CombatClass=0x{:X} combatOk={} "
+                         "meOk={} nextMovePre=0x{:X}) — reintento {} (esperando CombatClass del host).",
+                         hostChar, fx.combat, fx.combatOk, fx.meOk, fx.nextMovePre, s_combatArmAttempts);
+        }
+        if (s_combatArmAttempts == COMBATARM_MAX_ATTEMPTS) {
+            spdlog::warn("[FIX-COMBATARM] sin completar tras {} intentos (combatOk={} meOk={} "
+                         "called={}). Revisar resolución vtable+0x50 de startupState.",
+                         s_combatArmAttempts, fx.combatOk, fx.meOk, fx.called);
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// [FIX-ARMHAND] — Repara el handle de brazo del AI del host (AI+0x318 → Character+0x458)
+// ══════════════════════════════════════════════════════════════════════════════════
+// CAUSA (RE estático de alta confianza, 2026-07-14, desensamblado de la cadena nativa
+//   giveBirth→createComponents→AI::create, RVAs 0x62b210 / 0x62af50 / 0x622110):
+//   El host no puede CARGAR/SECUESTRAR personas, hacer PRIMEROS AUXILIOS a otros ni
+//   AUTOCURARSE: el chequeo GOAP nativo devuelve "brazo en estado pésimo" AUNQUE los brazos
+//   estén sanos (100/100). El motivo NO es la salud del brazo (eso ya lo cubre el [FIX-ARMGATE]
+//   / [FIX-ARMSEED]) sino que el handle en AI+0x318 no apunta a donde debería tras el reclamo
+//   del host por el mod (el spawn de la plantilla del mod no reprodujo esta parte de AI::create).
+//
+//   En un personaje SANO, AI+0x318 debe apuntar a Character+0x458 — una región que YA EXISTE
+//   dentro del propio objeto Character desde que nace. Por tanto NO hay que alocar memoria nueva
+//   ni llamar a ningún constructor: es una simple ESCRITURA DE PUNTERO de 8 bytes.
+//     AI      = *(Character + 0x650)          ; puntero al AI del char
+//     destino = AI + 0x318                    ; handle a reparar
+//     valor   = Character + 0x458             ; dirección DENTRO del propio Character
+//   Offsets confirmados ESTABLES (no cambian entre Steam/GOG/versión): AI+0x318, Character+0x458,
+//   Character+0x650.
+//
+// SEGURIDAD:
+//   • Resuelve el char del host con game::GetPlayerPrimaryCharacterDirect() (= data[0] del
+//     PlayerInterface, mismo helper que FIX-COMBATCLASS/FIX-COMBATARM). Esto GARANTIZA que 'chr'
+//     es una base Character REAL, así que Character+0x458 existe y la escritura no puede caer
+//     sobre un objeto que no sea Character (evita corrupción). Por eso este fix se limita al host
+//     (mismo alcance que los fixes hermanos de escritura cruda COMBATCLASS/COMBATARM; el
+//     SeedHostCharArmFlagsTick que sí itera varios chars usa una LLAMADA NATIVA de reevaluación,
+//     no una escritura de puntero, así que no es precedente para ampliar el alcance aquí).
+//   • Auto-verificación barata antes de escribir: AI = *(chr+0x650) debe ser un puntero de HEAP
+//     válido (isHeap). Se lee el valor ACTUAL de [AI+0x318] para loguear antes/después (útil para
+//     diagnóstico) y para no reescribir si ya estaba correcto (idempotente).
+//   • Thread safety: HILO DE LÓGICA (OnGameTick), igual que FIX-COMBATCLASS/FIX-COMBATARM (NUNCA red).
+//   • One-shot re-armable (ResetHostArmHandFix), throttle 250ms, tope de intentos, todo bajo SEH.
+//   • Corre DESPUÉS de FIX-COMBATCLASS/FIX-COMBATARM (que dependen de que host/AI estén resueltos):
+//     este fix también asume el AI (char+0x650) ya materializado.
+
+// Toggle maestro del FIX-ARMHAND. DEFAULT TRUE (escritura idempotente de bajo riesgo).
+static constexpr bool kEnableArmHandFix = true;
+
+// Estado one-shot del FIX-ARMHAND (re-armable en disconnect / nueva carga).
+static std::atomic<bool> s_armHandFixDone{false};
+static int  s_armHandAttempts = 0;
+static auto s_lastArmHandTry  = std::chrono::steady_clock::now();
+static constexpr int ARMHAND_MAX_ATTEMPTS = 240; // ~varios segundos (≈throttle 250ms), como FIX-COMBATARM
+
+// Re-arma el FIX-ARMHAND para una partida/conexión nueva (mismo patrón que FIX-COMBATARM).
+void ResetHostArmHandFix() {
+    s_armHandFixDone.store(false);
+    s_armHandAttempts = 0;
+    s_lastArmHandTry = std::chrono::steady_clock::now();
+}
+
+// Snapshot POD del FIX-ARMHAND (vive dentro del __try; sin objetos C++ → evita C2712).
+struct ArmHandFixSnapshot {
+    uintptr_t chr        = 0;  // char del host (base Character real)
+    uintptr_t ai         = 0;  // *(chr+0x650) = puntero al AI
+    int       aiOk       = 0;  // 1 si ai es heap válido
+    uintptr_t expected   = 0;  // chr+0x458 (valor que debe quedar en AI+0x318)
+    uintptr_t handlePre  = 0;  // [ai+0x318] ANTES (evidencia: apunta mal si el bug está presente)
+    uintptr_t handlePost = 0;  // [ai+0x318] DESPUÉS de la escritura
+    int       alreadyOk  = 0;  // 1 si [ai+0x318] ya == chr+0x458 (nada que hacer)
+    int       repaired   = 0;  // 1 si se escribió el puntero
+    int       excepted   = 0;  // -1 si saltó excepción dentro del guard
+};
+
+// Lee AI = *(chr+0x650), valida, lee [AI+0x318] y escribe chr+0x458 si procede. TODO bajo SEH.
+static void SEH_FixArmHand(uintptr_t chr, ArmHandFixSnapshot* out) {
+    // Criterio de puntero de HEAP válido (mismo que SEH_FixCombatArm): no-nulo, dentro del rango
+    // canónico de usuario y alineado a 8 (los punteros del juego lo están).
+    auto isHeap = [](uintptr_t v) -> bool {
+        if (v < 0x10000 || v >= 0x00007FFFFFFFFFFF) return false;
+        if ((v & 0x7) != 0) return false;
+        return true;
+    };
+    __try {
+        if (!isHeap(chr)) return;
+        out->chr = chr;
+
+        // AI = *(Character+0x650). Si aún no está materializado (NULL/no-heap) → no aplicable: reintentar.
+        uintptr_t ai = 0;
+        if (!Memory::Read(chr + 0x650, ai) || !isHeap(ai)) return;
+        out->ai = ai;
+        out->aiOk = 1;
+
+        // Valor que debe quedar en AI+0x318: la región Character+0x458 DENTRO del propio char.
+        uintptr_t expected = chr + 0x458;
+        out->expected = expected;
+
+        // Valor ACTUAL del handle (evidencia antes/después; también sirve para la idempotencia).
+        Memory::Read(ai + 0x318, out->handlePre);
+
+        if (out->handlePre == expected) {
+            // Ya está reparado (idempotente): no reescribir.
+            out->alreadyOk  = 1;
+            out->handlePost = out->handlePre;
+            return;
+        }
+
+        // Escritura de puntero de 8 bytes: AI+0x318 = Character+0x458.
+        if (Memory::Write(ai + 0x318, expected)) {
+            out->repaired = 1;
+        }
+        // Releer para confirmar/loguear el resultado.
+        Memory::Read(ai + 0x318, out->handlePost);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->excepted = -1;
+    }
+}
+
+// Orquesta el FIX-ARMHAND. Mismo patrón que FixHostCombatArmTick: throttle 250ms, one-shot
+// re-armable, SOLO host, en el HILO DE LÓGICA (OnGameTick). Idempotente (one-shot).
+static void FixHostArmHandTick(Core& core) {
+    if (!kEnableArmHandFix) return;                            // toggle maestro
+    if (s_armHandFixDone.load()) return;                       // ya resuelto (reparado o ya correcto)
+    if (s_armHandAttempts >= ARMHAND_MAX_ATTEMPTS) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastArmHandTry < std::chrono::milliseconds(250)) return;
+    s_lastArmHandTry = now;
+
+    // char primario del host (mismo helper que FIX-COMBATCLASS/FIX-COMBATARM): base Character REAL.
+    uintptr_t hostChar = game::GetPlayerPrimaryCharacterDirect();
+    if (hostChar <= 0x10000) return;                           // host aún no resoluble → reintentar
+
+    // A partir de aquí HAY host real → intento REAL: contarlo.
+    s_armHandAttempts++;
+
+    ArmHandFixSnapshot fx{};
+    SEH_FixArmHand(hostChar, &fx);
+
+    // (chr/ai son punteros de HEAP, no del módulo → se loguean en absoluto, sin convertir a RVA).
+    if (fx.repaired == 1) {
+        // Se reparó el handle: cerrar one-shot.
+        s_armHandFixDone.store(true);
+        spdlog::info(
+            "[FIX-ARMHAND] AI+0x318 reparado: 0x{:X} -> 0x{:X} (char=0x{:X} Character+0x458=0x{:X} "
+            "AI=0x{:X}) (intento {}). El host ya puede cargar/secuestrar, hacer primeros auxilios y "
+            "autocurarse (el chequeo GOAP de brazo deja de fallar).",
+            fx.handlePre, fx.handlePost, fx.chr, fx.expected, fx.ai, s_armHandAttempts);
+        core.GetNativeHud().AddSystemMessage("Brazo del jugador reparado (cargar/curar habilitado)");
+    } else if (fx.alreadyOk == 1) {
+        // Ya estaba correcto (idempotente): cerrar one-shot sin escribir.
+        s_armHandFixDone.store(true);
+        spdlog::info(
+            "[FIX-ARMHAND] AI+0x318 ya correcto (0x{:X} == Character+0x458) en char=0x{:X} (AI=0x{:X}) "
+            "— nada que reparar (intento {}).",
+            fx.handlePre, fx.chr, fx.ai, s_armHandAttempts);
+    } else if (fx.excepted == -1) {
+        if (s_armHandAttempts <= 5 || s_armHandAttempts % 60 == 0) {
+            spdlog::warn("[FIX-ARMHAND] excepción dentro de la reparación (char=0x{:X} AI=0x{:X} "
+                         "aiOk={}) — reintento {}.",
+                         fx.chr, fx.ai, fx.aiOk, s_armHandAttempts);
+        }
+    } else {
+        // Aún no aplicable (AI no materializado, o Write falló) → reintentar.
+        if (s_armHandAttempts <= 5 || s_armHandAttempts % 60 == 0) {
+            spdlog::info("[FIX-ARMHAND] aún no aplicable (char=0x{:X} AI=0x{:X} aiOk={} "
+                         "handlePre=0x{:X}) — reintento {} (esperando AI del host en char+0x650).",
+                         fx.chr, fx.ai, fx.aiOk, fx.handlePre, s_armHandAttempts);
+        }
+        if (s_armHandAttempts == ARMHAND_MAX_ATTEMPTS) {
+            spdlog::warn("[FIX-ARMHAND] sin completar tras {} intentos (aiOk={} handlePre=0x{:X}). "
+                         "Revisar resolución AI=*(char+0x650) y offset AI+0x318.",
+                         s_armHandAttempts, fx.aiOk, fx.handlePre);
+        }
     }
 }
 
@@ -3936,7 +5266,8 @@ static void CombatAutotestTick(Core& core) {
         if ((v & 0x7) != 0) return false;
         return true;
     };
-    const uintptr_t taskMeleeVtblAbs = modBase + 0x16BE448; // Task_MeleeAttack (audit-12)
+    const uintptr_t taskMeleeVtblAbs        = modBase + 0x16BE448; // Task_MeleeAttack (ataque AUTOMÁTICO, audit-12)
+    const uintptr_t taskFocusedMeleeVtblAbs = modBase + 0x16BF9E8; // Task_FocusedMeleeAttack (ataque ORDENADO, RE 2026-07-14)
 
     // ── FASE 2: POST — MUESTREO EN VENTANA (RE 2026-06-19) ──
     // attackTarget SOLO encola la orden; el AI tick materializa currentTarget(+0x290)/Task_MeleeAttack
@@ -3949,7 +5280,11 @@ static void CombatAutotestTick(Core& core) {
 
         AutotestCharState post{};
         SEH_ReadAutotestState(s_autotestHostChar, &post, isHeap);
-        bool meleeNow  = (post.activeTaskVtbl == taskMeleeVtblAbs);
+        // ÉXITO = cualquiera de las dos tareas de ataque: automática (Task_MeleeAttack) u ordenada
+        // (Task_FocusedMeleeAttack, clic manual). Antes solo se reconocía la automática → falso negativo.
+        bool meleeAutoNow    = (post.activeTaskVtbl == taskMeleeVtblAbs);
+        bool meleeFocusedNow = (post.activeTaskVtbl == taskFocusedMeleeVtblAbs);
+        bool meleeNow  = (meleeAutoNow || meleeFocusedNow); // el host ejecuta ALGÚN ataque melee
         bool hasTarget = (post.currentTarget != 0);
         // RVA relativo del activeTaskVtbl (para identificar la tarea sin depender del ASLR del log).
         uintptr_t activeTaskRva = (post.activeTaskVtbl > modBase) ? (post.activeTaskVtbl - modBase) : 0;
@@ -3959,12 +5294,17 @@ static void CombatAutotestTick(Core& core) {
         // de los NPCs de la tanda → el FIX-PLATOON desbloqueó el combate.
         bool outOfIdle = (post.amIdle == 0);
         if ((meleeNow || hasTarget) && outOfIdle) {
+            // Distinguimos el tipo de ataque para diagnósticos futuros: auto=Task_MeleeAttack (0x16BE448),
+            // ordenado=Task_FocusedMeleeAttack (0x16BF9E8), o solo currentTarget!=0 (aún sin tarea melee).
+            const char* meleeKind = meleeAutoNow ? "automatico(Task_MeleeAttack)"
+                                  : meleeFocusedNow ? "ordenado(Task_FocusedMeleeAttack)"
+                                  : "sin-tarea-melee(solo currentTarget)";
             spdlog::info(
                 "[AUTOTEST] POST OK (tick {} de la ventana, {} objetivos atacados) host=0x{:X} | "
                 "combat=0x{:X} currentTarget=0x{:X} | activeTask=0x{:X} vtblRVA=0x{:X} "
-                "(Task_MeleeAttack=0x16BE448 → melee={}) | amIdle={}",
+                "(melee={} tipo={} | Task_MeleeAttack=0x16BE448 / Task_FocusedMeleeAttack=0x16BF9E8) | amIdle={}",
                 s_autotestPostCounter, s_autotestTargetCount, s_autotestHostChar, post.combat,
-                post.currentTarget, post.activeTask, activeTaskRva, meleeNow ? 1 : 0, post.amIdle);
+                post.currentTarget, post.activeTask, activeTaskRva, meleeNow ? 1 : 0, meleeKind, post.amIdle);
             spdlog::info("[AUTOTEST] ==> *** COMBATE DESBLOQUEADO *** el host SALIÓ DE OCIOSO y ADQUIRIÓ "
                          "objetivo (amIdle=0 + Task_MeleeAttack o currentTarget!=0) atacando a la tanda de "
                          "{} NPC(s). El encolado del melee FUNCIONA y el AI tick lo procesó.",
@@ -3976,12 +5316,15 @@ static void CombatAutotestTick(Core& core) {
         // Caso raro: adquirió objetivo pero el motor aún marca amIdle=1 (transitorio). Lo tratamos
         // como positivo igualmente (hay objetivo/melee) pero lo dejamos anotado en el log.
         if (meleeNow || hasTarget) {
+            const char* meleeKind = meleeAutoNow ? "automatico(Task_MeleeAttack)"
+                                  : meleeFocusedNow ? "ordenado(Task_FocusedMeleeAttack)"
+                                  : "sin-tarea-melee(solo currentTarget)";
             spdlog::info(
                 "[AUTOTEST] POST OK (tick {} de la ventana, {} objetivos) host=0x{:X} | combat=0x{:X} "
-                "currentTarget=0x{:X} | activeTask=0x{:X} vtblRVA=0x{:X} (melee={}) | amIdle={} "
+                "currentTarget=0x{:X} | activeTask=0x{:X} vtblRVA=0x{:X} (melee={} tipo={}) | amIdle={} "
                 "(objetivo adquirido aunque amIdle aún=1, transitorio)",
                 s_autotestPostCounter, s_autotestTargetCount, s_autotestHostChar, post.combat,
-                post.currentTarget, post.activeTask, activeTaskRva, meleeNow ? 1 : 0, post.amIdle);
+                post.currentTarget, post.activeTask, activeTaskRva, meleeNow ? 1 : 0, meleeKind, post.amIdle);
             spdlog::info("[AUTOTEST] ==> *** COMBATE DESBLOQUEADO *** el host ADQUIRIÓ objetivo "
                          "(Task_MeleeAttack o currentTarget!=0) sobre la tanda de {} NPC(s).",
                          s_autotestTargetCount);
@@ -4022,7 +5365,7 @@ static void CombatAutotestTick(Core& core) {
         spdlog::info(
             "[AUTOTEST] POST FINAL (ventana {} ticks agotada, {} objetivos atacados) host=0x{:X} | "
             "combat=0x{:X} currentTarget=0x{:X} | activeTask=0x{:X} vtblRVA=0x{:X} (≠Task_MeleeAttack "
-            "0x16BE448; ≠Tasker 0x16BDC68) | amIdle={}",
+            "0x16BE448; ≠Task_FocusedMeleeAttack 0x16BF9E8; ≠Tasker 0x16BDC68) | amIdle={}",
             kAutotestPostWindow, s_autotestTargetCount, s_autotestHostChar, post.combat,
             post.currentTarget, post.activeTask, activeTaskRva, post.amIdle);
         spdlog::info("[AUTOTEST] ==> {}", verdict);
@@ -4094,7 +5437,10 @@ static void CombatAutotestTick(Core& core) {
     }
 
     // Se encontró una TANDA de NPCs y se disparó attackTarget a cada uno → log de la tanda + PRE.
-    bool preMelee = (snap.pre.activeTaskVtbl == taskMeleeVtblAbs);
+    // preMelee = el host YA estaba en melee antes de la orden, sea automático (Task_MeleeAttack) u
+    // ordenado (Task_FocusedMeleeAttack, clic manual previo). Solo informativo del estado PRE.
+    bool preMelee = (snap.pre.activeTaskVtbl == taskMeleeVtblAbs ||
+                     snap.pre.activeTaskVtbl == taskFocusedMeleeVtblAbs);
     spdlog::info(
         "[AUTOTEST] TANDA encontrada: {} NPC(s) de facción distinta en radio {:.0f} (cap {}) | "
         "host=0x{:X} faction=0x{:X} | hostTasker(char+0x658→+0x98)=0x{:X} | hostDefaultRel "
@@ -4763,7 +6109,11 @@ struct CombatStructSnapshot {
     static constexpr uintptr_t kCombatClassVtableRVA  = 0x16F67B8; // *(CharBody+0x8) -> CombatClass (vtbl derivada)
     static constexpr uintptr_t kCharBodyVtableRVA     = 0x16F8A68; // char+0x648 -> CharBody
     static constexpr uintptr_t kTaskerVtableRVA       = 0x16BDC68; // Task activo base (Tasker)
-    static constexpr uintptr_t kTaskMeleeVtableRVA    = 0x16BE448; // Task activo = Task_MeleeAttack
+    static constexpr uintptr_t kTaskMeleeVtableRVA    = 0x16BE448; // Task activo = Task_MeleeAttack (ataque AUTOMÁTICO del CombatClass)
+    // ── Ataque ORDENADO por el jugador (clic manual): el motor usa una tarea DISTINTA (RTTI en vivo,
+    //    RE 2026-07-14). El host SÍ fija currentTarget y ejecuta esta tarea contra enemigos reales.
+    //    Reconocerla evita el falso negativo "orden perdida / host ocupado" cuando el ataque SÍ funciona.
+    static constexpr uintptr_t kTaskFocusedMeleeVtableRVA = 0x16BF9E8; // Task activo = Task_FocusedMeleeAttack (ataque ORDENADO)
 
     // ── Host (char primario del jugador) ──
     uintptr_t hostChar       = 0;   // primaryChar del mod
@@ -5690,6 +7040,11 @@ static std::atomic<bool>   s_combatGateInstalled{false};
 static std::atomic<uintptr_t> s_cachedHostFaction{0};  // Faction* del host (GW+0x580->+0x2A0)
 static std::atomic<uintptr_t> s_cachedHostFR{0};       // hostFaction + 0x78 (FactionRelations*)
 static std::atomic<uintptr_t> s_cachedNamelessFR{0};   // Nameless.relations (Faction+0x78) o 0
+// [FIX-ENEMY-HOOK] Faction* de Nameless (204-gamedata.base), NO su FactionRelations*. Se cachea
+//   junto a s_cachedNamelessFR (misma rama de éxito) porque el hook de isEnemy necesita el puntero
+//   de FACCIÓN (no de relaciones) para SUSTITUIR el parámetro 'other' de un NPC que pregunta por el
+//   host. Vale 0 mientras Nameless no se haya resuelto (fallback seguro = no intervenir).
+static std::atomic<uintptr_t> s_cachedNamelessFaction{0}; // Nameless (Faction*) para sustituir 'other'
 static std::atomic<int>       s_namelessResolveState{0}; // 0=sin intentar, 1=hallada, 2=NO existe
 // Contadores de diagnóstico (logueo throttled, sin spamear el hot-path).
 static std::atomic<int>       s_gateHostCalls{0};      // nº de llamadas interceptadas con this==hostFR
@@ -5751,8 +7106,13 @@ static void ResolveNamelessFactionOnce(uintptr_t modBase) {
     if (s_namelessResolveState.load(std::memory_order_acquire) != 0) return; // ya intentado
     if (modBase == 0) return;
 
-    // FactionManager = instancia embebida en .data (GameWorld@+0x2134110, factionMgr@+0x21345B8).
-    uintptr_t factionMgr = modBase + 0x21345B8;
+    // FactionManager: modBase+0x21345B8 (GameWorld@+0x2134110 + 0x4A8) es un PUNTERO GLOBAL en .data
+    // a un lektor<Faction*> (RTTI confirmado en vivo), NO la estructura embebida — hace falta un deref.
+    // Mismo patrón que theFactory (offset vecino, -0x08). Verificado en vivo 2026-07-13: sin el deref,
+    // count@+0x08 leía un objeto "navmesh" adyacente en .data (basura, rechazada por count>4096) → n=0
+    // SIEMPRE, Nameless nunca se resolvía. Con el deref: count=105, array real de Faction* válidos.
+    uintptr_t factionMgr = 0;
+    if (!Memory::Read(modBase + 0x21345B8, factionMgr) || factionMgr == 0) return; // lektor aún no listo
 
     // Recolectamos (Faction*, GameData*) bajo SEH; comparamos stringID fuera del __try.
     constexpr int kMax = 512;
@@ -5760,7 +7120,17 @@ static void ResolveNamelessFactionOnce(uintptr_t modBase) {
     static uintptr_t gds[kMax];
     int n = 0;
     SEH_CollectFactionGameDatas(factionMgr, facs, gds, &n, kMax);
-    if (n == 0) return;  // FactionManager aún no poblado → reintentar en el próximo tick
+    if (n == 0) {
+        // (c) Log THROTTLED: antes este retorno era 100% silencioso.
+        static int s_namelessEmptyTicks = 0;
+        ++s_namelessEmptyTicks;
+        if (s_namelessEmptyTicks == 1 || s_namelessEmptyTicks % 1800 == 0) {
+            spdlog::info("[FIX-HOSTILITY-HOOK] ResolveNamelessFactionOnce: FactionManager "
+                         "(modBase+0x21345B8) devuelve n=0 facciones — aún no poblado, "
+                         "reintentando cada tick (tick #{})", s_namelessEmptyTicks);
+        }
+        return;  // FactionManager aún no poblado → reintentar en el próximo tick
+    }
 
     uintptr_t namelessFaction = 0;
     for (int i = 0; i < n; ++i) {
@@ -5774,6 +7144,10 @@ static void ResolveNamelessFactionOnce(uintptr_t modBase) {
         uintptr_t nfr = SEH_GetFactionRelationsWithEntries(namelessFaction, &hasEntries);
         if (nfr != 0 && hasEntries) {
             s_cachedNamelessFR.store(nfr, std::memory_order_release);
+            // [FIX-ENEMY-HOOK] Opción A: cachear también el Faction* de Nameless. El hook de isEnemy
+            //   sustituirá con este puntero el 'other' cuando un NPC pregunte si el host es su enemigo,
+            //   heredando así la hostilidad REAL que el NPC ya tiene hacia la facción vanilla del jugador.
+            s_cachedNamelessFaction.store(namelessFaction, std::memory_order_release);
             s_namelessResolveState.store(1, std::memory_order_release);  // hallada y útil
             spdlog::info("[FIX-HOSTILITY-HOOK] Nameless (204-gamedata.base) RESUELTA: faction=0x{:X} "
                          "FR=0x{:X} (con relaciones) → Opción A: el host hereda sus relaciones reales.",
@@ -5790,6 +7164,18 @@ static void ResolveNamelessFactionOnce(uintptr_t modBase) {
         spdlog::info("[FIX-HOSTILITY-HOOK] Nameless (204-gamedata.base) NO existe en el FactionManager "
                      "({} facciones) → Opción C (clasificar por fundamentalType).", n);
     }
+}
+
+// Purga los 3 statics de Nameless para que ResolveNamelessFactionOnce se re-arme desde cero tras
+// disconnect/recarga de save. SIN esto: el motor libera/recrea las facciones al cargar un save nuevo,
+// pero s_namelessResolveState se queda en 1 (permanente, nadie lo resetea) y s_cachedNamelessFaction/
+// FR siguen apuntando a memoria reciclada — los hooks isAlly/isEnemy seguirían "sustituyendo por
+// Nameless" contra punteros liberados, con el log diciendo que todo va bien. Mismo patrón que los
+// otros 7 Reset*Fix() de este fichero (idempotente, se re-resuelve solo en el siguiente tick).
+void ResetNamelessResolve() {
+    s_namelessResolveState.store(0, std::memory_order_release);
+    s_cachedNamelessFaction.store(0, std::memory_order_release);
+    s_cachedNamelessFR.store(0, std::memory_order_release);
 }
 
 // Lee el fundamentalType de una facción (Faction+0x34) bajo SEH. Devuelve -1 si no legible.
@@ -5914,6 +7300,141 @@ static void RefreshHostFactionCache(uintptr_t hostFaction) {
         s_cachedHostFR.store(fr, std::memory_order_release);
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════
+//  [FIX-HOSTREL] Corrección de relaciones de facción CORRUPTAS del host (Fase 4 — 2026-07-13)
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PROBLEMA (RE en vivo, dry-run de SOLO LECTURA confirmado 2026-07-13, confianza ALTA):
+//   NINGÚN NPC contraataca al host ("todos huyen") pese a que el host YA tiene la facción Nameless
+//   real. La FactionRelations de esa Nameless (que el host COMPARTE — es el MISMO objeto, no un clon
+//   aparte) arrastra 105 relaciones EXPLÍCITAS heredadas de un clon corrupto: 37 de ellas deberían
+//   ser hostiles (-100) pero están puestas a 0.00 / -10 (neutral). Esas entries explícitas ANULAN el
+//   defaultRelation=-100 (FR+0x60), que sí está bien: getRelationData devuelve un nodo NO-null → se
+//   lee la relación explícita neutral → el NPC no ve al host como enemigo → no contraataca.
+//
+// SOLUCIÓN: pasada one-shot re-armable que recorre el boost::unordered_map de la FactionRelations
+//   del host (la MISMA que Nameless) y reescribe a -100 las relaciones que DEBEN ser hostiles
+//   (bandidos/esclavistas + fauna salvaje real) y que ahora están en neutral (rel > -30).
+//
+// LAYOUT (verificado en vivo 2026-07-13 — ⚠ 'relation' va en node+0x1C, NO node+0xC como decía una
+//   nota antigua):
+//   FactionRelations:  bucket_count@FR+0x38, buckets(Node**)@FR+0x58, defaultRelation(float)@FR+0x60,
+//                      element_count@FR+0x40, ownerFaction@FR+0x8.
+//   Nodo boost::unordered_map<Faction*, RelationData>:
+//     next@node+0x0 (⚠ boost comparte UNA cadena 'next' GLOBAL entre TODOS los buckets → hay que
+//                    deduplicar por dirección de nodo; si no, se cuenta el mismo nodo miles de veces),
+//     key(Faction*)@node+0x10, RelationData@node+0x18 = { alliance(bool)@+0x0, relation(float)@+0x4 }
+//     → relation absoluto = node+0x1C.
+//   Faction:  fundamentalNPCType(int)@+0x34, _antiSlavery(bool)@+0x8, notARealFaction(bool)@+0x1D0,
+//             GameData*@+0x240;  GameData: stringID(std::string)@+0x58.
+//
+// SEGURIDAD / por qué NO hay un __try propio envolviendo el bucle: cada acceso ya va por
+//   Memory::Read/Memory::Write (individualmente bajo SEH — ver memory.h) y ReadKenshiString también
+//   es SEH interno (SSO/heap); GateIsHeap descarta punteros basura. Un __try externo sería redundante
+//   Y, además, mezclarlo con el std::unordered_set 'visited' (objeto con destructor) en la MISMA
+//   función dispara C2712 en MSVC ("cannot use __try in functions that require object unwinding" — la
+//   misma restricción documentada en SEH_ShutdownStep). El guard 'visited' + el límite de 5000 saltos
+//   por bucket cortan cualquier ciclo de la cadena 'next' compartida de boost.
+// HILO: corre en el HILO DE LÓGICA (game thread), llamado desde OnGameTick — NUNCA desde el de red.
+
+// Tipo fundamental "sin tipo" (Faction+0x34). kOT_SLAVER(7)/kOT_BANDIT(8) ya definidos arriba.
+static constexpr int kOT_NONE = 0;
+
+// ¿Esta facción DEBE ser hostil al host? Criterio verificado (37 correcciones exactas, 0 falsos
+// positivos en el dry-run): bandido/esclavista → sí; "sin tipo" pero facción-no-real y NO
+// anti-esclavista y con GameData stringID != "nofac" (= fauna salvaje real) → sí; resto → no.
+static bool ShouldBeHostile(uintptr_t faction) {   // faction = Faction*
+    int32_t type = 0;
+    if (!Memory::Read(faction + 0x34, type)) return false;
+    if (type == kOT_BANDIT || type == kOT_SLAVER) return true;
+    if (type == kOT_NONE) {
+        uint8_t notReal = 0, antiSlav = 0;
+        Memory::Read(faction + 0x1D0, notReal);   // notARealFaction
+        Memory::Read(faction + 0x8, antiSlav);    // _antiSlavery
+        if (notReal != 0 && antiSlav == 0) {
+            uintptr_t gd = 0;
+            if (Memory::Read(faction + 0x240, gd) && gd != 0) {
+                // ReadKenshiString es SEH interno; reutiliza el helper ya existente del proyecto.
+                // "nofac" = placeholder de facción sin GameData de fauna → NO es fauna salvaje real.
+                std::string sid = SpawnManager::ReadKenshiString(gd + 0x58);
+                if (sid != "nofac") return true;  // fauna salvaje real → hostil
+            }
+        }
+    }
+    return false;
+}
+
+// Recorre el boost::unordered_map de la FactionRelations del host y reescribe a -100 las relaciones
+// que DEBEN ser hostiles y siguen en neutral (rel > -30). hostFR = s_cachedHostFR (ya resuelto y
+// cacheado por el FIX-HOSTILITY cada tick; aquí SOLO se REUTILIZA, no se resuelve la cadena de nuevo).
+// Devuelve el nº de relaciones corregidas.
+static int FixHostFactionRelations(uintptr_t hostFR) {
+    if (!GateIsHeap(hostFR)) return 0;
+    uint64_t bucketCount = 0;
+    uintptr_t buckets = 0;
+    if (!Memory::Read(hostFR + 0x38, bucketCount) || bucketCount == 0 || bucketCount > 100000) return 0;
+    if (!Memory::Read(hostFR + 0x58, buckets) || !GateIsHeap(buckets)) return 0;
+
+    std::unordered_set<uintptr_t> visited;  // dedup por dirección de nodo (cadena 'next' compartida)
+    int fixed = 0;
+    for (uint64_t i = 0; i < bucketCount; ++i) {
+        uintptr_t node = 0;
+        if (!Memory::Read(buckets + i * 8, node)) continue;
+        // guard<5000: corta cualquier ciclo/cadena anómala; visited: no re-contar nodos compartidos.
+        for (int guard = 0; node != 0 && guard < 5000; ++guard) {
+            if (!GateIsHeap(node)) break;               // node desalineado/fuera de rango → no dereferenciar
+            if (!visited.insert(node).second) break;   // nodo ya recorrido → fin de esta cadena
+            uintptr_t target = 0;
+            float rel = 0.0f;
+            if (Memory::Read(node + 0x10, target) && GateIsHeap(target) &&
+                Memory::Read(node + 0x1C, rel) && rel > -30.0f && ShouldBeHostile(target)) {
+                if (Memory::Write(node + 0x1C, -100.0f)) fixed++;   // neutral corrupta → hostil real
+            }
+            uintptr_t next = 0;
+            if (!Memory::Read(node + 0x0, next)) break;
+            node = next;
+        }
+    }
+    return fixed;
+}
+
+// ── Estado one-shot re-armable del [FIX-HOSTREL] (mismo patrón que ResetHostSimSeedFix) ──
+// Se aplica UNA vez por carga (cuando corrige >0 relaciones) y se re-arma en disconnect/recarga por
+// si el motor recarga las relaciones al cargar un save. Throttle ~1s como red de seguridad.
+static std::atomic<bool> s_hostRelFixed{false};
+static int  s_hostRelAttempts = 0;
+static auto s_lastHostRelTry = std::chrono::steady_clock::now();
+static constexpr int HOST_REL_MAX_ATTEMPTS = 240; // ~varios segundos de reintentos hasta que hostFR exista
+
+void ResetHostFactionRelationsFix() {
+    s_hostRelFixed.store(false);
+    s_hostRelAttempts = 0;
+    s_lastHostRelTry = std::chrono::steady_clock::now();
+}
+
+// Orquesta el fix: REUTILIZA s_cachedHostFR (FactionRelations* del host, cacheado por el
+// FIX-HOSTILITY — NO se resuelve la cadena aquí). One-shot re-armable + throttle ~1s. Solo host.
+// Llamado desde OnGameTick (ambas ramas), en el HILO DE LÓGICA.
+static void FixHostFactionRelationsTick(Core& core) {
+    (void)core;                                                 // firma homogénea con los demás Seed*Tick
+    if (s_hostRelFixed.load()) return;                          // ya sembrado esta carga
+    if (s_hostRelAttempts >= HOST_REL_MAX_ATTEMPTS) return;     // nos rendimos (hostFR nunca llegó)
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastHostRelTry < std::chrono::milliseconds(1000)) return; // red de seguridad, no cada frame
+    s_lastHostRelTry = now;
+    s_hostRelAttempts++;
+
+    uintptr_t hostFR = s_cachedHostFR.load(std::memory_order_acquire);
+    if (hostFR == 0) return;  // el FIX-HOSTILITY aún no resolvió la facción del host → reintentar
+
+    int fixed = FixHostFactionRelations(hostFR);
+    if (fixed > 0) {
+        spdlog::info("[FIX-HOSTREL] corregidas {} relaciones de facción a -100 (esperado ~37)", fixed);
+        s_hostRelFixed.store(true);   // one-shot: latch tras corregir al menos una relación
+    }
+    // fixed==0: hostFR recién cacheado / entries aún no legibles → se reintenta en el próximo throttle.
+}
+
 // Instala el hook del gate de combate (una vez). Se llama desde OnGameTick tras tener modBase.
 static void InstallCombatGateHookOnce(uintptr_t modBase) {
     if (s_combatGateInstalled.load(std::memory_order_acquire)) return;
@@ -5933,6 +7454,550 @@ static void InstallCombatGateHookOnce(uintptr_t modBase) {
         spdlog::warn("[FIX-HOSTILITY-HOOK] FALLO al instalar el hook del gate de combate en 0x{:X} "
                      "(RVA 0x6B2630). El combate seguirá dependiendo solo del defaultRelation.", gateAddr);
         s_combatGateInstalled.store(true, std::memory_order_release); // no reintentar en bucle
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+//  FIX-ENEMY-HOOK (2026-07-12) — hook de isEnemy (RVA 0x6B26D0 + COMDAT gemela 0x6B25D0)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// ESPEJO del FIX-HOSTILITY-HOOK (isAlly, 0x6B2630), pero en la DIRECCIÓN CONTRARIA. Confirmado EN
+//   VIVO (Cheat Engine + x64dbg sobre el proceso real, 2026-07-12): ningún NPC contraataca al host
+//   aunque reciba daño real — solo huyen. El hook de isAlly SOLO cubre "el host pregunta si X es su
+//   aliado" (thisFR == hostFR). La dirección OPUESTA — "un NPC pregunta si el HOST es SU enemigo" —
+//   la resuelve isEnemy (0x6B26D0 y su copia COMDAT idéntica 0x6B25D0, AMBAS sin hookear), que lee
+//   datos nativos ROTOS: la facción del host es un CLON ('Player 1'/'Sinnombre') con 105 relaciones
+//   explícitas a 0.00, así que ningún NPC calcula suficiente hostilidad hacia el host para atacar.
+//
+// Lógica nativa confirmada de isEnemy(FactionRelations* this, Faction* other):
+//     if other == null                    -> FALSE
+//     if other == this->owner (FR+0x08)   -> FALSE                 // misma facción
+//     rel = this->getRelationData(other) (vtbl+0x50) o this->defaultRelation (FR+0x60)
+//     return (-30.0f >= rel)                                       // umbral de hostilidad (.rdata)
+//
+// CURA (SUSTITUCIÓN, igual filosofía que isAlly Opción A — NO forzamos un valor fijo):
+//   Cuando un NPC cualquiera (thisFR != hostFR) pregunta si el HOST (other == hostFaction) es su
+//   enemigo, llamamos al ORIGINAL con 'other' SUSTITUIDO por la facción VANILLA del jugador
+//   (Nameless, 204-gamedata.base). Así el NPC hereda la hostilidad/relación REAL que ya tiene hacia
+//   la facción del jugador de siempre, en vez de la basura del clon. thisFR (la facción del NPC,
+//   real) NO se toca. Si Nameless aún no está resuelto → delegamos sin tocar (fallback seguro: a
+//   diferencia de isAlly NO hay una Opción C fiable para "quién debería considerarme enemigo", así
+//   que sin Nameless preferimos un no-op a un valor inventado).
+//
+// DOS DIRECCIONES COMDAT: isEnemy vive en 0x6B26D0 y en una copia idéntica 0x6B25D0. Se hookean
+//   AMBAS con DOS trampolines separados (los trampolines de MinHook son específicos de cada
+//   dirección; NO se puede compartir un único puntero de original). La lógica de decisión está
+//   factorizada en EnemyGateBody(); cada detour (A/B) solo aporta SU propio trampolín.
+//
+// REENTRANCIA (seguro): al llamar al original con (thisFR, namelessFaction), thisFR sigue siendo la
+//   facción del NPC (!= hostFR) y other pasa a ser Nameless (!= hostFaction) → si re-entrara en
+//   cualquier detour caería en el FAST-PATH (other != hostFaction) y delegaría. El cuerpo nativo de
+//   isEnemy llama a getRelationData (vtbl+0x50), no hookeado → sin recursión.
+// THREAD-SAFETY: corre en el hilo de lógica (mismo que isAlly). host/Nameless se leen de atomics ya
+//   poblados por el FIX-HOSTILITY-HOOK. Todo el detour va bajo SEH: ante fallo, fallback = original.
+// NOTA: reutiliza CombatGateFn (bool __fastcall(FactionRelations*, Faction*)) — misma firma que isEnemy.
+
+static CombatGateFn        s_origEnemyGateA = nullptr;  // trampolín MinHook de 0x6B26D0 (isEnemy)
+static CombatGateFn        s_origEnemyGateB = nullptr;  // trampolín MinHook de 0x6B25D0 (COMDAT gemela)
+static std::atomic<bool>   s_enemyGateInstalled{false};
+// Contadores de diagnóstico (logueo throttled, sin spamear el hot-path).
+static std::atomic<int>     s_enemyGateInterceptCalls{0};  // nº de llamadas donde intervenimos (other==host)
+static std::atomic<int>     s_enemyGateHostileVerdicts{0}; // nº de veredictos isEnemy=TRUE (el NPC ataca)
+
+// Llama al original bajo SEH usando el trampolín pasado (cada dirección COMDAT tiene el suyo).
+static bool SEH_CallEnemyOrig(CombatGateFn origFn, uintptr_t thisFR, uintptr_t other) {
+    if (origFn == nullptr) return false;
+    __try {
+        return origFn(thisFR, other);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Núcleo de decisión del detour de isEnemy, bajo SEH (POD puro, sin objetos C++ en el __try).
+// Semántica isEnemy: TRUE = ENEMIGO (el NPC atacará al host); FALSE = no-enemigo.
+// Códigos de retorno:
+//   1 = VEREDICTO DIRECTO ENEMIGO (TRUE): (a) Vía A (2026-07-13): la facción del NPC (owner de thisFR)
+//       es de tipo hostil por diseño (bandido/esclavista/fauna real, criterio ShouldBeHostile); o
+//       (b) ESPEJO host->npc (FIX-HOSTREL-MIRROR, 2026-07-14): el HOST (thisFR==hostFR) pregunta por un
+//       npc 'other' que ShouldBeHostile → el host lo ve enemigo. Ambos comparten este mismo retorno.
+//   2 = DELEGAR al original tal cual (thisFR, other) — no intervenimos.
+//   3 = SUSTITUIR: evaluar el original con other = Nameless (thisFR intacto) — la cura.
+static int SEH_DecideEnemyGate(uintptr_t thisFR, uintptr_t other, uintptr_t hostFaction,
+                               uintptr_t hostFR, uintptr_t namelessFaction, int* outMode) {
+    // outMode (diag): 0=fast-path(no nos toca) 1=sustitución(Nameless) 2=sin-Nameless(delegado)
+    //                 3=tipo-hostil(Vía A: bandido/esclavista/fauna → enemigo directo)
+    //                 4=espejo host->npc (FIX-HOSTREL-MIRROR: el host ve enemigo a un npc hostil)
+    *outMode = 0;
+    __try {
+        // (0) ESPEJO host->npc — [FIX-HOSTREL-MIRROR] (2026-07-14). Es el ESPEJO de la Vía A (paso 3):
+        //   allí un NPC de tipo hostil ve enemigo al host; AQUÍ, cuando quien pregunta es el propio
+        //   HOST (thisFR == hostFR, una facción de jugador "Player N"/Nameless) sobre un NPC 'other'
+        //   que DEBE ser hostil por diseño (ShouldBeHostile: bandido/esclavista/fauna real), forzamos
+        //   ENEMIGO. Causa raíz confirmada esta noche: isEnemy(host->npc) devolvía NEUTRAL porque esos
+        //   NPC de mundo tienen una entrada NEUTRAL EXPLÍCITA en el boost::unordered_map de relaciones
+        //   del host que ANULA el defaultRelation=-100 ya corregido → el host nunca los clasificaba
+        //   como enemigos ("ataque en frío"). Va ANTES del fast-path (paso 1) A PROPÓSITO: ese delega
+        //   cualquier 'other' != hostFaction, y aquí 'other' ES el npc (!= hostFaction), justo el caso
+        //   que el fast-path descartaría. Reutiliza ShouldBeHostile TAL CUAL (sin relajar el criterio)
+        //   para NO volver hostiles aliados ni facciones neutrales legítimas. Igual que la Vía A, solo
+        //   SUSTITUYE LA RESPUESTA: no escribe memoria de relaciones en esta dirección.
+        //   Guards: other != 0 (no-null), other != hostFaction (no preguntar sobre uno mismo),
+        //   GateIsHeap(other) (Faction* válida en heap, no basura).
+        if (thisFR == hostFR && other != 0 && other != hostFaction &&
+            GateIsHeap(other) && ShouldBeHostile(other)) {
+            *outMode = 4;
+            return 1;   // ENEMIGO directo (TRUE) → el host ve hostil al NPC (mismo retorno que Vía A)
+        }
+
+        // (1) FAST-PATH (cubre el 99% de llamadas): solo nos interesa cuando alguien pregunta
+        //   específicamente si el HOST es su enemigo. Cualquier otro 'other' → delegar sin tocar.
+        if (other == 0 || other != hostFaction) { *outMode = 0; return 2; }
+
+        // (2) El propio host preguntándose por sí mismo (thisFR == hostFR): el check nativo
+        //   other == this->owner ya devuelve FALSE correctamente → no hace falta intervenir.
+        if (thisFR == hostFR) { *outMode = 0; return 2; }
+
+        // (3) VÍA A — VEREDICTO DIRECTO POR TIPO DE FACCIÓN (causa raíz confirmada EN VIVO 2026-07-13,
+        //   Cheat Engine + x64dbg, no es hipótesis): la SUSTITUCIÓN (paso 4) solo arregla el caso en el
+        //   que el NPC HEREDA por Nameless una relación ya hostil; NO cubre el caso genérico en el que
+        //   la facción del NPC, POR SU PROPIO TIPO, debería ver hostil al host aunque su tabla de
+        //   relaciones diga neutral. Verificado en vivo: Dust Bandits->host=-10.0 y Esclavistas->host=
+        //   0.00 (sus PROPIOS defaultRelation, leídos del FactionRelations de la facción del NPC),
+        //   ambos por encima del umbral de enemigo (-30) → el NPC nunca clasificaba al host como
+        //   enemigo y nunca iniciaba Task de combate. Aquí: si la facción DUEÑA de thisFR (el NPC que
+        //   pregunta) es de tipo hostil por diseño (bandido/esclavista, o fauna salvaje real) según el
+        //   MISMO criterio que [FIX-HOSTREL] (reutilizamos ShouldBeHostile, sin duplicar la lógica de
+        //   clasificación) Y quien pregunta es por el HOST (other == hostFaction), forzamos ENEMIGO.
+        //   SUSTITUCIÓN de la RESPUESTA únicamente: NO se escribe memoria de relaciones en esta
+        //   dirección (a diferencia de [FIX-HOSTREL], que sí reescribe la dirección host->npc); así no
+        //   interferimos con eventos de reputación nativos del motor para la dirección npc->host.
+        //   CAVEAT (no bloqueante): la fauna salvaje NO se verificó en vivo con esta evidencia exacta
+        //   (solo bandidos y esclavistas); el mecanismo debería ser idéntico por diseño (mismo
+        //   ShouldBeHostile), pero queda pendiente de confirmar con el próximo test en vivo.
+        //   npcFaction = ownerFaction del FactionRelations que pregunta (thisFR + 0x8; layout
+        //   confirmado en [FIX-HOSTREL] y por el check nativo `other == this->owner`).
+        {
+            uintptr_t npcFaction = 0;   // Faction* dueña de thisFR (POD, seguro dentro del __try)
+            if (Memory::Read(thisFR + 0x8, npcFaction) && GateIsHeap(npcFaction) &&
+                ShouldBeHostile(npcFaction)) {
+                *outMode = 3;
+                return 1;   // ENEMIGO directo (TRUE) → el NPC contraataca al host
+            }
+        }
+
+        // (4) SUSTITUCIÓN (la cura): un NPC cualquiera pregunta por el host. Si Nameless está
+        //   resuelto, sustituir 'other' por la facción vanilla del jugador → hereda la hostilidad real.
+        //   Guard != hostFaction (defensa en profundidad, simetría con isAlly:6111): por diseño de
+        //   ResolveNamelessFactionOnce esto nunca coincide (Nameless se busca por stringID distinto
+        //   al del clon del host), pero evita re-sustituir por el propio host si algún día cambiara.
+        if (namelessFaction != 0 && namelessFaction != hostFaction) { *outMode = 1; return 3; }
+
+        // (5) Nameless aún no resuelto → fallback seguro: delegar sin tocar (mejor no-op que inventar).
+        *outMode = 2;
+        return 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outMode = 0;
+        return 2;  // ante fallo, delegar al original (vanilla)
+    }
+}
+
+// Cuerpo COMÚN de los detours A/B. 'origFn' es el trampolín de la dirección que disparó (cada
+// COMDAT tiene el suyo); 'which' es solo etiqueta de log ('A'=0x6B26D0, 'B'=0x6B25D0).
+static bool EnemyGateBody(uintptr_t thisFR, uintptr_t other, CombatGateFn origFn, char which) {
+    // Cache del host (resuelto por el FIX-HOSTILITY-HOOK; aquí solo se LEE, atómico).
+    uintptr_t hostFaction = s_cachedHostFaction.load(std::memory_order_acquire);
+
+    // Si el cache del host aún no está listo, delegamos sin alterar nada (arranque/transición).
+    if (hostFaction == 0) return SEH_CallEnemyOrig(origFn, thisFR, other);
+
+    uintptr_t hostFR          = s_cachedHostFR.load(std::memory_order_acquire);
+    uintptr_t namelessFaction = s_cachedNamelessFaction.load(std::memory_order_acquire);
+
+    int mode = 0;
+    int decision = SEH_DecideEnemyGate(thisFR, other, hostFaction, hostFR, namelessFaction, &mode);
+
+    // 'result' ES el retorno de isEnemy: TRUE = ENEMIGO (el NPC ATACA al host), FALSE = no-enemigo.
+    bool result;
+    if (decision == 1) {
+        // VÍA A: veredicto directo ENEMIGO por tipo de facción del NPC (bandido/esclavista/fauna).
+        //   Solo SUSTITUIMOS LA RESPUESTA — no llamamos al original ni tocamos memoria del juego
+        //   (misma filosofía que el resto del sistema isEnemy/isAlly: nunca escritura directa aquí).
+        result = true;
+    } else if (decision == 3) {
+        // SUSTITUCIÓN: 'other' pasa a ser la facción vanilla Nameless; thisFR (facción real del NPC)
+        //   intacto. Re-entra en el original con other != hostFaction → sin recursión al detour.
+        result = SEH_CallEnemyOrig(origFn, thisFR, namelessFaction);
+    } else {
+        result = SEH_CallEnemyOrig(origFn, thisFR, other);  // delegar tal cual
+    }
+
+    // Diagnóstico throttled: solo cuando intervenimos sobre el host (mode != 0), primeros 8 + cada 200.
+    if (mode != 0) {
+        int c = s_enemyGateInterceptCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        // Contamos veredictos de ATAQUE (enemigo = el NPC atacará al host) — métrica del fix.
+        if (result) s_enemyGateHostileVerdicts.fetch_add(1, std::memory_order_relaxed);
+        if (c <= 8 || (c % 200) == 0) {
+            if (mode == 4) {
+                // ESPEJO host->npc: aquí 'thisFR' es el HOST y 'other' es el NPC al que ahora ve hostil.
+                //   Log con prefijo propio [FIX-HOSTREL-MIRROR] para distinguirlo de la dirección npc->host.
+                spdlog::info("[FIX-HOSTREL-MIRROR] gate(isEnemy)[{}] HOST(thisFR)=0x{:X} pregunta por "
+                             "npc(other)=0x{:X} (ShouldBeHostile) => forzado ENEMIGO (el host ve hostil "
+                             "al NPC) [intercepts={}]", which, thisFR, other, c);
+            } else {
+                const char* modeStr = (mode == 1) ? "sustitucion-Nameless" :
+                                      (mode == 3) ? "tipo-hostil-ViaA(bandido/esclavista/fauna)" :
+                                                    "sin-Nameless(delegado)";
+                // VERIFICACIÓN: con el fix, un bandido preguntando por el host debe loguear isEnemy=TRUE
+                //   (=> el NPC ATACA), heredado de la hostilidad real de Nameless hacia bandidos.
+                spdlog::info("[FIX-ENEMY-HOOK] gate(isEnemy)[{}] NPC(thisFR)=0x{:X} other=0x{:X}{} modo={} "
+                             "isEnemy={} => NPC {} al host [intercepts={}]",
+                             which, thisFR, other,
+                             (mode == 1) ? " (sustituido->Nameless)" : "",
+                             modeStr, result ? "ENEMIGO" : "NO-ENEMIGO",
+                             result ? "ATACA" : "no-ataca", c);
+            }
+        }
+    }
+    return result;
+}
+
+// ── DETOURS de isEnemy — uno por dirección COMDAT, cada uno con SU propio trampolín ──
+// bool __fastcall isEnemy(FactionRelations* this, Faction* other)
+static bool __fastcall Hook_EnemyGateA(uintptr_t thisFR, uintptr_t other) {  // 0x6B26D0
+    return EnemyGateBody(thisFR, other, s_origEnemyGateA, 'A');
+}
+static bool __fastcall Hook_EnemyGateB(uintptr_t thisFR, uintptr_t other) {  // 0x6B25D0 (COMDAT gemela)
+    return EnemyGateBody(thisFR, other, s_origEnemyGateB, 'B');
+}
+
+// Instala el hook de isEnemy en AMBAS direcciones COMDAT (una vez). Se llama desde OnGameTick, al
+// lado de InstallCombatGateHookOnce. Cada dirección usa un nombre y un trampolín distintos.
+static void InstallEnemyGateHookOnce(uintptr_t modBase) {
+    if (s_enemyGateInstalled.load(std::memory_order_acquire)) return;
+    if (modBase == 0) return;
+    // RVAs confirmados EN VIVO (2026-07-12): isEnemy = 0x6B26D0 y su copia COMDAT idéntica 0x6B25D0.
+    uintptr_t addrA = modBase + 0x6B26D0;  // isEnemy principal
+    uintptr_t addrB = modBase + 0x6B25D0;  // copia COMDAT idéntica (mismo cuerpo, otra dirección)
+    bool okA = HookManager::Get().InstallAt("EnemyGateA", addrA, &Hook_EnemyGateA, &s_origEnemyGateA);
+    bool okB = HookManager::Get().InstallAt("EnemyGateB", addrB, &Hook_EnemyGateB, &s_origEnemyGateB);
+    // Enable() defensivo: si el prólogo resultara ser 'mov rax,rsp', InstallAt lo dejaría en bypass
+    // (passthrough) esperando un Enable() explícito que si no, nunca llegaría. El hermano isAlly
+    // (0x6B2630) no lo necesita (prólogo estándar confirmado), pero isEnemy no se ha verificado a
+    // nivel de bytes — Enable() sobre un hook ya activo es idempotente (no-op seguro).
+    if (okA) HookManager::Get().Enable("EnemyGateA");
+    if (okB) HookManager::Get().Enable("EnemyGateB");
+    if (okA || okB) {
+        spdlog::info("[FIX-ENEMY-HOOK] hook de isEnemy INSTALADO (A@0x{:X}={}, B@0x{:X}={}). Cuando un "
+                     "NPC pregunte si el host es su enemigo, hereda la hostilidad real de Nameless.",
+                     addrA, okA ? "ok" : "FALLO", addrB, okB ? "ok" : "FALLO");
+    } else {
+        spdlog::warn("[FIX-ENEMY-HOOK] FALLO al instalar AMBAS direcciones de isEnemy (A@0x{:X}, "
+                     "B@0x{:X}). Los NPC seguirán sin contraatacar al host (solo huyen).", addrA, addrB);
+    }
+    s_enemyGateInstalled.store(true, std::memory_order_release); // no reintentar en bucle
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+//  DIAG-BEDREQ (2026-07-13) — hook de DIAGNÓSTICO en TaskData::_isRequirementsComplete
+// ══════════════════════════════════════════════════════════════════════════════════════
+// OBJETIVO: capturar EN VIVO qué requisito GOAP falla realmente cuando el host intenta
+//   dormir/levantarse. La RE estática ya identificó los requisitos exactos de cada Task de
+//   cama (evidencia de bytes), pero faltaba el dato definitivo: cuál FALLA en runtime. Este
+//   hook lo registra sin poner breakpoints (el juego está en uso).
+//
+// 100% OBSERVACIONAL — CERO cambio de comportamiento:
+//   - Llama al original PRIMERO con los MISMOS argumentos (incluido el MISMO puntero
+//     failedOn del caller, para que el original escriba el out-param REAL tal cual).
+//   - Captura su retorno (bool complete) y lee failedOn DESPUÉS (solo lectura).
+//   - Devuelve EXACTAMENTE el retorno del original; NO altera el out-param.
+//   - Todo el detour va bajo SEH, igual que el resto del módulo.
+//
+// Requisitos GOAP de cama (RE 2026-07-13, evidencia de bytes):
+//   - USE_BED(0x62) / USE_BED_ORDER(0x102): ALARMS_IN_THE_VICINITY=0,
+//     MACHINE_HAS_FREE_OPERATOR_SLOT=1, HAS_ANYTHING_EQUIPPED=0, IS_CARRYING_SOMETHING=0,
+//     AT_LOCATION=1.
+//   - GET_OUT_OF_BED(0x74) / GET_UP_STAND_UP(0x41): solo CAN_GET_UP=1.
+//
+// Firma (KenshiLib, confirmada):
+//   bool __fastcall(TaskData* this, AI* ai, hand& target, Vector3& location,
+//                   /*stack*/ hand& subTarget, bool autoTargetFinder, StateType& failedOn)
+//   Las referencias (hand&/Vector3&/StateType&) son punteros en el ABI x64 → void* en el
+//   typedef (el compilador coloca subTarget/autoTargetFinder/failedOn en la pila
+//   automáticamente al declarar los 7 parámetros; el detour y la llamada al trampolín usan
+//   la misma convención, así que no hace falta ensamblar el paso por pila a mano).
+//   this->key (TaskType) en TaskData+0x44 (RE 2026-07-13); se lee como int32 porque
+//   0x102=258 no cabe en un byte. Prólogo estándar (48 89 5C 24 10 = mov [rsp+10],rbx;
+//   NO mov rax,rsp) → MinHook normal, sin fix MovRaxRsp (verificado: AOB único en .text).
+using IsReqCompleteFn = bool(__fastcall*)(void* thisTask, void* ai, void* target,
+                                          void* location, void* subTarget,
+                                          bool autoTargetFinder, void* failedOn);
+static IsReqCompleteFn   s_origBedReq = nullptr;      // trampolín MinHook (cuerpo original)
+static std::atomic<bool> s_bedReqInstalled{false};
+static std::atomic<int>  s_bedReqFailCount{0};        // nº de fallos de requisito de cama logueados
+
+// TaskTypes de cama (KenshiLib TaskType enum) — SOLO estos disparan el log de diagnóstico.
+static constexpr int kTT_USE_BED        = 0x62;   // 98  — meterse en la cama
+static constexpr int kTT_USE_BED_ORDER  = 0x102;  // 258 — orden de usar cama
+static constexpr int kTT_GET_OUT_OF_BED = 0x74;   // 116 — salir de la cama
+static constexpr int kTT_GET_UP_STAND   = 0x41;   // 65  — levantarse / ponerse de pie
+
+// Nombre legible del TaskType de cama (para el log). "?" si no es de cama.
+static const char* BedTaskName(int key) {
+    switch (key) {
+        case kTT_USE_BED:        return "USE_BED";
+        case kTT_USE_BED_ORDER:  return "USE_BED_ORDER";
+        case kTT_GET_OUT_OF_BED: return "GET_OUT_OF_BED";
+        case kTT_GET_UP_STAND:   return "GET_UP_STAND_UP";
+        default:                 return "?";
+    }
+}
+// ¿Es una de las 4 Tasks de cama que nos interesan?
+static inline bool IsBedTask(int key) {
+    return key == kTT_USE_BED || key == kTT_USE_BED_ORDER ||
+           key == kTT_GET_OUT_OF_BED || key == kTT_GET_UP_STAND;
+}
+
+// Llama al original bajo SEH con los 7 args idénticos. *ok=false si el trampolín petó.
+// POD puro dentro del __try (sin objetos C++) para no romper el desenrollado de excepciones.
+static bool SEH_CallBedReq(void* thisTask, void* ai, void* target, void* location,
+                           void* subTarget, bool autoTargetFinder, void* failedOn, bool* ok) {
+    if (s_origBedReq == nullptr) { *ok = false; return false; }
+    __try {
+        bool r = s_origBedReq(thisTask, ai, target, location, subTarget, autoTargetFinder, failedOn);
+        *ok = true;
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *ok = false;
+        return false;
+    }
+}
+
+// ── DETOUR de TaskData::_isRequirementsComplete (SOLO LOG, NO modifica nada) ──
+// Corre en el HILO DE LÓGICA (AI tick), el mismo que los gate hooks de combate — por eso
+// spdlog::info directo aquí es seguro (mismo patrón que Hook_CombatGate, detour MinHook normal).
+static bool __fastcall Hook_BedReq(void* thisTask, void* ai, void* target, void* location,
+                                   void* subTarget, bool autoTargetFinder, void* failedOn) {
+    // (1) Llama al original PRIMERO con los MISMOS args (mismo puntero failedOn del caller):
+    //     el original escribe el out-param real tal cual — no lo tocamos.
+    bool ok = false;
+    bool complete = SEH_CallBedReq(thisTask, ai, target, location, subTarget,
+                                   autoTargetFinder, failedOn, &ok);
+
+    // (2) SOLO si el requisito FALLÓ (complete==false) y la Task es de cama, logueamos.
+    //     Lecturas SEH-safe (Memory::Read, nunca deref ciego): this->key y *failedOn.
+    if (ok && !complete) {
+        int key = -1;
+        Memory::Read(reinterpret_cast<uintptr_t>(thisTask) + 0x44, key); // TaskData+0x44 = TaskType (int32)
+        if (IsBedTask(key)) {
+            int failedOnVal = -1;
+            if (failedOn) Memory::Read(reinterpret_cast<uintptr_t>(failedOn), failedOnVal); // StateType (int32)
+            int n = s_bedReqFailCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            // Throttle: primeros 30 + 1 de cada 30. El AI tick re-evalúa cada tick mientras el
+            // requisito siga fallando, así que sin throttle inundaría el log. Se loguea para
+            // CUALQUIER AI (no solo el host): determinar aquí si el AI es el del host es costoso
+            // (cadena AI→Character→Faction inversa) y ruidoso pero simple; el ai=0x.. del log
+            // permite correlacionarlo a posteriori. (Ver reporte del executor.)
+            if (n <= 30 || n % 30 == 0) {
+                spdlog::info("[DIAG-BEDREQ] #{} taskType=0x{:X}({}) FALLA requisito -> failedOn=0x{:X} "
+                             "(StateType) ai=0x{:X} this=0x{:X} [cualquier AI]",
+                             n, (unsigned)key, BedTaskName(key), (unsigned)failedOnVal,
+                             reinterpret_cast<uintptr_t>(ai), reinterpret_cast<uintptr_t>(thisTask));
+            }
+        }
+    }
+
+    // (3) Devuelve EXACTAMENTE lo que devolvió el original. Si el trampolín petó (ok==false),
+    //     complete=false = degradación segura: el caller trata la Task como "requisitos
+    //     incompletos", idéntico a tener el hook desactivado. No se altera nada.
+    return complete;
+}
+
+// Instala el hook DIAG-BEDREQ (una vez). Se llama desde OnGameTick, junto a los gate hooks.
+static void InstallBedReqDiagHookOnce(uintptr_t modBase) {
+    if (s_bedReqInstalled.load(std::memory_order_acquire)) return;
+    if (modBase == 0) return;
+    // RVA confirmada EN VIVO (2026-07-13) + AOB único en .text (48 89 5C 24 10 4C 89 4C 24 20
+    // 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C): 0x60F940. Prólogo estándar → MinHook normal.
+    uintptr_t addr = modBase + 0x60F940;
+    bool ok = HookManager::Get().InstallAt("BedReqDiag", addr, &Hook_BedReq, &s_origBedReq);
+    if (ok) {
+        spdlog::info("[DIAG-BEDREQ] hook instalado en TaskData::_isRequirementsComplete 0x{:X} "
+                     "(RVA 0x60F940). Al dormir/levantarse el host, loguea el StateType que falla "
+                     "para las Tasks de cama (USE_BED/USE_BED_ORDER/GET_OUT_OF_BED/GET_UP_STAND_UP).",
+                     addr);
+    } else {
+        spdlog::warn("[DIAG-BEDREQ] FALLO al instalar el hook en 0x{:X} (RVA 0x60F940) — "
+                     "el diagnóstico de requisitos de cama no estará disponible.", addr);
+    }
+    s_bedReqInstalled.store(true, std::memory_order_release); // no reintentar en bucle
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+//  [FIX-ARMGATE] (2026-07-13) — hook de MedicalSystem::hasWorkingArm (RVA 0x644150)
+//  "Mi brazo está en un estado tan pésimo que no puedo levantar nada" al intentar cargar.
+// ══════════════════════════════════════════════════════════════════════════════════════
+// CAUSA RAÍZ (RE en vivo con Cheat Engine/x64dbg 2026-07-13, no es hipótesis):
+//   hasWorkingArm (RVA 0x644150) es el ÚNICO punto de choque de 7 callers GOAP distintos
+//   (atacar, cargar/lift, usar objetos...). Lee dos bytes cacheados en el MedicalSystem inline:
+//     char+0x458+0x165 = char+0x5BD = rightArmOk   (1=funcional, 0=roto)
+//     char+0x458+0x166 = char+0x5BE = leftArmOk
+//   y devuelve 1 si CUALQUIERA es != 0; 0 sólo si AMBOS son 0. AOB único confirmado byte a byte:
+//     80 B9 65 01 00 00 00 75 0C 80 B9 66 01 00 00 00 75 03 32 C0 C3 B0 01 C3
+//   Esos dos bytes arrancan con la BASURA del clon reclamado por el mod y sólo los recalcula
+//   MedicalSystem::reassessCollapseMode. Corre en el PLANIFICADOR GOAP, ANTES de encolar ninguna
+//   orden → NINGÚN hook de Hook_AddOrderBackend (incluido [FIX-CARRY-HAND]) lo ve nunca (0 entradas
+//   de log de ese fix para este síntoma). El SeedHostCharArmFlagsTick ([FIX-ARMSEED]) re-siembra el
+//   bool pero su timing/cobertura no garantiza cubrir el instante exacto del intento de carga.
+//
+// FIX (Opción A recomendada por la investigación — ataca la causa en el ÚNICO punto de choque en vez
+//   de perseguir cada flag por separado): detour sobre hasWorkingArm que, SÓLO para chars de la
+//   facción del host/jugador (mismo criterio que el resto del sistema: char.faction(char+0x10) ==
+//   s_cachedHostFaction, el atomic ya poblado por RefreshHostFactionCache), sustituye la CONSULTA por
+//   DATOS REALES en vez de forzar un booleano a ciegas (misma filosofía que isAlly/isEnemy hoy):
+//     · Lee la salud REAL de los dos brazos desde el array de partes de salud (cadena canónica
+//       MedicalSystem: partArray@char+0x5F8, count@char+0x5F0, stride 8, flesh@part+0x40 — los MISMOS
+//       offsets que SEH_WriteLimbHealthDirect/SEH_ReassessCollapse, no se reinventan). Índices de
+//       brazo = kmp::BodyPart (Head=0,Chest=1,Stomach=2,LeftArm=3,RightArm=4,...).
+//     · Si al menos un brazo tiene flesh>0 (funcional) PERO el veredicto nativo era 0 → CORRIGE a 1.
+//     · Si la salud real también dice brazo roto de verdad (ambos flesh<=0) o no es legible, o el
+//       nativo ya daba 1 → delega al veredicto nativo. NUNCA fuerza true sobre un brazo destrozado.
+//   Para NPCs y chars remotos (charFaction != s_cachedHostFaction) delega tal cual: no toca IA ajena.
+//   COOP: en un cliente, s_cachedHostFaction es la facción del propio jugador → corrige sus propios
+//   chars, que es igualmente deseable (mismo razonamiento inofensivo/deseable de [FIX-CARRY-HAND]).
+// SEGURIDAD: el detour llama SIEMPRE al original primero (barato, 2 bytes) y va bajo SEH; ante
+//   cualquier fallo devuelve el veredicto nativo (degradación = hook desactivado). Prólogo
+//   `80 B9 65 01...` (cmp, NO mov rax,rsp) → MinHook normal, sin fix MovRaxRsp.
+// HILO: corre en el hilo de lógica (planificador GOAP/AI tick), el mismo que los gate hooks de
+//   combate — por eso spdlog directo aquí es seguro (mismo patrón que Hook_CombatGate).
+
+// Firma nativa de MedicalSystem::hasWorkingArm (RVA 0x644150). __fastcall(this=MedicalSystem* en rcx),
+// retorno bool en al. this = char+0x458 (MedicalSystem vive INLINE en el Character).
+using HasWorkingArmFn = uint8_t(__fastcall*)(uintptr_t medicalSystem);
+static HasWorkingArmFn   s_origHasWorkingArm = nullptr;   // trampolín MinHook (cuerpo original)
+static std::atomic<bool> s_armGateInstalled{false};
+static std::atomic<int>  s_armGateCorrections{0};         // nº de veces que el hook corrigió el veredicto
+
+// MedicalSystem inline dentro del Character: char = medicalSystem - 0x458 (ver SEH_ReassessCollapse).
+static constexpr uintptr_t kMedicalSystemOffset = 0x458;
+// Índices de parte de salud (mismo orden que kmp::BodyPart y el array health[7] de MsgLimbHealth:
+//   Head=0, Chest=1, Stomach=2, LeftArm=3, RightArm=4, LeftLeg=5, RightLeg=6).
+static constexpr int kArmPartIdxLeft  = 3;   // BodyPart::LeftArm
+static constexpr int kArmPartIdxRight = 4;   // BodyPart::RightArm
+
+// Llama al original bajo SEH. *ok=false si el trampolín peta (devolvemos 0 = "sin brazo", degradación
+// segura idéntica a tener el hook desactivado). POD puro dentro del __try.
+static uint8_t SEH_CallHasWorkingArm(uintptr_t medicalSystem, bool* ok) {
+    if (s_origHasWorkingArm == nullptr) { *ok = false; return 0; }
+    __try {
+        uint8_t r = s_origHasWorkingArm(medicalSystem);
+        *ok = true;
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *ok = false;
+        return 0;
+    }
+}
+
+// Lee la salud REAL (flesh, part+0x40) de los dos brazos del char y decide si hay al menos uno
+// funcional. Cadena canónica MedicalSystem (mismos offsets que SEH_WriteLimbHealthDirect/
+// SEH_ReassessCollapse): partArray@char+0x5F8, count@char+0x5F0, stride 8, flesh@part+0x40. POD puro.
+// Devuelve: 1 = al menos un brazo con flesh>0 (utilizable), 0 = ambos brazos rotos de verdad
+//          (flesh<=0), -1 = no legible (cadena de salud incompleta) → el caller delega al original.
+static int SEH_ReadArmRealOk(uintptr_t charPtr) {
+    __try {
+        const auto& offsets = game::GetOffsets().character;
+        if (offsets.healthPartArray < 0 || offsets.healthBase < 0) return -1;
+        uintptr_t partArray = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartArray, partArray) || !GateIsHeap(partArray))
+            return -1;
+        int count = 0;
+        // El array debe cubrir al menos hasta RightArm (idx 4) → count >= 5. Humanos = 7.
+        if (!Memory::Read(charPtr + offsets.healthPartCount, count) ||
+            count <= kArmPartIdxRight || count > 32)
+            return -1;
+        bool anyFunctional = false;
+        bool anyReadable   = false;
+        const int idx[2] = { kArmPartIdxLeft, kArmPartIdxRight };
+        for (int k = 0; k < 2; ++k) {
+            uintptr_t part = 0;
+            if (!Memory::Read(partArray + idx[k] * offsets.healthStride, part) || !GateIsHeap(part))
+                continue;
+            float flesh = 0.0f, fleshStun = 0.0f;
+            if (!Memory::Read(part + offsets.healthBase, flesh)) continue;
+            Memory::Read(part + offsets.healthBase + 4, fleshStun);   // fleshStun = part+0x44
+            anyReadable = true;
+            // Salud EFECTIVA (flesh - fleshStun), igual criterio que getCollapseStage/reassessCollapseMode
+            // (ver SEH_ReassessCollapse) — si solo miráramos flesh>0 anularíamos un colapso por stun de
+            // combate legítimo, dejando al host inmune al stun de brazo (mismo bug que ya se evitó en
+            // SeedHostCharArmFlagsTick con clearStun=false).
+            if (flesh - fleshStun > 0.0f) anyFunctional = true;
+        }
+        if (!anyReadable) return -1;                  // ninguna parte de brazo legible → delegar
+        return anyFunctional ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// ── DETOUR de MedicalSystem::hasWorkingArm (0x644150) ──
+// uint8_t __fastcall hasWorkingArm(MedicalSystem* this)
+static uint8_t __fastcall Hook_HasWorkingArm(uintptr_t medicalSystem) {
+    // (1) Veredicto nativo SIEMPRE primero (barato: 2 bytes cacheados). Es el valor por defecto.
+    bool origOk = false;
+    uint8_t origResult = SEH_CallHasWorkingArm(medicalSystem, &origOk);
+
+    // (2) Sólo intervenimos para chars de la facción del host/jugador. Cache no listo o puntero
+    //   basura → devolver el veredicto nativo sin tocar nada.
+    uintptr_t hostFaction = s_cachedHostFaction.load(std::memory_order_acquire);
+    if (hostFaction == 0 || !GateIsHeap(medicalSystem) || medicalSystem < kMedicalSystemOffset)
+        return origResult;
+
+    uintptr_t charPtr = medicalSystem - kMedicalSystemOffset;   // MedicalSystem inline en char+0x458
+    if (!GateIsHeap(charPtr)) return origResult;
+
+    uintptr_t charFaction = 0;
+    if (!Memory::Read(charPtr + game::GetOffsets().character.faction /*+0x10*/, charFaction) ||
+        charFaction != hostFaction) {
+        return origResult;   // NPC / char remoto (facción distinta a la del host) → delegar
+    }
+
+    // (3) Char del host: evaluar la salud REAL de los brazos (no forzar true a ciegas).
+    int realOk = SEH_ReadArmRealOk(charPtr);
+    if (realOk == 1 && origResult == 0) {
+        // CORRECCIÓN: la salud real dice "brazo funcional" pero el bool nativo cacheado (basura del
+        //   clon reclamado) decía "sin brazo" → devolvemos 1. Ataca la causa raíz en el único punto
+        //   de choque de los 7 callers GOAP, ANTES de que la acción (cargar/atacar/usar) se descarte.
+        int c = s_armGateCorrections.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c <= 8 || (c % 200) == 0) {
+            spdlog::info("[FIX-ARMGATE] host char=0x{:X} med=0x{:X}: hasWorkingArm nativo=0 pero salud "
+                         "real de brazo>0 → CORREGIDO a 1 (desbloquea cargar/atacar/usar) "
+                         "[correcciones={}]", charPtr, medicalSystem, c);
+        }
+        return 1;
+    }
+    // realOk==0 (ambos brazos rotos de verdad) / realOk==-1 (no legible) / el nativo ya daba 1:
+    //   delegar al veredicto nativo — NUNCA forzamos true sobre un brazo genuinamente destrozado.
+    return origResult;
+}
+
+// Instala el hook de hasWorkingArm (una vez). Se llama desde OnGameTick, junto a los demás gate hooks.
+static void InstallArmGateHookOnce(uintptr_t modBase) {
+    if (s_armGateInstalled.load(std::memory_order_acquire)) return;
+    if (modBase == 0) return;
+    // RVA confirmada byte a byte (investigación 2026-07-13), AOB único en .text:
+    //   80 B9 65 01 00 00 00 75 0C 80 B9 66 01 00 00 00 75 03 32 C0 C3 B0 01 C3
+    // Prólogo `cmp byte[rcx+0x165],0` (7 bytes, NO mov rax,rsp) → MinHook normal.
+    uintptr_t addr = modBase + 0x644150;
+    bool ok = HookManager::Get().InstallAt("ArmGate", addr, &Hook_HasWorkingArm, &s_origHasWorkingArm);
+    if (ok) {
+        s_armGateInstalled.store(true, std::memory_order_release);
+        spdlog::info("[FIX-ARMGATE] hook de MedicalSystem::hasWorkingArm INSTALADO en 0x{:X} "
+                     "(RVA 0x644150). Los chars del host con brazo sano dejarán de ver el gate "
+                     "'brazo roto' por el bool cacheado corrupto del clon.", addr);
+    } else {
+        spdlog::warn("[FIX-ARMGATE] FALLO al instalar el hook en 0x{:X} (RVA 0x644150) — el host "
+                     "podría seguir sin poder cargar/atacar por el flag de brazo corrupto.", addr);
+        s_armGateInstalled.store(true, std::memory_order_release); // no reintentar en bucle
     }
 }
 
@@ -6053,7 +8118,9 @@ void Core::OnGameTick(float deltaTime) {
     //   En cuanto el host cree su primer personaje (y el juego llene 0x21345B0), la siguiente
     //   pasada captura el factory real y IsReady() pasa a true SIN forzar creates ni spawnar
     //   NPCs dummy. CaptureFactoryFromGameWorld ya es SEH-safe (valida con Memory::Read y
-    //   rechaza el residuo de 32 bits en el check#4). Coste: 1 comparación + (cuando falta) una
+    //   el check OBLIGATORIO de vtable en .rdata + entradas en .text — los checks #4/#4b de
+    //   "mitad alta nula" se ELIMINARON en Oleada A: el heap de Kenshi vive bajo 4GB y
+    //   rechazaban el factory real). Coste: 1 comparación + (cuando falta) una
     //   lectura de puntero, una vez por segundo. No-op en cuanto IsReady()==true.
     if (!m_spawnManager.IsReady() && m_gameFuncs.GameWorldSingleton != 0) {
         static int s_factoryRetryGuard = 0;
@@ -6668,12 +8735,16 @@ void Core::OnGameTick(float deltaTime) {
                             // ── [DIAG-ATTACK] Capa de combate: la SONDA decisiva (CombatClass) ──
                             // CombatClass = *(char+0x648 [CharBody] + 0x8). vtblOk vs modBase+0x16F67B8.
                             // Task activo = *(char+0x448+0xE8); vtbl vs Tasker 0x16BDC68 / Task_MeleeAttack
-                            // 0x16BE448. currentTarget = CombatClass+0x290 (escrito por setAttackTarget 0x665580).
+                            // 0x16BE448 / Task_FocusedMeleeAttack 0x16BF9E8. currentTarget = CombatClass+0x290
+                            // (escrito por setAttackTarget 0x665580).
                             const uintptr_t taskerVtblAbs = modBase + CombatStructSnapshot::kTaskerVtableRVA;
                             const uintptr_t meleeVtblAbs  = modBase + CombatStructSnapshot::kTaskMeleeVtableRVA;
+                            // Ataque ORDENADO por el jugador (clic manual): tarea distinta a la automática (RE 2026-07-14).
+                            const uintptr_t focusedMeleeVtblAbs = modBase + CombatStructSnapshot::kTaskFocusedMeleeVtableRVA;
                             auto taskName = [&](uintptr_t v) -> const char* {
                                 if (v == 0) return "none";
-                                if (v == meleeVtblAbs)  return "Task_MeleeAttack";
+                                if (v == meleeVtblAbs)        return "Task_MeleeAttack(auto)";
+                                if (v == focusedMeleeVtblAbs) return "Task_FocusedMeleeAttack(ordenado)";
                                 if (v == taskerVtblAbs) return "Tasker(base)";
                                 return "otro";
                             };
@@ -6914,9 +8985,31 @@ void Core::OnGameTick(float deltaTime) {
                 if (m_gameLoaded) {
                     uintptr_t hookModBase = Memory::GetModuleBase();
                     if (hookModBase != 0) {
-                        InstallCombatGateHookOnce(hookModBase);   // instala el detour una vez
+                        InstallCombatGateHookOnce(hookModBase);   // instala el detour de isAlly (una vez)
+                        InstallEnemyGateHookOnce(hookModBase);    // [FIX-ENEMY-HOOK] instala isEnemy (2 COMDAT)
+                        InstallBedReqDiagHookOnce(hookModBase);   // [DIAG-BEDREQ] hook observacional de req. de cama (una vez)
+                        InstallArmGateHookOnce(hookModBase);      // [FIX-ARMGATE] hook de hasWorkingArm 0x644150 (una vez)
                         ResolveNamelessFactionOnce(hookModBase);  // localiza Nameless (Opción A) o marca C
                     }
+
+                    // (b) CAMBIO CRÍTICO: refrescar el cache del host para el hook CADA tick, SIN
+                    // condición. Antes solo se refrescaba dentro del bloque con tope de 600 reintentos:
+                    // durante la carga OnGameTick corre a ~230 ticks/s y el tope se agotaba en ~2.6s,
+                    // ANTES de que la facción del host se resolviera (~7s) -> ABORT permanente ->
+                    // s_cachedHostFR=0 para siempre -> Hook_CombatGate quedaba inerte. También cubre el
+                    // caso de éxito: si SetControlledChar resetea Faction+0x78 DESPUÉS de que el fix
+                    // marque done, aquí el cache se re-sincroniza igualmente.
+                    uintptr_t cacheFaction = game::GetPlayerFactionDirect();          // Opción B
+                    if (cacheFaction == 0) {
+                        void* pc = m_playerController.GetPrimaryCharacter();          // Opción A
+                        if (pc != nullptr) {
+                            const int facOff = game::GetOffsets().character.faction;  // +0x10
+                            uintptr_t fac = 0;
+                            if (Memory::Read(reinterpret_cast<uintptr_t>(pc) + facOff, fac))
+                                cacheFaction = fac;
+                        }
+                    }
+                    RefreshHostFactionCache(cacheFaction);  // no-op interno si cacheFaction==0
                 }
 
                 static std::atomic<bool> s_hostilityFixDone{false};
@@ -6926,7 +9019,8 @@ void Core::OnGameTick(float deltaTime) {
                 static constexpr int kHostilityConfirmsNeeded = 3; // re-aplicar ≥3 ticks (cubre reset
                                                                    // de SetControlledChar/FIX-CONTROL)
                 if (!s_hostilityFixDone.load(std::memory_order_acquire) && m_gameLoaded) {
-                    s_hostilityFixTries++;
+                    // (a) el incremento de s_hostilityFixTries se movió DENTRO de la rama
+                    // hostFaction != 0: esperar a que la facción exista NO consume el tope.
 
                     // ── Resolver la facción del HOST DIRECTAMENTE (sin iterar el FactionManager) ──
                     // Causa del ABORTO anterior: la búsqueda por isPlayerIface(+0x250)!=0 NO halla
@@ -6948,6 +9042,7 @@ void Core::OnGameTick(float deltaTime) {
                     }
 
                     if (hostFaction != 0) {
+                        s_hostilityFixTries++;  // (a) solo cuentan intentos REALES (facción resuelta)
                         const auto& off  = game::GetOffsets().faction;
                         const auto& frel = game::GetOffsets().factionRelations;
 
@@ -6997,12 +9092,17 @@ void Core::OnGameTick(float deltaTime) {
                         }
                     } else {
                         // Facción del host aún no resuelta (carga a medias / cadena GW+0x580 no lista).
+                        // (a) NO quemamos el tope: durante la carga van ~230 ticks/s y los 600
+                        // intentos se agotaban en ~2.6s, antes de los ~7s que tarda la facción.
                         s_hostilityConfirms = 0;
-                        if (s_hostilityFixTries <= 10 || s_hostilityFixTries % 120 == 0) {
+                        static int s_hostilityWaitTicks = 0;
+                        ++s_hostilityWaitTicks;
+                        if (s_hostilityWaitTicks <= 10 || s_hostilityWaitTicks % 600 == 0) {
                             spdlog::info(
                                 "[FIX-HOSTILITY] facción del host no resuelta aún "
-                                "(GetPlayerFactionDirect=0 y char+0x10 no legible) — reintento #{}",
-                                s_hostilityFixTries);
+                                "(GetPlayerFactionDirect=0 y char+0x10 no legible) — esperando "
+                                "(tick de espera #{}, intentos reales consumidos={})",
+                                s_hostilityWaitTicks, s_hostilityFixTries);
                         }
                     }
 
@@ -7151,8 +9251,8 @@ void Core::OnGameTick(float deltaTime) {
         size_t cmdCount = m_commandQueue.Size();
         if (cmdCount > 0) {
             m_commandQueue.DrainAll([](GameCommand& cmd) {
-                if (cmd.execute) {
-                    cmd.execute();
+                if (!SEH_RunGameCommand(&cmd)) {
+                    spdlog::warn("Core: comando de red descartado por excepción durante ejecución");
                 }
             });
             if (cmdCount > 100) {
@@ -7199,6 +9299,24 @@ void Core::OnGameTick(float deltaTime) {
         // +0xD0=reloj fuerza diff<=12 → rama combate. One-shot, throttled, solo host.
         if (IsHost()) SeedHostCharLastProcessedTick(*this);
 
+        // [FIX-MEDSEED] Seed de char+0x4C0 (timestamp medico) del host: desbloquea el consumo de
+        // comida. Con char+0x4C0 basura/futuro, MedicalSystem::periodicUpdate (0x64DA70) calcula
+        // dt = SimClock - char+0x4C0 SIN clamp → dt<0 → el hambre SUBE y el char nunca come.
+        // Sembrar char+0x4C0=SimClock fuerza dt>=0. One-shot, throttled, solo host (hermano del
+        // FIX-SIMSEED, mismo mecanismo en otro offset).
+        if (IsHost()) SeedHostCharMedicalTimestampTick(*this);
+
+        // [FIX-ARMSEED] Recalcula el bool cacheado "brazo OK" (char+0x5BE) del host vía
+        // reassessCollapseMode (0x649320). Sin esto, si el brazo nunca se dañó no llega ninguna
+        // escritura de salud por red y el flag se queda mal → no puedes cargar a nadie a cuestas.
+        // NO one-shot: throttle ~2.5s, idempotente, solo host (hermano del FIX-MEDSEED).
+        if (IsHost()) SeedHostCharArmFlagsTick(*this);
+
+        // [FIX-HOSTREL] Corrige las 37 relaciones de facción corruptas (neutral→-100) del host que
+        // impedían que los NPC contraatacaran ("todos huyen"). Reutiliza s_cachedHostFR. One-shot
+        // re-armable, throttled ~1s, solo host. Coexiste con el FIX-HOSTILITY-HOOK (isAlly).
+        if (IsHost()) FixHostFactionRelationsTick(*this);
+
         // [FIX-CONTROL] CAUSA 2: vincular el char del host como "controlado por el jugador"
         // (SetControlledChar 0x802520 → faction+0x250=PI). El gate de la rama viva 0x5CD1E3
         // exime al host del umbral 0.75 → su think (atacar/curar/levantar/auto-defensa) corre
@@ -7211,6 +9329,22 @@ void Core::OnGameTick(float deltaTime) {
         // idempotente, throttled, solo host. Detrás de toggle kEnableCombatClassFix (OFF por
         // defecto: validar primero con [DIAG-ATTACK]). Coexiste con FIX-CONTROL/FIX-HOSTILITY.
         if (IsHost()) FixHostCombatClassTick(*this);
+
+        // [FIX-COMBATARM] Arranca la máquina de estados de combate del host llamando a
+        // CombatClass::startupState() (vtable slot +0x50) una vez, para que nextMove(CC+0x1F4)/
+        // combatState(CC+0x1F0) dejen de tener basura sin inicializar (el host podía no iniciar
+        // combate en frío hasta usar un muñeco). Red de seguridad: sanea nextMove/combatState si
+        // siguen fuera de rango. Va DESPUÉS de FIX-COMBATCLASS (necesita la CombatClass ya creada).
+        // One-shot idempotente, throttled, solo host, hilo de lógica.
+        if (IsHost()) FixHostCombatArmTick(*this);
+
+        // [FIX-ARMHAND] Repara el handle de brazo del AI del host: AI+0x318 = Character+0x458
+        // (escritura de puntero de 8 bytes a una región que ya existe dentro del propio Character).
+        // Sin esto, el chequeo GOAP nativo dice "brazo en estado pésimo" aunque los brazos estén
+        // sanos → el host no puede cargar/secuestrar, hacer primeros auxilios ni autocurarse.
+        // One-shot idempotente, throttled, solo host. Va DESPUÉS de FIX-COMBATCLASS/FIX-COMBATARM
+        // (asume host/AI ya resueltos: AI = *(char+0x650) debe estar materializado).
+        if (IsHost()) FixHostArmHandTick(*this);
 
         // [FIX-PLATOON] Re-enlaza el ActivePlatoon del host (char+0x658) registrando AI+0x10 vía
         // setActivePlatoon(0x6213F0), que el spawn del clon del mod omite → su Tasker queda
@@ -7225,6 +9359,16 @@ void Core::OnGameTick(float deltaTime) {
         // throttled, solo host. Toggle kEnableCombatAutotest (DEFAULT true). Va el ÚLTIMO,
         // tras los FIX, para que la facción/control/hostilidad ya estén aplicados al disparar.
         if (IsHost()) CombatAutotestTick(*this);
+
+        // [DIAG-CLONESQUAD] Detecta (solo log, NO despawnea) el CharacterHuman DUPLICADO del squad
+        // del host — causa raíz del bug de la cama (GET_OUT_OF_BED reencolado sin fin). One-shot
+        // re-armable, throttle ~2s, solo host. Ver wiki secc. 21.
+        if (IsHost()) DetectHostSquadCloneTick(*this);
+
+        // [FIX-CLONESQUAD-DESPAWN] Despawn REAL del clon detectado arriba: erase de la lektor
+        // PlayerInterface PRIMERO, GameWorld::removeObject(0x799AF0) DESPUÉS. Gating por estabilidad
+        // (≥3 ticks con el mismo clon), guards de seguridad completos, one-shot re-armable.
+        if (IsHost()) DespawnHostSquadCloneTick(*this);
 
         // Run unified offset prober (discovers sceneNode, isPlayerControlled, aiPackage, etc.)
         // Only runs until all probes complete; then becomes a no-op.
@@ -7318,17 +9462,39 @@ void Core::OnGameTick(float deltaTime) {
         // [FIX-SIMSEED] Seed de char+0xD0 del host (misma lógica que la rama sync).
         if (IsHost()) SeedHostCharLastProcessedTick(*this);
 
+        // [FIX-MEDSEED] Seed de char+0x4C0 (timestamp medico) del host (misma lógica que la rama sync).
+        if (IsHost()) SeedHostCharMedicalTimestampTick(*this);
+
+        // [FIX-ARMSEED] Recalcula el bool "brazo OK" del host (misma lógica que la rama sync).
+        if (IsHost()) SeedHostCharArmFlagsTick(*this);
+
+        // [FIX-HOSTREL] Corrige las relaciones de facción corruptas del host (misma lógica que la rama sync).
+        if (IsHost()) FixHostFactionRelationsTick(*this);
+
         // [FIX-CONTROL] SetControlledChar del host (misma lógica que la rama sync).
         if (IsHost()) SetHostControlledCharTick(*this);
 
         // [FIX-COMBATCLASS] Crear CombatClass del host si nació NULL (misma lógica que la rama sync).
         if (IsHost()) FixHostCombatClassTick(*this);
 
+        // [FIX-COMBATARM] Arranca la máquina de estados de combate del host (startupState vtbl+0x50)
+        // + red de seguridad de nextMove/combatState (misma lógica que la rama sync).
+        if (IsHost()) FixHostCombatArmTick(*this);
+
+        // [FIX-ARMHAND] Repara AI+0x318 = Character+0x458 del host (misma lógica que la rama sync).
+        if (IsHost()) FixHostArmHandTick(*this);
+
         // [FIX-PLATOON] Re-enlace AI<->platoon del host (misma lógica que la rama sync).
         if (IsHost()) FixHostPlatoonTick(*this);
 
         // [AUTOTEST] Auto-test de combate (misma lógica que la rama sync).
         if (IsHost()) CombatAutotestTick(*this);
+
+        // [DIAG-CLONESQUAD] Detección del clon del squad del host (misma lógica que la rama sync).
+        if (IsHost()) DetectHostSquadCloneTick(*this);
+
+        // [FIX-CLONESQUAD-DESPAWN] Despawn REAL del clon del squad del host (misma lógica que la rama sync).
+        if (IsHost()) DespawnHostSquadCloneTick(*this);
 
         // Run unified offset prober (legacy path — same wrapper as sync path)
         if (!game::IsProberComplete() && s_tickCallCount % 30 == 5) {
@@ -7632,23 +9798,91 @@ static bool SEH_AllyModFaction(void* character) {
     }
 }
 
+// ── Recalcula el flag de colapso médico tras escribir salud (duplicado literal de
+// SEH_ReassessCollapse en packet_handler.cpp; static → sin colisión de enlazado). ──
+// El motor cachea en MedicalSystem un BOOL "brazo OK" (char+0x458+0x166 = char+0x5BE) que
+// solo refresca MedicalSystem::reassessCollapseMode. Escribir salud a pelo deja ese bool
+// congelado y el gate de "cargar a cuestas" (Hook_AddOrderBackend) sigue viendo el brazo
+// roto. RVA 0x649320 VERIFICADA en bytes (Steam 1.0.68; el 0x648BA0 de KenshiLib está
+// obsoleto para esta build). Firma: void __fastcall(MedicalSystem* this, bool medic, bool agony).
+// SOLO game thread (esta ruta corre en el procesamiento de spawn del game thread). SEH-safe.
+static void SEH_ReassessCollapse(void* character, bool clearStun) {
+    __try {
+        uintptr_t charPtr = reinterpret_cast<uintptr_t>(character);
+        if (charPtr == 0) return;
+        // SALTAR si el char está MUERTO (char+0x5BC, byte isDead: 0=vivo, 1=muerto).
+        uint8_t isDead = 0;
+        if (!Memory::Read(charPtr + 0x5BC, isDead) || isDead != 0) return;
+        // ── FIX-STUNSEED: limpiar el "fleshStun rancio" antes del recálculo de colapso ──
+        // SOLO si clearStun=true (llamado tras una escritura de salud REAL por red). El tick
+        // periódico de FIX-ARMSEED (SeedHostCharArmFlagsTick) pasa clearStun=false: no hay datos
+        // nuevos que justifiquen borrar stun, y hacerlo ahí anularía stun real de combate legítimo
+        // del host cada 2.5s (found en revisión adversarial — el arm-seed dejaba al host inmune al
+        // derribo por stun). reassessCollapseMode NO decide con flesh a secas (part+0x40): usa la
+        // salud EFECTIVA = flesh(part+0x40) − fleshStun(part+0x44) (getCollapseStage RVA 0x644450
+        // hace la resta). El mod sólo sincroniza flesh por red; fleshStun nunca se escribe ni se
+        // simula su decaimiento, así que un valor viejo de un golpe/colapso anterior deja la salud
+        // efectiva negativa y el brazo se re-marca como roto aunque la UI muestre 100%. Reseteamos
+        // fleshStun=0 en TODAS las partes con el MISMO patrón de iteración que
+        // SEH_WriteLimbHealthDirect (partArray@0x5F8, count@0x5F0, stride 8, fleshStun =
+        // healthBase+4 = part+0x44 — ver game_types.h). Escritura LOCAL: NO toca la red ni el
+        // protocolo MsgLimbHealth. OJO: sólo tocamos fleshStun(+0x44); flesh(+0x40, la salud real)
+        // se deja intacto — no curamos.
+        if (clearStun) {
+            auto& offsets = game::GetOffsets().character;
+            if (offsets.healthPartArray >= 0 && offsets.healthBase >= 0) {
+                uintptr_t partArray = 0;
+                int count = 0;
+                if (Memory::Read(charPtr + offsets.healthPartArray, partArray) && partArray != 0 &&
+                    Memory::Read(charPtr + offsets.healthPartCount, count) && count > 0 && count <= 32) {
+                    for (int i = 0; i < count; i++) {
+                        uintptr_t part = 0;
+                        if (!Memory::Read(partArray + i * offsets.healthStride, part) || part == 0)
+                            continue;
+                        // fleshStun está justo tras flesh: part+0x44 = healthBase(0x40)+4.
+                        Memory::Write(part + offsets.healthBase + 4, 0.0f);
+                    }
+                }
+            }
+        }
+        // MedicalSystem vive INLINE dentro del Character en char+0x458 (NO es puntero).
+        void* medicalSystem = reinterpret_cast<void*>(charPtr + 0x458);
+        using ReassessCollapseFn = void(__fastcall*)(void* medical, bool medic, bool agony);
+        auto fn = reinterpret_cast<ReassessCollapseFn>(Memory::GetModuleBase() + 0x649320);
+        fn(medicalSystem, false, false);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Una llamada nativa fallida jamás debe tumbar el game thread.
+    }
+}
+
 // SEH-protected limb health write for remote character spawn/link.
 // Extracted from HandleSpawnQueue because __try cannot coexist with
 // std::unordered_map (C2712). Only POD types inside __try block.
+// Duplicado literal de SEH_WriteLimbHealthToChar (packet_handler.cpp) por límites del
+// compilador (C2712). Cadena CANÓNICA MedicalSystem — ver game_types.h:
+//   partArray = [char+0x5F8] → part_i = [partArray + i*8] → flesh @ part_i+0x40
 static bool SEH_WriteLimbHealthDirect(void* character, const float health[7]) {
     __try {
         auto& offsets = game::GetOffsets().character;
         uintptr_t charPtr = reinterpret_cast<uintptr_t>(character);
-        if (offsets.healthChain1 < 0 || offsets.healthChain2 < 0 || offsets.healthBase < 0)
+        if (offsets.healthPartArray < 0 || offsets.healthBase < 0) return false;
+        uintptr_t partArray = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartArray, partArray) || partArray == 0)
             return false;
-        uintptr_t ptr1 = 0;
-        if (!Memory::Read(charPtr + offsets.healthChain1, ptr1) || ptr1 == 0) return false;
-        uintptr_t ptr2 = 0;
-        if (!Memory::Read(ptr1 + offsets.healthChain2, ptr2) || ptr2 == 0) return false;
-        for (int i = 0; i < 7; i++) {
-            int partOffset = offsets.healthBase + i * offsets.healthStride;
-            Memory::Write(ptr2 + partOffset, health[i]);
+        int count = 0;
+        if (!Memory::Read(charPtr + offsets.healthPartCount, count)) return false;
+        if (count <= 0 || count > 32) return false;
+        int n = (count < 7) ? count : 7;
+        for (int i = 0; i < n; i++) {
+            uintptr_t part = 0;
+            if (!Memory::Read(partArray + i * offsets.healthStride, part) || part == 0)
+                continue;
+            Memory::Write(part + offsets.healthBase, health[i]);
         }
+        // Refrescar el flag de colapso UNA sola vez, tras escribir TODAS las partes
+        // (fuera del bucle — evita 7 llamadas nativas seguidas por char). clearStun=true: esta
+        // función SÍ acaba de escribir salud real por red, el stun rancio debe limpiarse.
+        SEH_ReassessCollapse(character, /*clearStun=*/true);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -8092,11 +10326,18 @@ void Core::HandleSpawnQueue() {
         s_lastDirectAttempt = std::chrono::steady_clock::time_point{};
         s_directSpawnsPerPlayer.clear();
         ResetHostFactionFix(); // re-armar el fix de facción del host en nueva conexión
+        ResetNamelessResolve(); // purgar cachés de Nameless por simetría (idempotente, barato)
+        ResetHostFactionRelationsFix(); // re-armar el FIX-HOSTREL (relaciones corruptas) en nueva conexión
         ResetHostSimSeedFix(); // re-armar el seed de char+0xD0 (AI tick combate) en nueva conexión
+        ResetHostMedSeedFix(); // re-armar el seed de char+0x4C0 (timestamp medico/comida) en nueva conexión
         ResetHostControlledCharFix(); // re-armar el FIX-CONTROL (SetControlledChar) en nueva conexión
         ResetHostCombatClassFix();    // re-armar el FIX-COMBATCLASS (CombatClass del host) en nueva conexión
+        ResetHostCombatArmFix();      // re-armar el FIX-COMBATARM (arranque de la máquina de combate del host) en nueva conexión
+        ResetHostArmHandFix();        // re-armar el FIX-ARMHAND (handle de brazo AI+0x318=Character+0x458) en nueva conexión
         ResetHostPlatoonFix();        // re-armar el FIX-PLATOON (re-enlace AI<->platoon) en nueva conexión
         ResetHostCombatAutotest();    // re-armar el [AUTOTEST] de combate en nueva conexión
+        ResetHostSquadCloneDetect();  // re-armar el [DIAG-CLONESQUAD] (detección del clon del squad) en nueva conexión
+        ResetHostSquadCloneDespawn(); // re-armar el [FIX-CLONESQUAD-DESPAWN] (despawn real del clon) en nueva conexión
         spdlog::info("Core::HandleSpawnQueue: Reset statics for new connection");
     }
 
@@ -8127,8 +10368,14 @@ void Core::HandleSpawnQueue() {
     // Red de seguridad FIX-FACTORY-GW #1: si OnGameLoaded corrió antes de que el GameWorld
     // estuviera resuelto, reintentamos la captura del factory aquí (idempotente: no-op si ya
     // hay factory). Así IsReady() se activa en cuanto el GameWorld es válido.
+    // [Oleada A 2026-07-12] Guard de intervalo añadido: sin él esta llamada corría CADA tick
+    // (~160/s) mientras no hubiera factory, inundando el log con los warns de isPlausibleFactory
+    // (2M de rechazos en la sesión de investigación). Mismo ritmo que FIX-FACTORY-RETRY (~1s).
     if (!m_spawnManager.IsReady() && gwValidForScan) {
-        m_spawnManager.CaptureFactoryFromGameWorld(m_gameFuncs.GameWorldSingleton);
+        static int s_factoryScanRetryGuard = 0;
+        if (++s_factoryScanRetryGuard % 150 == 0) {
+            m_spawnManager.CaptureFactoryFromGameWorld(m_gameFuncs.GameWorldSingleton);
+        }
     }
     bool canScan = m_spawnManager.IsReady() || gwValidForScan;
     if (needsScan && canScan && timeSinceLastScan.count() >= 5) {

@@ -176,6 +176,23 @@ const TrackedChar* FindByPtr(void* characterPtr) {
     return (it != s_trackedChars.end()) ? &it->second : nullptr;
 }
 
+// Cambio 2.1: purga la entrada de un puntero concreto del tracker.
+// Llamado desde el destroy-hook del motor (Hook_CharacterDestroy) para que un Character
+// destruido no deje una entrada colgada apuntando a memoria que el motor puede reciclar.
+// Usa el mismo mutex que el resto de funciones del fichero.
+void RemoveByPtr(void* ptr) {
+    std::lock_guard lock(s_trackerMutex);
+    s_trackedChars.erase(ptr);
+}
+
+// Cambio 2.2: vacía TODO el tracker de golpe.
+// Llamado en desconexión / recarga de save en caliente: todos los punteros cacheados
+// pasan a ser inválidos (el motor libera los Character de la sesión/partida anterior).
+void Clear() {
+    std::lock_guard lock(s_trackerMutex);
+    s_trackedChars.clear();
+}
+
 void* GetLocalPlayerAnimClass() { return s_localPlayerAnimClass; }
 
 void* GetRemotePlayerAnimClass(const std::string& name) {

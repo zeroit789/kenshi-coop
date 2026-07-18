@@ -241,19 +241,33 @@ void PipelineOrchestrator::BroadcastSnapshot(const PipelineSnapshot& snap) {
 void PipelineOrchestrator::BroadcastPendingEvents() {
     if (!m_client) return;
 
-    std::lock_guard lock(m_eventMutex);
-    if (m_pendingBroadcast.empty()) return;
+    // FIX deadlock ABBA (m_eventMutex <-> m_enetMutex):
+    // Extraemos el lote de eventos pendientes BAJO m_eventMutex, SOLTAMOS el lock,
+    // y solo ENTONCES enviamos por red. Enviar dentro del scope del lock permitía
+    // que el hilo de juego tomara m_eventMutex -> m_enetMutex mientras el hilo de
+    // red tomaba m_enetMutex -> m_eventMutex, congelando ambos hilos.
+    // Mismo patrón que BroadcastSnapshot: copiar bajo lock, enviar fuera de él.
+    std::vector<PipelineEvent> batch;
+    {
+        std::lock_guard lock(m_eventMutex);
+        if (m_pendingBroadcast.empty()) return;
 
-    // Batch up to EVENT_BROADCAST_BATCH events per packet
-    int count = static_cast<int>(std::min(m_pendingBroadcast.size(),
-                                           (size_t)EVENT_BROADCAST_BATCH));
+        // Batch up to EVENT_BROADCAST_BATCH events per packet
+        int count = static_cast<int>(std::min(m_pendingBroadcast.size(),
+                                               (size_t)EVENT_BROADCAST_BATCH));
+        batch.reserve(count);
+        for (int i = 0; i < count; i++) {
+            batch.push_back(std::move(m_pendingBroadcast.front()));
+            m_pendingBroadcast.pop_front();
+        }
+    } // m_eventMutex liberado ANTES de tocar la red
 
+    // Serialización idéntica a la anterior, ahora usando el lote copiado 'batch'.
     PacketWriter writer;
     writer.WriteHeader(MessageType::C2S_PipelineEvent);
-    writer.WriteU8(static_cast<uint8_t>(count));
+    writer.WriteU8(static_cast<uint8_t>(batch.size()));
 
-    for (int i = 0; i < count; i++) {
-        auto& evt = m_pendingBroadcast.front();
+    for (const auto& evt : batch) {
         writer.WriteU8(static_cast<uint8_t>(evt.type));
         writer.WriteU8(evt.severity);
         writer.WriteU16(0); // padding
@@ -262,9 +276,9 @@ void PipelineOrchestrator::BroadcastPendingEvents() {
         writer.WriteU32(evt.auxData);
         std::string detail = evt.detail.substr(0, 64);
         writer.WriteString(detail);
-        m_pendingBroadcast.pop_front();
     }
 
+    // Envío de red FUERA del lock -> ya no puede producirse el deadlock ABBA.
     m_client->SendReliableUnordered(writer.Data(), writer.Size());
 }
 

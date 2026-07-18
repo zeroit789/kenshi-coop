@@ -29,3 +29,35 @@ C:\Program Files (x86)\Steam\steamapps\common\Kenshi\KenshiMP\tools\ModGen\ModGe
 C:\Program Files (x86)\Steam\steamapps\common\Kenshi\KenshiMP\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.genruntimeconfig.cache
 C:\Program Files (x86)\Steam\steamapps\common\Kenshi\KenshiMP\tools\ModGen\ModGen\obj\Release\net10.0\ref\ModGen.dll
 C:\Program Files (x86)\Steam\steamapps\common\Kenshi\KenshiMP\tools\ModGen\ModGen\bin\Release\net10.0\Microsoft.Extensions.DependencyInjection.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\ModGen.exe
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\ModGen.deps.json
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\ModGen.runtimeconfig.json
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\ModGen.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\ModGen.pdb
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\FluentResults.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\GameFinder.Common.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\GameFinder.RegistryUtils.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\GameFinder.StoreHandlers.GOG.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\GameFinder.StoreHandlers.Steam.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\GameFinder.Wine.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\Microsoft.Extensions.DependencyInjection.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\Microsoft.Extensions.DependencyInjection.Abstractions.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\Microsoft.Extensions.Logging.Abstractions.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\NexusMods.Paths.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\OneOf.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\OpenConstructionSet.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\Reloaded.Memory.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\ValveKeyValue.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\bin\Release\net10.0\Vogen.SharedTypes.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.csproj.AssemblyReference.cache
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.GeneratedMSBuildEditorConfig.editorconfig
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.AssemblyInfoInputs.cache
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.AssemblyInfo.cs
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.csproj.CoreCompileInputs.cache
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.sourcelink.json
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.csproj.Up2Date
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\refint\ModGen.dll
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.pdb
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ModGen.genruntimeconfig.cache
+E:\Aplicaciones\Kenshi-Online\tools\ModGen\ModGen\obj\Release\net10.0\ref\ModGen.dll

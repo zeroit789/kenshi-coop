@@ -475,8 +475,8 @@ void CommandRegistry::RegisterBuiltins() {
         r += fmtOff("equipment", co.equipment);
         r += fmtOff("isPlayerControlled", co.isPlayerControlled);
         r += fmtOff("health (direct)", co.health);
-        r += fmtOff("healthChain1", co.healthChain1);
-        r += fmtOff("healthChain2", co.healthChain2);
+        r += fmtOff("healthPartArray", co.healthPartArray);
+        r += fmtOff("healthPartCount", co.healthPartCount);
         r += fmtOff("healthBase", co.healthBase);
         r += fmtOff("moneyChain1", co.moneyChain1);
         r += fmtOff("moneyChain2", co.moneyChain2);
@@ -859,25 +859,30 @@ void CommandRegistry::RegisterBuiltins() {
             return (val != 0);
         });
 
-        // Health chain: follow pointer chain
+        // Health chain — cadena CANÓNICA MedicalSystem (ver game_types.h):
+        //   partArray = [char+0x5F8] (HealthPartStatus**), partCount = [char+0x5F0],
+        //   part_0 = [partArray], flesh = [part_0+0x40]
         {
-            r += "\n  --- Health Chain ---";
-            uintptr_t step1 = 0, step2 = 0;
+            r += "\n  --- Health Chain (canonica MedicalSystem) ---";
+            uintptr_t partArray = 0, part0 = 0;
+            int partCount = 0;
             float hp = 0;
             bool ok = false;
-            Memory::Read(ptr + co.healthChain1, step1);
-            if (step1 > 0x10000 && step1 < 0x00007FFFFFFFFFFF) {
-                Memory::Read(step1 + co.healthChain2, step2);
-                if (step2 > 0x10000 && step2 < 0x00007FFFFFFFFFFF) {
-                    Memory::Read(step2 + co.healthBase, hp);
+            Memory::Read(ptr + co.healthPartArray, partArray);
+            Memory::Read(ptr + co.healthPartCount, partCount);
+            if (partArray > 0x10000 && partArray < 0x00007FFFFFFFFFFF &&
+                partCount > 0 && partCount <= 32) {
+                Memory::Read(partArray, part0);
+                if (part0 > 0x10000 && part0 < 0x00007FFFFFFFFFFF) {
+                    Memory::Read(part0 + co.healthBase, hp);
                     ok = (hp >= -100.f && hp <= 200.f);
                 }
             }
-            snprintf(buf, sizeof(buf), "\n  %s health chain: +%X -> 0x%llX -> +%X -> 0x%llX -> +%X -> %.1f",
+            snprintf(buf, sizeof(buf),
+                     "\n  %s health chain: +%X -> partArray=0x%llX (count=%d) -> part0=0x%llX -> +%X -> %.1f",
                      ok ? "PASS" : "FAIL",
-                     co.healthChain1, (unsigned long long)step1,
-                     co.healthChain2, (unsigned long long)step2,
-                     co.healthBase, hp);
+                     co.healthPartArray, (unsigned long long)partArray, partCount,
+                     (unsigned long long)part0, co.healthBase, hp);
             r += buf;
             if (ok) pass++; else fail++;
         }
@@ -1302,75 +1307,57 @@ void CommandRegistry::RegisterBuiltins() {
         }
 
         // ══════════════════════════════════════════════════════════════
-        //  STEP 5: Scan for HEALTH CHAIN
-        //  Follow every pointer in the struct, then follow sub-pointers,
-        //  looking for arrays of floats near 100.0
+        //  STEP 5: Verify HEALTH CHAIN (cadena canónica MedicalSystem)
+        //  [Oleada A 2026-07-12] El scan viejo buscaba "7 floats stride 8" tras
+        //  una cadena de 2 derefs — modelo que NO existe en 1.0.68 (la salud vive
+        //  en HealthPartStatus* individuales). Ahora se recorre la cadena real:
+        //    partArray = [char+0x5F8] → part_i = [partArray + i*8] → flesh @ +0x40
         // ══════════════════════════════════════════════════════════════
-        r += "\n\n  --- Health Chain Discovery ---";
-        int discoveredHC1 = -1, discoveredHC2 = -1, discoveredHBase = -1;
-        spdlog::info("DISCOVER: Starting health chain scan...");
+        r += "\n\n  --- Health Chain (canonica MedicalSystem) ---";
+        spdlog::info("DISCOVER: Verifying canonical health chain...");
+        {
+            uintptr_t partArray = 0;
+            int partCount = 0;
+            Memory::Read(charPtr + co.healthPartArray, partArray);
+            Memory::Read(charPtr + co.healthPartCount, partCount);
 
-        for (int off1 = 0x100; off1 < 0x400; off1 += 8) {
-            uintptr_t ptr1 = 0;
-            Memory::Read(charPtr + off1, ptr1);
-            if (!isHeapPtr(ptr1)) continue;
-
-            // Follow sub-pointers from ptr1
-            for (int off2 = 0; off2 < 0x800; off2 += 8) {
-                uintptr_t ptr2 = 0;
-                if (!Memory::Read(ptr1 + off2, ptr2)) continue;
-                if (!isHeapPtr(ptr2)) continue;
-
-                // Look for 7 consecutive floats near 100.0 (full health character)
-                for (int base = 0; base < 0x200; base += 4) {
-                    int goodCount = 0;
-                    for (int part = 0; part < 7; part++) {
-                        float hp = 0;
-                        if (!Memory::Read(ptr2 + base + part * 8, hp)) break;
-                        // Health values for a loaded char are typically 50-200 range
-                        if (hp > 10.f && hp < 300.f) goodCount++;
-                    }
-                    if (goodCount >= 5) {
-                        // Found a candidate! Read all 7 values
-                        float healthVals[7] = {};
-                        for (int p = 0; p < 7; p++)
-                            Memory::Read(ptr2 + base + p * 8, healthVals[p]);
-
-                        snprintf(buf, sizeof(buf),
-                                 "\n  FOUND health chain: +0x%03X -> +0x%03X -> +0x%03X"
-                                 "\n    [%.0f, %.0f, %.0f, %.0f, %.0f, %.0f, %.0f]",
-                                 off1, off2, base,
-                                 healthVals[0], healthVals[1], healthVals[2], healthVals[3],
-                                 healthVals[4], healthVals[5], healthVals[6]);
-                        r += buf;
-                        spdlog::info("DISCOVER: Health chain +0x{:03X} -> +0x{:03X} -> +0x{:03X} = "
-                                     "[{:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}]",
-                                     off1, off2, base,
-                                     healthVals[0], healthVals[1], healthVals[2], healthVals[3],
-                                     healthVals[4], healthVals[5], healthVals[6]);
-
-                        if (discoveredHC1 == -1) {
-                            discoveredHC1 = off1;
-                            discoveredHC2 = off2;
-                            discoveredHBase = base;
-                        }
-                    }
+            int goodParts = 0;
+            float healthVals[7] = {};
+            if (isHeapPtr(partArray) && partCount > 0 && partCount <= 32) {
+                int n = (partCount < 7) ? partCount : 7;
+                for (int p = 0; p < n; p++) {
+                    uintptr_t partPtr = 0;
+                    if (!Memory::Read(partArray + p * co.healthStride, partPtr)) break;
+                    if (!isHeapPtr(partPtr)) continue;
+                    float hp = 0;
+                    if (!Memory::Read(partPtr + co.healthBase, hp)) continue;
+                    healthVals[p] = hp;
+                    // Salud plausible para un char cargado: -100..300
+                    if (hp >= -100.f && hp < 300.f) goodParts++;
                 }
             }
-        }
 
-        if (discoveredHC1 == co.healthChain1 && discoveredHC2 == co.healthChain2 && discoveredHBase == co.healthBase) {
-            matches++;
-            r += "\n  OK: Matches hardcoded chain (0x2B8->0x5F8->0x40)";
-        } else if (discoveredHC1 >= 0) {
-            snprintf(buf, sizeof(buf), "\n  MISMATCH: Hardcoded=(0x%X->0x%X->0x%X), Found=(0x%X->0x%X->0x%X)",
-                     co.healthChain1, co.healthChain2, co.healthBase,
-                     discoveredHC1, discoveredHC2, discoveredHBase);
-            r += buf;
-            mismatches++;
-        } else {
-            r += "\n  NOT FOUND (no 7-float health array discovered)";
-            mismatches++;
+            if (goodParts >= 5) {
+                matches++;
+                snprintf(buf, sizeof(buf),
+                         "\n  OK: canonical chain +0x%X (count=%d) -> +0x%X"
+                         "\n    [%.0f, %.0f, %.0f, %.0f, %.0f, %.0f, %.0f]",
+                         co.healthPartArray, partCount, co.healthBase,
+                         healthVals[0], healthVals[1], healthVals[2], healthVals[3],
+                         healthVals[4], healthVals[5], healthVals[6]);
+                r += buf;
+                spdlog::info("DISCOVER: canonical health chain OK — partArray=0x{:X} count={} "
+                             "[{:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}]",
+                             partArray, partCount,
+                             healthVals[0], healthVals[1], healthVals[2], healthVals[3],
+                             healthVals[4], healthVals[5], healthVals[6]);
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "\n  FAIL: canonical chain — partArray=0x%llX count=%d goodParts=%d",
+                         (unsigned long long)partArray, partCount, goodParts);
+                r += buf;
+                mismatches++;
+            }
         }
 
         // ══════════════════════════════════════════════════════════════

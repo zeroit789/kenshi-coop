@@ -358,21 +358,47 @@ void Update(float deltaTime) {
         static int s_revalidateCounter = 0;
         if (++s_revalidateCounter % 300 == 0) { // Every ~5 seconds at 60fps
             auto* tc = char_tracker_hooks::FindByName(s_ownCharName);
-            if (tc && tc->animClassPtr != s_ownAnimClass) {
-                s_ownAnimClass = tc->animClassPtr;
-                s_ownCharPtr = tc->characterPtr;
-                spdlog::debug("shared_save_sync: Own animClass updated to 0x{:X}",
-                              reinterpret_cast<uintptr_t>(s_ownAnimClass));
+            if (tc && tc->animClassPtr) {
+                // Encontrado: actualizar cachés solo si el animClass cambió (recreación de zona).
+                if (tc->animClassPtr != s_ownAnimClass) {
+                    s_ownAnimClass = tc->animClassPtr;
+                    s_ownCharPtr = tc->characterPtr;
+                    spdlog::debug("shared_save_sync: Own animClass updated to 0x{:X}",
+                                  reinterpret_cast<uintptr_t>(s_ownAnimClass));
+                }
+            } else {
+                // Cambio 1: la búsqueda del propio falló (char destruido/recargado o aún no existe).
+                // Invalidar cachés own para no leer/escribir sobre un puntero reciclado por el motor;
+                // s_ownFound=false fuerza la re-búsqueda (STEP 1) en el siguiente tick.
+                s_ownAnimClass = nullptr;
+                s_ownCharPtr = nullptr;
+                s_ownFound = false;
             }
             // Revalidar "other" solo si el modelo binario aplica (2 jugadores).
             if (s_otherRequired) {
                 auto* tc2 = char_tracker_hooks::FindByName(s_otherCharName);
-                if (tc2 && tc2->animClassPtr != s_otherAnimClass) {
-                    s_otherAnimClass = tc2->animClassPtr;
-                    s_otherCharPtr = tc2->characterPtr;
-                    if (s_otherCharPtr) ai_hooks::MarkRemoteControlled(s_otherCharPtr);
-                    spdlog::debug("shared_save_sync: Other animClass updated to 0x{:X}",
-                                  reinterpret_cast<uintptr_t>(s_otherAnimClass));
+                if (tc2 && tc2->animClassPtr) {
+                    // Encontrado: actualizar cachés solo si el animClass cambió.
+                    if (tc2->animClassPtr != s_otherAnimClass) {
+                        // Cambio 3.1: desmarcar el puntero "other" ANTERIOR antes de sustituirlo por
+                        // el nuevo, para que no quede marcado como remote-controlled para siempre si
+                        // el motor recicla esa dirección para un NPC local nuevo.
+                        if (s_otherCharPtr && s_otherCharPtr != tc2->characterPtr) {
+                            ai_hooks::UnmarkRemoteControlled(s_otherCharPtr);
+                        }
+                        s_otherAnimClass = tc2->animClassPtr;
+                        s_otherCharPtr = tc2->characterPtr;
+                        if (s_otherCharPtr) ai_hooks::MarkRemoteControlled(s_otherCharPtr);
+                        spdlog::debug("shared_save_sync: Other animClass updated to 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(s_otherAnimClass));
+                    }
+                } else {
+                    // Cambio 1: la búsqueda del ajeno falló → invalidar cachés other (evita UAF sobre
+                    // memoria reciclada). Desmarcamos el puntero viejo para no dejarlo remote-controlled.
+                    if (s_otherCharPtr) ai_hooks::UnmarkRemoteControlled(s_otherCharPtr);
+                    s_otherAnimClass = nullptr;
+                    s_otherCharPtr = nullptr;
+                    s_otherFound = false;
                 }
             }
         }

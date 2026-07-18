@@ -255,51 +255,51 @@ bool SpawnManager::CaptureFactoryFromGameWorld(uintptr_t gwSingleton) {
                          "[0x{:X},0x{:X}) (no es objeto de heap)", tag, p, moduleBase, kModuleEnd);
             return false;
         }
-        // (4) NUEVA — descarta el patrón "valor de 32 bits con mitad alta nula".
-        // Un puntero de heap x64 bajo ASLR NUNCA tiene los 32 bits altos a cero. El valor
-        // 0x590301A0 (constante, persistente) caía aquí: NO es un RootObjectFactory* real.
-        // El heap de un proceso x64 vive muy por encima de 0x1'00000000. Exigimos >= 0x10000000000
-        // (256 GB) que es donde residen heaps/módulos en Win x64 (módulo Kenshi ≈ 0x7FF6...).
-        if ((p >> 32) == 0) {
-            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#4 mitad alta NULA "
-                         "(valor de 32 bits, NO es puntero de heap x64 — p.ej. 0x590301A0)", tag, p);
-            return false;
-        }
-        if (p < 0x10000000000ull) {
-            spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#4b por debajo del rango "
-                         "de heap x64 (<0x100'00000000)", tag, p);
-            return false;
-        }
-        // (5) El 1er qword del factory debe ser su VTABLE. En MSVC x64 la vtable vive en .rdata
-        // (sus entradas apuntan a .text). Aceptamos vtable en .rdata O .text (defensivo).
+        // ⛔ checks #4/#4b ELIMINADOS (2026-07-12, Oleada A): rechazaban candidatos con los
+        // 32 bits altos a cero asumiendo que un heap x64 nunca vive bajo 4GB. FALSO en esta
+        // máquina: el heap propio de Kenshi SÍ vive bajo 4GB, por lo que el factory REAL
+        // (que sí se puebla en runtime en modBase+0x21345B0) se rechazaba SIEMPRE
+        // (2M de rechazos, 0 aciertos en los logs de la sesión de investigación).
+        // El check#1 (p > 0x10000) ya cubre el rango bajo razonable; lo que de verdad
+        // distingue un objeto C++ real es el check de vtable de abajo (ahora OBLIGATORIO).
+        //
+        // (5) OBLIGATORIO: el 1er qword del candidato debe ser su VTABLE, y la vtable debe
+        // vivir en .rdata del módulo (MSVC x64 pone las vtables en .rdata). Si la lectura
+        // falla (memoria no mapeada, p.ej. un float 0x3F000000 reinterpretado), RECHAZAR.
         uintptr_t vt = 0;
         if (!Memory::Read(p, vt)) {
             spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#5 *p ilegible (no se pudo "
-                         "leer la vtable)", tag, p);
+                         "leer la vtable — memoria no mapeada, no es objeto C++)", tag, p);
             return false;
         }
         bool vtInRdata = inRange(vt, rdataStart, rdataEnd);
-        bool vtInText  = inRange(vt, textStart, textEnd);
-        if (!vtInRdata && !vtInText) {
+        // Fallback defensivo SOLO si .rdata no se pudo localizar por nombre en las cabeceras:
+        // en ese caso aceptamos vtable en .text (mejor que rechazar todo).
+        bool vtOk = vtInRdata || (rdataEnd == 0 && inRange(vt, textStart, textEnd));
+        if (!vtOk) {
             spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#5 vtable=0x{:X} fuera de "
-                         ".rdata [0x{:X},0x{:X}) y .text [0x{:X},0x{:X})",
-                         tag, p, vt, rdataStart, rdataEnd, textStart, textEnd);
+                         ".rdata [0x{:X},0x{:X}) — no es un objeto C++ del módulo",
+                         tag, p, vt, rdataStart, rdataEnd);
             return false;
         }
-        // (6) Refuerzo: si la vtable está en .rdata, su 1ª entrada (1er método virtual) debe
-        // apuntar a CÓDIGO (.text). Esto descarta que 'vt' sea un float/dato que casualmente
-        // caiga en .rdata. Si la lectura falla, NO rechazamos (defensivo: la check#5 ya pasó).
-        if (vtInRdata) {
-            uintptr_t firstSlot = 0;
-            if (Memory::Read(vt, firstSlot) && firstSlot != 0 && !inRange(firstSlot, textStart, textEnd)) {
-                spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#6 vtable@0x{:X} en .rdata "
-                             "pero su 1ª entrada=0x{:X} NO apunta a .text [0x{:X},0x{:X})",
-                             tag, p, vt, firstSlot, textStart, textEnd);
+        // (6) OBLIGATORIO (antes "defensivo"): las 3 primeras entradas de la vtable deben
+        // apuntar a .text del módulo. Esto es lo que de verdad distingue un objeto C++ real
+        // de basura de heap o de un float reinterpretado como puntero. Si alguna lectura
+        // falla o alguna entrada cae fuera de .text, RECHAZAR.
+        for (int slot = 0; slot < 3; ++slot) {
+            uintptr_t entry = 0;
+            if (!Memory::Read(vt + slot * 8, entry) || !inRange(entry, textStart, textEnd)) {
+                spdlog::warn("[FIX-FACTORY-GW/{}] RECHAZADO p=0x{:X}: check#6 vtable@0x{:X} "
+                             "entrada[{}]=0x{:X} NO apunta a .text [0x{:X},0x{:X}) — vtable no válida",
+                             tag, p, vt, slot, entry, textStart, textEnd);
                 return false;
             }
         }
-        spdlog::info("[FIX-FACTORY-GW/{}] ACEPTADO p=0x{:X} (vtable=0x{:X}, {}): factory plausible",
-                     tag, p, vt, vtInRdata ? ".rdata" : ".text");
+        // Al aceptar, loguear el RVA de la vtable: sirve para pinnear la vtable real de
+        // RootObjectFactory en Steam 1.0.68 en la próxima sesión.
+        spdlog::info("[FIX-FACTORY-GW/{}] ACEPTADO p=0x{:X} (vtable=0x{:X}, RVA-vtable=0x{:X}, {}): "
+                     "factory plausible",
+                     tag, p, vt, vt - moduleBase, vtInRdata ? ".rdata" : ".text");
         return true;
     };
 
@@ -326,8 +326,11 @@ bool SpawnManager::CaptureFactoryFromGameWorld(uintptr_t gwSingleton) {
     // Volcamos ±0x40 alrededor del slot y marcamos qué qword SÍ pasaría isPlausibleFactory.
     // Si un vecino resulta plausible, la próxima sesión revela el offset correcto SIN parchear
     // a ciegas. Esto NO captura nada (solo diagnostica): la captura sigue gobernada por la
-    // validación endurecida. Coste: 17 lecturas SEH-safe, una sola vez por intento fallido.
-    {
+    // validación endurecida. Coste: 17 lecturas SEH-safe, UNA SOLA VEZ por proceso (antes se
+    // ejecutaba en CADA intento fallido — inundaba el log a ~160 intentos/s durante la carga).
+    static bool s_diagSlotDumped = false;
+    if (!s_diagSlotDumped) {
+        s_diagSlotDumped = true;
         spdlog::info("[DIAG-FACTORY-SLOT] volcado vecindad de theFactory @RVA 0x{:X} "
                      "(modBase=0x{:X}):", THEFACTORY_GLOBAL_RVA, moduleBase);
         for (int off = -0x40; off <= 0x40; off += 8) {
@@ -758,35 +761,15 @@ void SpawnManager::ScanGameDataHeap() {
         }
     }
 
-    // ── Strategy 1: Try hardcoded offsets (fast, works if version matches) ──
     uintptr_t gdmAddress = 0;
     uintptr_t gdmValue = 0;
 
-    uintptr_t hardcodedCandidates[] = {
-        moduleBase + 0x2133060,          // GOG GameDataManagerMain
-        moduleBase + 0x2133040 + 0x20,   // GOG GameWorld + dataMgr1 offset
-    };
-
-    for (auto candAddr : hardcodedCandidates) {
-        uintptr_t val = 0;
-        if (Memory::Read(candAddr, val) && val != 0) {
-            if (val > 0x10000 && val < 0x00007FFFFFFFFFFF &&
-                (val & 0x7) == 0 &&
-                !(val >= moduleBase && val < moduleBase + moduleSize)) {
-                // Double-dereference: a real GameDataManager should be readable
-                uintptr_t check = 0;
-                if (Memory::Read(val, check) && check != 0) {
-                    gdmAddress = candAddr;
-                    gdmValue = val;
-                    spdlog::info("SpawnManager: GameDataManager found via hardcoded offset 0x{:X} -> 0x{:X}", candAddr, val);
-                    break;
-                }
-            }
-        }
-    }
-
-    // ── Strategy 2: Derive from GameWorld singleton (works on Steam + GOG) ──
-    if (gdmValue == 0) {
+    // ── Estrategia 2 (AHORA PRIMERA — reordenada Oleada A 2026-07-12): derivar del singleton
+    // GameWorld (funciona en builds Steam Y GOG). Antes se probaba primero la Estrategia 1
+    // (offsets GOG hardcodeados), que en Steam 1.0.68 falla siempre y además, durante los
+    // primeros ticks de carga, dispara una excepción benigna (deref de 0x3F000000, capturada
+    // por SEH pero que genera ruido de log). Esta vía es la que funciona de verdad en Steam.
+    {
         auto& core = Core::Get();
         uintptr_t gwAddr = core.GetGameFunctions().GameWorldSingleton;
         if (gwAddr != 0) {
@@ -808,14 +791,28 @@ void SpawnManager::ScanGameDataHeap() {
                 }
             }
             if (gwObj != 0) {
-                // GameWorld+0x20 = dataMgr1 (KenshiLib verified)
-                uintptr_t val = 0;
-                if (Memory::Read(gwObj + 0x20, val) && val != 0 &&
-                    val > 0x10000 && val < 0x00007FFFFFFFFFFF &&
-                    !(val >= moduleBase && val < moduleBase + moduleSize)) {
-                    gdmValue = val;
-                    gdmAddress = gwObj + 0x20;
-                    spdlog::info("SpawnManager: GameDataManager found via GameWorld+0x20 = 0x{:X} (gwObj=0x{:X})", val, gwObj);
+                // FIX 1.0.68 (RTTI-confirmado en vivo, confianza ALTA): GameDataManager es una
+                // INSTANCIA EMBEBIDA en GameWorld+0x20, NO un puntero. Por tanto *(gwObj+0x20) es
+                // su VTABLE (vive en .rdata, DENTRO del modulo), no un puntero a heap. El codigo
+                // anterior leia ese qword como si fuera el GameDataManager* y lo rechazaba justo
+                // por caer in-module -> la Estrategia 2 no disparaba nunca en Steam 1.0.68.
+                //
+                // El GameDataManager* que los objetos GameData+0x10 guardan como backpointer (y que
+                // el heap scan de mas abajo busca con `val == gdmValue`) es la DIRECCION de la
+                // instancia embebida (= gwObj+0x20), NO el contenido de ese qword (la vtable).
+                //
+                // Nuevo enfoque: leer la vtable en gwObj+0x20 SOLO para validar que es un objeto
+                // polimorfico legitimo (vtable dentro del rango del modulo, .rdata) — comprobacion
+                // INVERSA a la anterior — y si valida, usar la DIRECCION gwObj+0x20 como gdmValue.
+                uintptr_t gdmInstance = gwObj + 0x20;   // direccion de la instancia embebida (= identidad del GDM)
+                uintptr_t vtbl = 0;                     // primer qword del objeto = puntero a su vtable
+                if (Memory::Read(gdmInstance, vtbl) && vtbl != 0 &&
+                    vtbl >= (moduleBase + 0x1000) && vtbl < (moduleBase + moduleSize)) {
+                    // vtable dentro del modulo (.rdata) -> instancia polimorfica valida
+                    gdmValue = gdmInstance;             // usar la DIRECCION, no el contenido
+                    gdmAddress = gdmInstance;
+                    spdlog::info("SpawnManager: GameDataManager (instancia embebida) GameWorld+0x20 = 0x{:X} (vtbl=0x{:X}, gwObj=0x{:X})",
+                                 gdmInstance, vtbl, gwObj);
                 }
             }
         }
@@ -842,6 +839,35 @@ void SpawnManager::ScanGameDataHeap() {
         gdmAddress = 0; // Not from a specific address
         spdlog::info("SpawnManager: GameDataManager from character backpointer extraction = 0x{:X}",
                      m_managerPointer);
+    }
+
+    // ── Estrategia 1 (ÚLTIMO recurso — reordenada Oleada A 2026-07-12): offsets GOG
+    // hardcodeados. Solo se intenta si TODAS las vías anteriores fallaron, y solo con el
+    // juego ya cargado: sin el gate IsGameLoaded(), en los primeros ticks de carga estos
+    // derefs disparaban la excepción benigna 0x3F000000 (capturada por SEH, ruido de log).
+    if (gdmValue == 0 && Core::Get().IsGameLoaded()) {
+        uintptr_t hardcodedCandidates[] = {
+            moduleBase + 0x2133060,          // GOG GameDataManagerMain
+            moduleBase + 0x2133040 + 0x20,   // GOG GameWorld + dataMgr1 offset
+        };
+
+        for (auto candAddr : hardcodedCandidates) {
+            uintptr_t val = 0;
+            if (Memory::Read(candAddr, val) && val != 0) {
+                if (val > 0x10000 && val < 0x00007FFFFFFFFFFF &&
+                    (val & 0x7) == 0 &&
+                    !(val >= moduleBase && val < moduleBase + moduleSize)) {
+                    // Double-dereference: a real GameDataManager should be readable
+                    uintptr_t check = 0;
+                    if (Memory::Read(val, check) && check != 0) {
+                        gdmAddress = candAddr;
+                        gdmValue = val;
+                        spdlog::info("SpawnManager: GameDataManager found via hardcoded offset 0x{:X} -> 0x{:X}", candAddr, val);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     if (gdmValue == 0) {

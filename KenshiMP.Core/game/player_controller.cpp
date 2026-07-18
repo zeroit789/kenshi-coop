@@ -44,6 +44,23 @@ std::vector<EntityID> PlayerController::GetLocalSquadEntities() const {
 }
 
 void* PlayerController::GetPrimaryCharacter() const {
+    // [FIX-PRIMARY 2026-07] Re-resolver SIEMPRE contra la fuente de verdad NATIVA
+    // del motor: PlayerInterface+0x2B0 (lektor playerCharacters), data[0] = el
+    // personaje REAL del jugador (mismo camino que ClaimHostPrimaryCharacter /
+    // GetPlayerPrimaryCharacterDirect). Antes se devolvía "la primera entidad del
+    // registry con game object válido": cuando el registry de red reasignaba IDs,
+    // el NPC fantasma "Player N" (reclamado por nombre) podía pasar a ser "el
+    // primero" y TODOS los fixes del host (facción, platoon, hostilidad) se
+    // aplicaban al fantasma mientras el personaje real se quedaba congelado
+    // (confirmado en vivo: ambos con activeTask=NULL, amIdle=1, char+0xDC=0).
+    uintptr_t native = game::GetPlayerPrimaryCharacterDirect();
+    if (native != 0) {
+        return reinterpret_cast<void*>(native);
+    }
+
+    // Fallback: si la resolución nativa falla (juego aún no cargado, lista sin
+    // poblar), cae al comportamiento anterior — primera entidad del registry
+    // con game object válido. NO eliminar: cubre el timing post-carga.
     auto& registry = Core::Get().GetEntityRegistry();
     auto entities = registry.GetPlayerEntities(m_localPlayerId);
     if (entities.empty()) return nullptr;

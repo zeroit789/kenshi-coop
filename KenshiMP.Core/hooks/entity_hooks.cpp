@@ -1,6 +1,7 @@
 #include "entity_hooks.h"
 #include "save_hooks.h"
 #include "ai_hooks.h"
+#include "char_tracker_hooks.h"
 #include "squad_hooks.h"
 #include "../core.h"
 #include "../game/game_types.h"
@@ -35,7 +36,11 @@ static bool s_earlyFactoryLogged = false;
 
 // ── Function Types ──
 using CharacterCreateFn = void*(__fastcall*)(void* factory, void* templateData);
-using CharacterDestroyFn = void(__fastcall*)(void* character);
+// Destructor virtual MSVC (vtable slot 0): "scalar deleting destructor".
+// Firma real: void*(this, flags). flags bit0 = liberar memoria tras destruir.
+// OJO: NO confundir con funcs.CharacterDestroy — ese RVA resuelve a
+// NodeList::destroyNodesByBuilding, función equivocada (confirmado en pattern-verification.md).
+using CharacterDestroyFn = void*(__fastcall*)(void* character, unsigned int flags);
 
 // Store the ORIGINAL function addresses (NOT trampolines)
 static uintptr_t s_createTargetAddr = 0;
@@ -61,6 +66,10 @@ static void*              s_directCallStubAlloc = nullptr;
 
 // Whether CharacterDestroy hook is actually installed
 static bool s_destroyHookInstalled = false;
+
+// Instalación diferida del destroy hook (definida tras Hook_CharacterDestroy).
+// Necesita un Character* VIVO para leer su vtable — por eso no puede ir en Install().
+static void TryInstallDestroyHookFromCharacter(void* character);
 
 // ── Diagnostic Counters ──
 static std::atomic<int> s_totalCreates{0};
@@ -1032,6 +1041,11 @@ static void* __fastcall Hook_CharacterCreate(void* factory, void* templateData) 
         return nullptr;
     }
 
+    // ── Instalación diferida del destroy hook (una sola vez) ──
+    if (!s_destroyHookInstalled) {
+        TryInstallDestroyHookFromCharacter(character);
+    }
+
     // AnimClass probe (first 5 only)
     {
         if (s_earlyProbeCount < 5) {
@@ -1058,13 +1072,15 @@ static void* __fastcall Hook_CharacterCreate(void* factory, void* templateData) 
     return character;
 }
 
-static void __fastcall Hook_CharacterDestroy(void* character) {
+// Hook sobre el scalar deleting destructor de Character (resuelto en runtime vía vtable[0]).
+// Corre en el hilo de juego (quien destruye es el motor). Toda la limpieza del registro va
+// ANTES de llamar al original: después, la memoria del Character ya no existe.
+static void* __fastcall Hook_CharacterDestroy(void* character, unsigned int flags) {
     int destroyNum = s_totalDestroys.fetch_add(1) + 1;
 
     uintptr_t charAddr = reinterpret_cast<uintptr_t>(character);
     if (charAddr < 0x10000 || charAddr > 0x00007FFFFFFFFFFF) {
-        s_origDestroy(character);
-        return;
+        return s_origDestroy(character, flags);
     }
 
     auto& core = Core::Get();
@@ -1096,7 +1112,67 @@ static void __fastcall Hook_CharacterDestroy(void* character) {
         }
     }
 
-    s_origDestroy(character);
+    // Cambio 2.3: purgar este Character del char_tracker ANTES de destruirlo. Se hace siempre
+    // (haya o no conexión) porque el tracker cachea punteros de cualquier personaje del juego;
+    // si no se purga, queda una entrada colgada que FindByName/FindByPtr podría devolver
+    // apuntando a memoria que el motor recicla tras destruir/recargar el personaje (UAF).
+    char_tracker_hooks::RemoveByPtr(character);
+
+    // Destruir de verdad AL FINAL — la limpieza de arriba necesita el puntero vivo.
+    return s_origDestroy(character, flags);
+}
+
+// ── Instalación diferida del destroy hook vía vtable slot 0 ──
+// El patrón "CharacterDestroy" del scanner resuelve a la función equivocada. El RVA del
+// destructor real de Character se resuelve leyendo vtable[0] del primer Character vivo,
+// siguiendo el thunk de 5 bytes si aplica, y validando con .pdata que es inicio de función real
+// (mismo criterio que validateFactoryFunc en este mismo archivo).
+static void TryInstallDestroyHookFromCharacter(void* character) {
+    if (s_destroyHookInstalled || !character) return;
+
+    uintptr_t charAddr = reinterpret_cast<uintptr_t>(character);
+    if (charAddr < 0x10000 || charAddr > 0x00007FFFFFFFFFFF || (charAddr & 0x7) != 0) return;
+
+    uintptr_t modBase = Memory::GetModuleBase();
+
+    uintptr_t vtable = 0;
+    if (!Memory::Read(charAddr, vtable)) return;
+    if (vtable < modBase || vtable >= modBase + 0x4000000) return;
+
+    uintptr_t dtorAddr = 0;
+    if (!Memory::Read(vtable, dtorAddr)) return;
+    if (dtorAddr < modBase || dtorAddr >= modBase + 0x4000000) return;
+
+    // Seguir el thunk de 5 bytes (jmp rel32) si vtable[0] no es la función real directamente.
+    uint8_t firstByte = 0;
+    if (Memory::Read(dtorAddr, firstByte) && firstByte == 0xE9) {
+        int32_t rel32 = 0;
+        if (Memory::Read(dtorAddr + 1, rel32)) {
+            uintptr_t target = dtorAddr + 5 + static_cast<intptr_t>(rel32);
+            if (target >= modBase && target < modBase + 0x4000000) {
+                dtorAddr = target;
+            }
+        }
+    }
+
+    // Validación .pdata: tiene que ser un INICIO de función real
+    DWORD64 imageBase = 0;
+    auto* rtFunc = RtlLookupFunctionEntry(static_cast<DWORD64>(dtorAddr), &imageBase, nullptr);
+    if (!rtFunc || static_cast<uintptr_t>(imageBase) + rtFunc->BeginAddress != dtorAddr) {
+        spdlog::warn("entity_hooks: destroy-hook — vtable[0]=0x{:X} no es inicio de función — NO instalado", dtorAddr);
+        return;
+    }
+
+    if (!HookManager::Get().InstallAt("CharacterDestroy", dtorAddr,
+                                      &Hook_CharacterDestroy, &s_origDestroy)) {
+        spdlog::error("entity_hooks: destroy-hook — InstallAt FALLÓ en 0x{:X} (RVA 0x{:X})",
+                      dtorAddr, dtorAddr - modBase);
+        return;
+    }
+    HookManager::Get().Enable("CharacterDestroy");
+    s_destroyHookInstalled = true;
+    spdlog::info("entity_hooks: destroy-hook INSTALADO vía vtable[0] — dtor=0x{:X} (RVA 0x{:X})",
+                 dtorAddr, dtorAddr - modBase);
 }
 
 // ── Direct Call Stub Builder ──
@@ -1296,7 +1372,10 @@ bool Install() {
         }
     }
 
-    // CharacterDestroy hook NOT installed
+    // CharacterDestroy: NO se instala aquí a propósito. El patrón del scanner resuelve a
+    // NodeList::destroyNodesByBuilding — función equivocada. El hook real se instala DIFERIDO vía
+    // TryInstallDestroyHookFromCharacter() (vtable slot 0 del primer Character vivo, siguiendo el
+    // thunk si aplica), llamado desde Hook_CharacterCreate (conectado) y ResumeForNetwork().
     s_destroyHookInstalled = false;
 
     spdlog::info("entity_hooks: Installed (create={}, destroy={})",
@@ -1373,6 +1452,14 @@ void ResumeForNetwork() {
         spdlog::info("entity_hooks: ResumeForNetwork — CharacterCreate hook ENABLED (full mode)");
     } else {
         spdlog::warn("entity_hooks: ResumeForNetwork — CharacterCreate Enable() returned false");
+    }
+
+    // ── Instalación diferida del destroy hook con un mod template capturado ──
+    if (!s_destroyHookInstalled) {
+        void* tmpl[1] = {};
+        if (GetCapturedModTemplates(tmpl, 1) > 0) {
+            TryInstallDestroyHookFromCharacter(tmpl[0]);
+        }
     }
 
     spdlog::info("entity_hooks: ResumeForNetwork — hook active for runtime spawns "
