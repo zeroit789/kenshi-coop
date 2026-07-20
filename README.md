@@ -3,14 +3,28 @@
 **Open-source cooperative multiplayer for Kenshi (Steam 1.0.68).**
 A community continuation built on the work of several earlier multiplayer projects — see [CREDITS](CREDITS.md).
 
-[![Status](https://img.shields.io/badge/status-alpha%20%7C%20WIP-orange)]()
+[![Status](https://img.shields.io/badge/status-archived%20%7C%20unstable-red)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey)]()
 [![Kenshi](https://img.shields.io/badge/Kenshi-1.0.68%20Steam-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
-> ⚠️ **Alpha / work in progress.** This is an experimental mod under active development.
-> Co-op in Kenshi is extremely hard (the engine is single-threaded and was never designed
-> for networking). Expect bugs. The goal is a stable session for up to 16 players.
+> 🛑 **Archived / not stable — please use [nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop) instead.**
+>
+> This project (a continuation of `The404Studios/Kenshi-Online`) never got past the point of
+> making the host reliably play with the mod loaded — combat sync stayed at the diagnostic-hook
+> stage, remote-player spawning was unreliable on the Steam build, and client-side reconciliation
+> was never implemented upstream. After investigation, a different open-source project —
+> [nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop) — turned out to solve exactly these
+> problems (owner-authoritative characters with suppressed-AI puppets for remote players), and it
+> actually works in live 2-player sessions today. We've moved our effort there instead of
+> continuing this codebase. Our own reverse-engineering notes here (`docs/`, `RE-tools/`) remain
+> as reference and fed several fixes into that project, but this repository itself is not being
+> developed further.
+>
+> **If you want a working co-op mod for Kenshi right now, go to
+> [nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)** (or our fork with a combined,
+> tested build of several additional fixes: [zeroit789/KenshiCoop, `integration/session-2026-07-20-all-fixes`](https://github.com/zeroit789/KenshiCoop/tree/integration/session-2026-07-20-all-fixes),
+> [download the release here](https://github.com/zeroit789/KenshiCoop/releases/tag/session-2026-07-20)).
 
 ---
 

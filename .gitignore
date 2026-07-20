@@ -27,3 +27,25 @@ KenshiOnline*.log
 
 # Candidato generado por ModGen
 kenshi-online-16.mod
+
+# GPL-3.0 vendorizada como referencia (contamina el repo MIT si se sube) — decisión pendiente
+tools/KenshiLib-reference/
+
+# Local backups / archives / build byproducts (not source, not worth versioning)
+_deploy-backups/
+_kenshi-install-backup-*/
+_kenshi_archive/
+_re-data/
+_kenshi-server-config/
+dist/*.zip
+*.mod.bak-*
+tools/ModGen/ModGen/obj/
+tools/ModGen/ModGen/bin/
+__pycache__/
+*.pyc
+tools/autotest/*.png
+tools/autotest/*.err
+.codegraph/
+
+# Third-party standalone tools (not part of this project, kept locally only)
+RE-tools/
