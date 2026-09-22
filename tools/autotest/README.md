@@ -1,6 +1,6 @@
 # Autotest — Kenshi Co-op (prueba autónoma del mod)
 
-Herramientas EXTERNAS para que **Onyx (Claude) pruebe el mod co-op de Kenshi sin que un humano juegue a mano**. No tocan el código del mod (KenshiMP.Core / Scanner), solo lo lanzan y leen sus logs.
+Herramientas EXTERNAS para que **Onyx pruebe el mod co-op de Kenshi sin que un humano juegue a mano**. No tocan el código del mod (KenshiMP.Core / Scanner), solo lo lanzan y leen sus logs.
 
 > **TL;DR para Onyx:**
 > 1. Validar la capa de red primero (fiable): `run_autotest.bat` → no, eso es GUI. Para red usa `headless_test.py --integration` (requiere exes de test compilados).

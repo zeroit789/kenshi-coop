@@ -2,7 +2,7 @@
 
 Documento de referencia para APLICAR, no para investigar de nuevo. Toda la investigación (RVAs, AOBs,
 causas raíz) ya está confirmada con evidencia real — ver
-`C:\Users\Zero\Documents\Claude-Memory-Wiki\wiki\proyectos\KENSHI\Sesion-2026-07-11-combate-spawn-investigacion-fable.md`
+la sesión del 11-07-2026 sobre combate y spawn (wiki personal)
 si hace falta contexto adicional, pero NO repetir la investigación.
 
 **Regla de oro para quien aplique esto:** antes de cada Edit, releer el bloque real del fichero actual

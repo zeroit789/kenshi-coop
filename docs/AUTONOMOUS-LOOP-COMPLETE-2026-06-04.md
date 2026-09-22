@@ -232,7 +232,7 @@ See **docs/TESTING.md** for complete test scenarios.
 **Last Commit:** a81e092
 ```
 commit a81e092
-Author: Claude + The404Studios
+Author: The404Studios
 Date: 2026-06-04
 
 Add comprehensive project documentation (wiki-ready)
@@ -248,7 +248,6 @@ DOCUMENTATION ADDED:
 - docs/REVERSE_ENGINEERING.md
 - CONTRIBUTING.md
 
-Co-Authored-By: Claude Sonnet 4.5 (1M context) <noreply@anthropic.com>
 ```
 
 **Repository:** github.com/The404Studios/Kenshi-Online

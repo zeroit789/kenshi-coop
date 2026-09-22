@@ -3,7 +3,7 @@
 """
 autotest_kenshi.py  (v2 — guiado por log)
 =========================================
-Automatiza el CICLO DE PRUEBA del mod co-op de Kenshi para que Onyx (Claude)
+Automatiza el CICLO DE PRUEBA del mod co-op de Kenshi para que Onyx
 pueda probar el mod SIN que un humano juegue a mano.
 
 CAMBIO CLAVE v2 (fiabilidad):
@@ -247,7 +247,7 @@ def esperar_patron_en_log(ruta, patron, timeout, poll, etiqueta):
 def recolocar_ventana_kenshi(timeout=25):
     """
     *** ARREGLO CRITICO (verificado 2026-06-18) ***
-    Cuando se lanza kenshi_x64.exe desde una sesion NO interactiva (Claude /
+    Cuando se lanza kenshi_x64.exe desde una sesion NO interactiva (agente /
     PowerShell sin escritorio en primer plano), Kenshi abre su ventana FUERA
     de la pantalla visible (ej. X=3276) y a tamano pequeno (488x572). Mientras
     la ventana esta off-screen, Windows NO la compone y el RENDER LOOP de Kenshi

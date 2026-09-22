@@ -141,8 +141,8 @@ El README del base lista en **What Works**: `✅ Combat sync - Death/KO events s
 El MISMO README, en **Known Issues**: `❌ Combat damage bars don't sync (ApplyDamage hook crash)`
 y `⚠️ AI not synchronized (local AI decisions)`.
 
-No es ambigüedad: **es un README inflado** (generado con Claude AI, como admite su pie de página
-*"Built with 🧠 by Claude AI"*). El patrón es declarar la *intención* como *logro*. El "Combat sync"
+No es ambigüedad: **es un README inflado** (generado con IA, como admite su propio pie de página
+— firmado como obra de una IA). El patrón es declarar la *intención* como *logro*. El "Combat sync"
 del What Works es el diseño deseado; el Known Issues es el estado real.
 
 ### 2.2 Por qué el "Combat sync" NO puede funcionar en el base (causa técnica)
@@ -286,7 +286,7 @@ resolvimos nosotros: `0x2134110`, instancia embebida — RE que el base NO tiene
   (líneas 217-232 registro GOG, 638-695 salvaguarda anti-GOG), `KenshiMP.Core/hooks/char_tracker_hooks.cpp`,
   `squad_spawn_hooks.cpp`, `docs/architecture/02-hooks.md`, `audit-12-combate-ordenes-offsets.md`.
 - KenshiLib: `tools/KenshiLib-reference/` (GPL-3.0, offsets/firmas como hechos).
-- Estado del Arte: `Claude-Memory-Wiki/wiki/referencias/Kenshi-Multiplayer-Estado-Arte.md`.
+- Estado del Arte: wiki personal, página *Kenshi Multiplayer Estado Arte*.
 
 *Generado por game-reverse-engineer (sesión 2026-06-19). Verificación empírica en bytes sobre el
 binario Steam de los 21 AOB del base (21/21 casan = Steam), los 3 RVAs GOG (0/3 válidos en Steam,

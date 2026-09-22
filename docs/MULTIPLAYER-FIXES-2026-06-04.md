@@ -218,7 +218,6 @@ TESTING:
 - Compiles successfully
 - Ready for 2-player late join testing
 
-Co-Authored-By: Claude Sonnet 4.5 (1M context) <noreply@anthropic.com>
 ```
 
 ---

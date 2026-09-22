@@ -1,7 +1,5 @@
 # Clean Puppet Remote Player — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Make remote players appear, move with animations, and not fight with local AI/physics.
 
 **Architecture:** Single spawn path (FactoryCreate), continuous physics-chain position writes, combat blocked for remote chars. SetPosition/MoveTo hooks are NOT installable (mov-rax-rsp prologue), so movement suppression relies on AI behavior tree load-gating + continuous position overwrite.
