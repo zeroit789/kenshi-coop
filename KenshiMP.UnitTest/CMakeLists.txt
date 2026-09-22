@@ -7,6 +7,10 @@ add_executable(KenshiMP.UnitTest
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/game/game_offset_prober.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/entity_registry.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/interpolation.cpp
+
+    # Stubs de SpawnManager::ReadKenshiString y ai_hooks::IsRemoteControlled,
+    # que game_character.cpp necesita pero cuyas unidades no se compilan en el test.
+    test_stubs.cpp
 )
 
 target_include_directories(KenshiMP.UnitTest PRIVATE
