@@ -454,26 +454,26 @@ exactamente "tracked:0" y "CharacterCreate:0" en runtime entre jugadores.
 ## Archivos relevantes (rutas absolutas)
 
 Sync core:
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\sync_orchestrator.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\interpolation.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\entity_registry.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\entity_resolver.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\zone_engine.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\player_engine.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\authority_validator.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\sync_facilitator.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\pipeline_orchestrator.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\pipeline_state.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\deferred_spawn_queue.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sync\pending_snapshot_queue.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\sync_orchestrator.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\interpolation.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\entity_registry.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\entity_resolver.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\zone_engine.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\player_engine.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\authority_validator.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\sync_facilitator.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\pipeline_orchestrator.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\pipeline_state.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\deferred_spawn_queue.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sync\pending_snapshot_queue.cpp` / `.h`
 
 Relacionados:
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\loading_orchestrator.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\spawn_manager.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\player_controller.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\hooks\entity_hooks.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\hooks\char_tracker_hooks.cpp` / `.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\net\packet_handler.cpp`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\sys\frame_data.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\core.cpp` (OnGameTick ~2503)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Common\include\kmp\constants.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\loading_orchestrator.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\spawn_manager.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\player_controller.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\hooks\entity_hooks.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\hooks\char_tracker_hooks.cpp` / `.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\net\packet_handler.cpp`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\sys\frame_data.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\core.cpp` (OnGameTick ~2503)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Common\include\kmp\constants.h`

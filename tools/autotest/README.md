@@ -67,7 +67,7 @@ El ciclo de prueba pedido:
 ### Opción A — Flujo completo dentro del juego (GUI)
 
 ```bat
-cd /d E:\Aplicaciones\Kenshi-Online\tools\autotest
+cd /d E:\Dev\kenshi\Kenshi-Online\tools\autotest
 run_autotest.bat
 ```
 
@@ -93,7 +93,7 @@ Onyx lee ese resumen y, si necesita detalle, abre el log completo en la ruta ind
 ### Opción B — Validar la red sin GUI (recomendado primero)
 
 ```bat
-cd /d E:\Aplicaciones\Kenshi-Online\tools\autotest
+cd /d E:\Dev\kenshi\Kenshi-Online\tools\autotest
 "C:\Users\Zero\AppData\Local\Programs\Python\Python312\python.exe" headless_test.py --integration
 ```
 

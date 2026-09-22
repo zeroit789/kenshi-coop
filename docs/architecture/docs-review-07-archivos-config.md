@@ -1,6 +1,6 @@
 # docs-review-07 — Archivos sueltos, notas, config y herramientas de la raíz
 
-> Revisión READ-ONLY de los ficheros sueltos de la raíz de `E:\Aplicaciones\Kenshi-Online`,
+> Revisión READ-ONLY de los ficheros sueltos de la raíz de `E:\Dev\kenshi\Kenshi-Online`,
 > la carpeta `KenshiMP.MasterServer`, `tools/` y `dist/`. Fecha: 2026-06-18.
 > No se modifica código. Objetivo: extraer notas del autor, config, TODOs y pistas para el
 > combate congelado del host.

@@ -316,13 +316,13 @@ no haya dejado el char en un estado de facción válida pero squad/control incon
 ---
 
 ## Archivos relevantes (rutas absolutas)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\hooks\combat_hooks.cpp` (hooks de combate, DIAG StartAttack)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Scanner\src\mov_rax_rsp_fix.cpp` (núcleo MovRaxRsp → migrar a TLS)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Scanner\include\kmp\mov_rax_rsp_fix.h`
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Scanner\src\orchestrator.cpp` (registro RVA StartAttack:169-171)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Scanner\include\kmp\patterns.h` (START_ATTACK:90, anchor:342)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\core.cpp` (Step 0 Force unpause:2338-2390; fix facción host:2200-2260)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\game_character.cpp` (FixCharacterFactionTo:1200-1301)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\game_world.cpp` (paused/gameSpeed:156-223)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\hooks\faction_hooks.cpp` (FactionRelation, faction.id)
-- `E:\Aplicaciones\Kenshi-Online\docs\reverse-engineering\mov-rax-rsp-fix.md` (diseño actual del fix)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\hooks\combat_hooks.cpp` (hooks de combate, DIAG StartAttack)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Scanner\src\mov_rax_rsp_fix.cpp` (núcleo MovRaxRsp → migrar a TLS)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Scanner\include\kmp\mov_rax_rsp_fix.h`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Scanner\src\orchestrator.cpp` (registro RVA StartAttack:169-171)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Scanner\include\kmp\patterns.h` (START_ATTACK:90, anchor:342)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\core.cpp` (Step 0 Force unpause:2338-2390; fix facción host:2200-2260)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\game_character.cpp` (FixCharacterFactionTo:1200-1301)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\game_world.cpp` (paused/gameSpeed:156-223)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\hooks\faction_hooks.cpp` (FactionRelation, faction.id)
+- `E:\Dev\kenshi\Kenshi-Online\docs\reverse-engineering\mov-rax-rsp-fix.md` (diseño actual del fix)

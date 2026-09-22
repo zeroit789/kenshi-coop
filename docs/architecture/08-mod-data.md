@@ -29,9 +29,9 @@
 - **Ubicaciones en el repo**:
   | Ruta | Rol |
   |------|-----|
-  | `E:\Aplicaciones\Kenshi-Online\kenshi-online.mod` | **FUENTE** probada (`SrcPath` de ModGen). 44 items, base del clonado. |
-  | `E:\Aplicaciones\Kenshi-Online\kenshi-online-16.mod` | **SALIDA** candidata de ModGen (`OutPath`). Autocontenida, 16 players + fixes. |
-  | `E:\Aplicaciones\Kenshi-Online\dist\kenshi-online.mod` | Copia de distribución. |
+  | `E:\Dev\kenshi\Kenshi-Online\kenshi-online.mod` | **FUENTE** probada (`SrcPath` de ModGen). 44 items, base del clonado. |
+  | `E:\Dev\kenshi\Kenshi-Online\kenshi-online-16.mod` | **SALIDA** candidata de ModGen (`OutPath`). Autocontenida, 16 players + fixes. |
+  | `E:\Dev\kenshi\Kenshi-Online\dist\kenshi-online.mod` | Copia de distribución. |
   | `...\kenshi-online.mod.orig-backup-2026-06-03` | Backup histórico. |
 - Tamaño ~31 KB. El `-16.mod` y el `.mod` fuente tienen el mismo tamaño porque el clonado de los players añade pocos bytes (los Character son registros pequeños, casi todo referencias).
 

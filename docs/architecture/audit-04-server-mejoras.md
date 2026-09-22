@@ -30,7 +30,7 @@
 El cuello de botella son **tres capas desincronizadas**:
 
 **Capa A — El servidor (hardcode):**
-`E:\Aplicaciones\Kenshi-Online\KenshiMP.Server\server.cpp:689-695`
+`E:\Dev\kenshi\Kenshi-Online\KenshiMP.Server\server.cpp:689-695`
 
 ```cpp
 static const char* factionStrings[] = {

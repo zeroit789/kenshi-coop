@@ -33,7 +33,7 @@ el cliente loguea **"Unknown faction"** y no asigna personajes.
 
 ## 1. Qué debe reconocer el cliente (StringIds del manifiesto)
 
-**Archivo:** `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\shared_save_sync.cpp`
+**Archivo:** `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\shared_save_sync.cpp`
 
 Hoy (líneas 69-81) el mapeo es hardcodeado a 2 facciones:
 
@@ -142,7 +142,7 @@ Hoy la facción es 100% impuesta por el server. Para que el JUGADOR elija su fac
 falta un paquete cliente→servidor que HOY NO EXISTE. Diseño propuesto:
 
 ### 3.1 Nuevo MessageType
-**Archivo:** `E:\Aplicaciones\Kenshi-Online\KenshiMP.Common\include\kmp\protocol.h` (o `messages.h`).
+**Archivo:** `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Common\include\kmp\protocol.h` (o `messages.h`).
 Añadir un tipo `C2S_FactionRequest` (la enum de mensajes está compartida entre server y cliente,
 así que el server también lo verá). Formato sugerido (simétrico al S2C):
 
@@ -198,12 +198,12 @@ Para la ELECCIÓN por el jugador (fase posterior):
 
 ## Estado del server + datos (YA HECHO — referencia)
 
-- **`.mod` regenerado:** `E:\Aplicaciones\Kenshi-Online\kenshi-online-16.mod` →
+- **`.mod` regenerado:** `E:\Dev\kenshi\Kenshi-Online\kenshi-online-16.mod` →
   6 facciones (Player 1..6), 16 personajes, game start "Multiplayer" intacto.
-  Manifiesto: `E:\Aplicaciones\Kenshi-Online\faction-slots.json` (6 slots).
+  Manifiesto: `E:\Dev\kenshi\Kenshi-Online\faction-slots.json` (6 slots).
   **No desplegado a Steam aún** (se despliega junto con el fix de Core).
 - **Server:** lee el manifiesto (`LoadFactionSlots`), asigna slot según `factionMode`
   (`ComputeFactionSlot`), envía S2C con `SendFactionAssignment`. Comandos de consola:
   `factionmode <single|teams|per-player>`, `setfaction <playerId> <slot1-6>`, `factions`.
   Persiste `factionMode` en `server.json`.
-- **Binario:** `E:\Aplicaciones\Kenshi-Online\build\bin\Release\KenshiMP.Server.exe` (compila OK).
+- **Binario:** `E:\Dev\kenshi\Kenshi-Online\build\bin\Release\KenshiMP.Server.exe` (compila OK).

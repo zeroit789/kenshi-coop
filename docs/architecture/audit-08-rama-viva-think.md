@@ -236,9 +236,9 @@ dentro de 0x5CCD90), `+0xDC` (flag dirty/repensar — reseteado a 0 al pensar), 
 
 ## 9. Archivos relevantes (rutas absolutas)
 
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\core.cpp` — DIAG-THINK corregido (~2730 y ~3046);
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\core.cpp` — DIAG-THINK corregido (~2730 y ~3046);
   `SEH_ReadSimDiag` (~2703), `SEH_WalkSimList` (~2657), FIX-SIMSEED (~2407–2520).
-- `E:\Aplicaciones\Kenshi-Online\docs\architecture\audit-06-aitick-invocacion.md` — invocación del tick.
-- `E:\Aplicaciones\Kenshi-Online\docs\architecture\audit-07-fix-h1-insercion.md` — `+0x750` = unordered_set; H1.
-- `E:\Aplicaciones\Kenshi-Online\docs\reverse-engineering\kenshi-re-memory.md` — notas RE base (la
+- `E:\Dev\kenshi\Kenshi-Online\docs\architecture\audit-06-aitick-invocacion.md` — invocación del tick.
+- `E:\Dev\kenshi\Kenshi-Online\docs\architecture\audit-07-fix-h1-insercion.md` — `+0x750` = unordered_set; H1.
+- `E:\Dev\kenshi\Kenshi-Online\docs\reverse-engineering\kenshi-re-memory.md` — notas RE base (la
   sección "char+0x5BC = FLAG MUERTO" describe +0xD8 con la semántica antigua; esta auditoría la corrige).

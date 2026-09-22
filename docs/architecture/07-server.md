@@ -12,7 +12,7 @@ hora del mundo) y lo replica a los clientes (que sí corren `kenshi_x64.exe` par
 
 ---
 
-## 0. Índice de archivos (`E:\Aplicaciones\Kenshi-Online\KenshiMP.Server\`)
+## 0. Índice de archivos (`E:\Dev\kenshi\Kenshi-Online\KenshiMP.Server\`)
 
 | Archivo | Responsabilidad |
 |---|---|
@@ -26,7 +26,7 @@ hora del mundo) y lo replica a los clientes (que sí corren `kenshi_x64.exe` par
 | `entity_manager`, `player_manager`, `zone_manager`, `game_state` | Managers auxiliares (.cpp/.h). |
 | `CMakeLists.txt` | Target `KenshiMP.Server`. Copia el `.exe` al dir de Kenshi como `KenshiMP.Server.exe` para que el botón "Host" lo encuentre. |
 
-> **MasterServer.exe es un proyecto SEPARADO**: `E:\Aplicaciones\Kenshi-Online\KenshiMP.MasterServer\main.cpp`. Ver §9.
+> **MasterServer.exe es un proyecto SEPARADO**: `E:\Dev\kenshi\Kenshi-Online\KenshiMP.MasterServer\main.cpp`. Ver §9.
 
 ---
 
@@ -306,7 +306,7 @@ updates además validan NaN/inf/coords extremas en `HandlePositionUpdate` (`:792
   (5→10→20→40→máx 60 s).
 
 ### Master server propiamente dicho — proyecto SEPARADO
-`E:\Aplicaciones\Kenshi-Online\KenshiMP.MasterServer\main.cpp`. Es un **registro centralizado
+`E:\Dev\kenshi\Kenshi-Online\KenshiMP.MasterServer\main.cpp`. Es un **registro centralizado
 para el server browser**:
 - Escucha ENet en **puerto 27801** (`DEFAULT_MASTER_PORT`), hasta 128 conexiones.
 - `g_servers` (`map "ip:port" → RegisteredServer`). Maneja `MS_Register`, `MS_Heartbeat`,

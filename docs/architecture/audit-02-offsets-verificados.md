@@ -12,7 +12,7 @@
 > xrefs absolutos `lea/mov reg,[RIP+disp]`. `.pdata` tiene 77 108 entradas → límites de
 > función autoritativos.
 >
-> **Estructuras:** cruzadas con `E:\Aplicaciones\ref-KenshiLib` (headers con offsets de
+> **Estructuras:** cruzadas con `E:\Dev\kenshi\ref-KenshiLib` (headers con offsets de
 > campo + RVAs). ⚠️ Las **RVAs de KenshiLib son de OTRA versión** (no Steam 1.0.68): p. ej.
 > `process` en KenshiLib = `0x580FF0` pero en el binario Steam = `0x581770`. Por eso las RVAs
 > de FUNCIÓN se verificaron SIEMPRE contra el binario; los **offsets de CAMPO de KenshiLib SÍ

@@ -15,7 +15,7 @@ resolución por ID) y DESPUÉS las del Paso 4 (corregir la cadena de offsets de 
 mismas lambdas ya migradas).
 
 Tras aplicar TODO: compilar (`cmake --build build --config Release` desde
-`E:\Aplicaciones\Kenshi-Online`) y confirmar 0 errores. Dejar warnings nuevos anotados si aparecen.
+`E:\Dev\kenshi\Kenshi-Online`) y confirmar 0 errores. Dejar warnings nuevos anotados si aparecen.
 
 ---
 
@@ -636,7 +636,7 @@ esto el `/verify` de salud debería pasar de FAIL a OK la próxima vez que se ej
 
 ## Tras aplicar TODO
 
-1. `cd E:\Aplicaciones\Kenshi-Online && cmake --build build --config Release` — confirmar 0 errores.
+1. `cd E:\Dev\kenshi\Kenshi-Online && cmake --build build --config Release` — confirmar 0 errores.
 2. Si hay errores de compilación por offsets/nombres que no coincidan exactamente con este documento
    (drift esperable), corregir siguiendo la INTENCIÓN de cada patch (la cadena de offsets correcta, la
    resolución por ID, el SEH por comando), no revertir el cambio.

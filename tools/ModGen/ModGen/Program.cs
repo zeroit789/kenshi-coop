@@ -16,8 +16,8 @@ using OpenConstructionSet.Mods;
 // is valid. Writes a CANDIDATE file — never overwrites the live mod.
 
 // Rutas ajustadas por Onyx 2026-06-17: apuntan al repo en E:, no a la ruta de Steam original.
-const string SrcPath = @"E:\Aplicaciones\Kenshi-Online\kenshi-online.mod";
-const string OutPath = @"E:\Aplicaciones\Kenshi-Online\kenshi-online-16.mod";
+const string SrcPath = @"E:\Dev\kenshi\Kenshi-Online\kenshi-online.mod";
+const string OutPath = @"E:\Dev\kenshi\Kenshi-Online\kenshi-online-16.mod";
 const int TotalPlayers = 16;
 
 if (args.Length > 0 && args[0] == "dump")
@@ -104,7 +104,7 @@ if (args.Length > 0 && args[0] == "fixhub")
     // mods\kenshi-online\) + las 3 del repo (fuente/dist/16 jugadores), para que un
     // redeploy futuro no reintroduzca los fantasmas. Mismo patrón de cobertura que
     // tools/set_player_squad_faction_nameless.py.
-    const string RepoRoot = @"E:\Aplicaciones\Kenshi-Online";
+    const string RepoRoot = @"E:\Dev\kenshi\Kenshi-Online";
     const string SteamKenshi = @"E:\SteamLibrary\steamapps\common\Kenshi";
     var defaultPaths = new[]
     {

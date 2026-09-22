@@ -71,7 +71,7 @@ static std::string StripModSuffix(const std::string& faction) {
 }
 
 // ── Tabla StringId de facción → slot 0-based ──
-// FUENTE DE VERDAD: E:\Aplicaciones\Kenshi-Online\faction-slots.json (generado por ModGen,
+// FUENTE DE VERDAD: E:\Dev\kenshi\Kenshi-Online\faction-slots.json (generado por ModGen,
 // leído por el server). Mientras el cliente no lea ese JSON directamente, mantenemos esta
 // tabla espejo de los 6 StringIds del manifiesto. Si ModGen genera más facciones, hay que
 // ampliar esta tabla O (mejor) leer el manifiesto desde disco (ver audit-05 §1, Camino B).

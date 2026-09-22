@@ -224,12 +224,12 @@ de lo deseado. **No usar.**
 
 ## 9. Archivos relevantes (rutas absolutas)
 
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\core.cpp` — `FindAndClaimModCharacters` (2066),
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\core.cpp` — `FindAndClaimModCharacters` (2066),
   `SEH_WalkSimList`/`[DIAG-SIMLIST]` (2294–2391, 2672+), Step 0 unpause / host-faction-fix (2214+).
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\game_character.cpp` — `CharacterIterator::Reset`
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\game_character.cpp` — `CharacterIterator::Reset`
   (662–810; itera el squad `+0x580→+0x2B0`, NO el set de simulación).
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\hooks\entity_hooks.cpp` — `Hook_CharacterCreate` (585),
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\hooks\entity_hooks.cpp` — `Hook_CharacterCreate` (585),
   NPC-hijack (325) — cubre remotos/spawns nativos, NO el reclamo del host.
-- `E:\Aplicaciones\Kenshi-Online\docs\architecture\audit-06-aitick-invocacion.md` — auditoría previa
+- `E:\Dev\kenshi\Kenshi-Online\docs\architecture\audit-06-aitick-invocacion.md` — auditoría previa
   (corregida aquí en §3.1 "insertador"/"cola de altas").
-- `E:\Aplicaciones\Kenshi-Online\docs\reverse-engineering\kenshi-re-memory.md` — notas RE base.
+- `E:\Dev\kenshi\Kenshi-Online\docs\reverse-engineering\kenshi-re-memory.md` — notas RE base.

@@ -235,9 +235,9 @@ Lista de simulación que itera `updateCharacters`: **`GW+0x768`** (idx/head), **
 
 ## 8. Archivos relevantes (rutas absolutas)
 
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\core.cpp` (DIAG-SIM/DIAG-CLOCK: 2513–2605; `SEH_ReadSimDiag`/`SimDiagSnapshot`: ~2300–2335; Step 0 unpause; `FindAndClaimModCharacters`: 2066)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\game_character.cpp` (`CharacterIterator::Reset`: 662–810 — itera el SQUAD, no la lista de simulación)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\game\game_types.h` (offsets: `world.player=0x580`, `playerInterface.playerCharacters=0x2B0`, `characterList=0x888` DEPRECADO)
-- `E:\Aplicaciones\Kenshi-Online\KenshiMP.Core\hooks\entity_hooks.cpp` (NPC hijack — solo REMOTOS, no el host)
-- `E:\Aplicaciones\Kenshi-Online\docs\reverse-engineering\kenshi-re-memory.md` (notas RE base de esta auditoría)
-- `E:\Aplicaciones\Kenshi-Online\docs\architecture\audit-03-combate-plan.md` (capa de orden/pausa — complementaria)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\core.cpp` (DIAG-SIM/DIAG-CLOCK: 2513–2605; `SEH_ReadSimDiag`/`SimDiagSnapshot`: ~2300–2335; Step 0 unpause; `FindAndClaimModCharacters`: 2066)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\game_character.cpp` (`CharacterIterator::Reset`: 662–810 — itera el SQUAD, no la lista de simulación)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\game\game_types.h` (offsets: `world.player=0x580`, `playerInterface.playerCharacters=0x2B0`, `characterList=0x888` DEPRECADO)
+- `E:\Dev\kenshi\Kenshi-Online\KenshiMP.Core\hooks\entity_hooks.cpp` (NPC hijack — solo REMOTOS, no el host)
+- `E:\Dev\kenshi\Kenshi-Online\docs\reverse-engineering\kenshi-re-memory.md` (notas RE base de esta auditoría)
+- `E:\Dev\kenshi\Kenshi-Online\docs\architecture\audit-03-combate-plan.md` (capa de orden/pausa — complementaria)
