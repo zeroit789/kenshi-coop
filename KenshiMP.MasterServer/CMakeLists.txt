@@ -1,3 +1,7 @@
+# ES: KenshiMP.MasterServer: ejecutable de consola del registro central de servidores
+#     (navegador de servidores) sobre ENet.
+# EN: KenshiMP.MasterServer: console executable for the central server registry
+#     (server browser) over ENet.
 add_executable(KenshiMP.MasterServer
     main.cpp
 )
