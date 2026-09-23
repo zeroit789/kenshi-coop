@@ -1,4 +1,16 @@
 @echo off
+REM ES: Instalador de un clic para usuarios: detecta la carpeta de Kenshi, carpeta del instalador,
+REM     carpeta padre, Steam o GOG por defecto, o la pide, comprueba que Kenshi no esta abierto, hace copias
+REM     de seguridad, copia la DLL, activa el plugin en Plugins_x64.cfg, anade el boton MULTIPLAYER al
+REM     menu principal con PowerShell o copia un layout ya parcheado, copia los layouts del panel y del HUD,
+REM     instala kenshi-online.mod en data y mods y en __mods.list, y copia el servidor. Uso: install.bat.
+REM     Ojo: la numeracion de pasos que se muestra no es coherente, pasa de 1/5 a 5/6 y 6/7.
+REM EN: One-click installer for users: detects the Kenshi folder, installer folder, parent folder, default
+REM     Steam or GOG, or asks for it, checks Kenshi is not running, makes backups, copies the DLL, enables
+REM     the plugin in Plugins_x64.cfg, adds the MULTIPLAYER button to the main menu with PowerShell or
+REM     copies a pre-patched layout, copies the panel and HUD layouts, installs kenshi-online.mod into data
+REM     and mods and __mods.list, and copies the server. Usage: install.bat.
+REM     Note: the displayed step numbering is inconsistent, it goes from 1/5 to 5/6 and 6/7.
 setlocal enabledelayedexpansion
 title KenshiMP Installer
 color 0A
@@ -11,23 +23,27 @@ echo   made with love by fourzerofour
 echo  ============================================
 echo.
 
+REM ES: Autodeteccion de la carpeta de Kenshi: probar ubicaciones comunes y si no, preguntar
 :: ── Auto-detect Kenshi directory ──
 :: Try common locations, then fall back to asking
 
 set "KENSHI_DIR="
 
+REM ES: Comprobar si ya estamos en la carpeta de Kenshi
 :: Check if we're already in the Kenshi folder
 if exist "%~dp0kenshi_x64.exe" (
     set "KENSHI_DIR=%~dp0"
     goto :found_kenshi
 )
 
+REM ES: Comprobar si estamos en una subcarpeta de Kenshi
 :: Check if we're in a subfolder of Kenshi
 if exist "%~dp0..\kenshi_x64.exe" (
     set "KENSHI_DIR=%~dp0..\"
     goto :found_kenshi
 )
 
+REM ES: Probar la ubicacion por defecto de Steam
 :: Try Steam default location
 set "STEAM_KENSHI=C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
 if exist "%STEAM_KENSHI%\kenshi_x64.exe" (
@@ -35,6 +51,7 @@ if exist "%STEAM_KENSHI%\kenshi_x64.exe" (
     goto :found_kenshi
 )
 
+REM ES: Probar la ubicacion por defecto de GOG
 :: Try GOG default
 set "GOG_KENSHI=C:\GOG Games\Kenshi"
 if exist "%GOG_KENSHI%\kenshi_x64.exe" (
@@ -42,6 +59,7 @@ if exist "%GOG_KENSHI%\kenshi_x64.exe" (
     goto :found_kenshi
 )
 
+REM ES: Preguntar al usuario
 :: Ask user
 echo  Could not auto-detect Kenshi installation.
 echo  Please enter the path to your Kenshi folder:
@@ -58,6 +76,8 @@ if not exist "%KENSHI_DIR%\kenshi_x64.exe" (
     exit /b 1
 )
 
+REM ES: Carpeta encontrada: quitar la barra final si la hay
+REM EN: Folder found: strip the trailing backslash if present
 :found_kenshi
 :: Remove trailing backslash if present
 if "%KENSHI_DIR:~-1%"=="\" set "KENSHI_DIR=%KENSHI_DIR:~0,-1%"
@@ -65,6 +85,7 @@ if "%KENSHI_DIR:~-1%"=="\" set "KENSHI_DIR=%KENSHI_DIR:~0,-1%"
 echo  Found Kenshi at: %KENSHI_DIR%
 echo.
 
+REM ES: Comprobar si Kenshi esta en ejecucion
 :: ── Check if Kenshi is running ──
 tasklist /FI "IMAGENAME eq kenshi_x64.exe" 2>NUL | find /I "kenshi_x64.exe" >NUL
 if %errorlevel% equ 0 (
@@ -75,6 +96,7 @@ if %errorlevel% equ 0 (
     exit /b 1
 )
 
+REM ES: Crear copias de seguridad de Plugins_x64.cfg y del layout del menu, solo la primera vez
 :: ── Create backups ──
 echo  [1/5] Creating backups...
 
@@ -95,6 +117,7 @@ if exist "%KENSHI_DIR%\data\gui\layout\Kenshi_MainMenu.layout" (
     )
 )
 
+REM ES: Copiar la DLL del mod
 :: ── Copy DLL ──
 echo  [2/5] Installing KenshiMP.Core.dll...
 
@@ -112,6 +135,7 @@ if exist "%~dp0KenshiMP.Core.dll" (
     exit /b 1
 )
 
+REM ES: Parchear Plugins_x64.cfg
 :: ── Patch Plugins_x64.cfg ──
 echo  [3/5] Patching Plugins_x64.cfg...
 
@@ -123,6 +147,10 @@ if errorlevel 1 (
     echo         Plugin entry already exists
 )
 
+REM ES: Parchear el layout del menu principal: insertar el boton MULTIPLAYER antes del boton OPTIONS,
+REM     name=OptionsButton, usando PowerShell para editar el XML; si falla, copiar el layout ya parcheado.
+REM EN: Patch the main menu layout: insert the MULTIPLAYER button before the OPTIONS button,
+REM     name=OptionsButton, using PowerShell to edit the XML; if it fails, copy the pre-patched layout.
 :: ── Patch Main Menu Layout ──
 echo  [4/5] Patching main menu layout...
 
@@ -163,6 +191,7 @@ if errorlevel 1 (
     echo         MULTIPLAYER button already present
 )
 
+REM ES: Copiar los layouts multijugador: panel obligatorio, HUD opcional
 :: ── Copy Multiplayer Layouts ──
 echo  [5/6] Installing multiplayer layouts...
 
@@ -182,6 +211,8 @@ if exist "%~dp0Kenshi_MultiplayerHUD.layout" (
     echo  [WARNING] Kenshi_MultiplayerHUD.layout not found (in-game HUD may not work)
 )
 
+REM ES: Instalar el mod de datos: copiarlo a data, que el motor carga siempre, y a mods/kenshi-online,
+REM     ubicacion estandar, y anadirlo a __mods.list si no esta.
 :: ── Install Multiplayer Mod ──
 echo  [6/7] Installing kenshi-online.mod...
 
@@ -207,6 +238,7 @@ if exist "%~dp0kenshi-online.mod" (
     echo         [INFO] kenshi-online.mod not in package (mod template spawning disabled)
 )
 
+REM ES: Copiar el servidor dedicado, opcional
 :: ── Copy Server ──
 echo  [7/7] Installing dedicated server...
 
@@ -217,6 +249,7 @@ if exist "%~dp0KenshiMP.Server.exe" (
     echo         [INFO] KenshiMP.Server.exe not in package (hosting optional)
 )
 
+REM ES: Fin: instrucciones para unirse o alojar partida
 :: ── Done ──
 echo.
 echo  ============================================

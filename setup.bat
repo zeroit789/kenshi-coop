@@ -1,9 +1,16 @@
 @echo off
+REM ES: Preparacion alternativa con vcpkg: instala enet, minhook, imgui, nlohmann-json y spdlog para
+REM     x64-windows y configura CMake con el toolchain de vcpkg usando la variable VCPKG_ROOT.
+REM     Uso: setup.bat. Requiere vcpkg en el PATH.
+REM EN: Alternative setup with vcpkg: installs enet, minhook, imgui, nlohmann-json and spdlog for
+REM     x64-windows and configures CMake with the vcpkg toolchain using the VCPKG_ROOT variable.
+REM     Usage: setup.bat. Requires vcpkg in the PATH.
 echo ========================================
 echo  Kenshi-Online Build Setup
 echo ========================================
 echo.
 
+REM ES: Comprobar que vcpkg esta instalado
 :: Check for vcpkg
 where vcpkg >nul 2>nul
 if %errorlevel% neq 0 (
@@ -14,6 +21,8 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM ES: Instalar dependencias con vcpkg
+REM EN: Install dependencies with vcpkg
 echo Installing dependencies via vcpkg...
 echo.
 
@@ -27,9 +36,11 @@ echo.
 echo Dependencies installed!
 echo.
 
+REM ES: Buscar el toolchain de vcpkg; la variable VCPKG_OUTPUT no se usa despues
 :: Find vcpkg toolchain
 for /f "tokens=*" %%i in ('vcpkg integrate install 2^>^&1') do set VCPKG_OUTPUT=%%i
 
+REM ES: Configurar CMake
 :: Configure CMake
 echo Configuring CMake...
 cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
