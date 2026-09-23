@@ -1,3 +1,11 @@
+// ES: Tipos básicos compartidos por todo KenshiMP: reloj de sesión, alias de IDs,
+//     identificador de red con generación, vectores/cuaterniones (con compresión),
+//     coordenadas de zona y enums del modelo de entidades (estado, autoridad,
+//     dirty flags, tipo de entidad, partes del cuerpo y ranuras de equipo).
+// EN: Basic types shared across KenshiMP: session clock, ID aliases,
+//     generation-tagged network ID, vectors/quaternions (with compression),
+//     zone coordinates and entity-model enums (state, authority, dirty flags,
+//     entity type, body parts and equipment slots).
 #pragma once
 #include <cstdint>
 #include <cmath>
@@ -6,9 +14,12 @@
 
 namespace kmp {
 
-// Session-relative timestamp in seconds (float).
-// Uses a static baseline so the value stays small and float-precise.
-// raw time_since_epoch() as float loses sub-second precision after ~9h of uptime.
+// ES: Marca de tiempo relativa a la sesión en segundos (float).
+//     Usa una referencia estática para que el valor sea pequeño y preciso en float.
+//     time_since_epoch() en bruto como float pierde precisión sub-segundo tras ~9 h encendido.
+// EN: Session-relative timestamp in seconds (float).
+//     Uses a static baseline so the value stays small and float-precise.
+//     raw time_since_epoch() as float loses sub-second precision after ~9h of uptime.
 inline float SessionTime() {
     static auto s_baseline = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -16,6 +27,10 @@ inline float SessionTime() {
     return static_cast<float>(elapsed.count()) / 1000000.f;
 }
 
+// ES: Alias de identificadores: entidad de red, jugador y número de tick del servidor.
+//     El valor 0 significa "inválido/ninguno".
+// EN: Identifier aliases: network entity, player and server tick number.
+//     The value 0 means "invalid/none".
 using EntityID = uint32_t;
 using PlayerID = uint32_t;
 using TickNumber = uint32_t;
@@ -23,13 +38,20 @@ using TickNumber = uint32_t;
 constexpr EntityID INVALID_ENTITY = 0;
 constexpr PlayerID INVALID_PLAYER = 0;
 
-// ── Network Entity ID with Generation ──
-// Prevents ghost control bugs where entity IDs are reused:
-//   Entity 55 = Player A
-//   Entity 55 destroyed
-//   Entity 55 reused as NPC
-//   Old packet for Player A arrives → ghost control bug
-// Generation prevents this by invalidating stale packets.
+// ES: ── ID de entidad de red con generación ──
+//     Evita el bug de "control fantasma" cuando se reutilizan IDs:
+//       Entidad 55 = Jugador A
+//       Entidad 55 destruida
+//       Entidad 55 reutilizada como NPC
+//       Llega un paquete viejo del Jugador A → bug de control fantasma
+//     La generación lo evita invalidando los paquetes obsoletos.
+// EN: ── Network Entity ID with Generation ──
+//     Prevents ghost control bugs where entity IDs are reused:
+//       Entity 55 = Player A
+//       Entity 55 destroyed
+//       Entity 55 reused as NPC
+//       Old packet for Player A arrives → ghost control bug
+//     Generation prevents this by invalidating stale packets.
 struct NetEntityId {
     uint32_t id = INVALID_ENTITY;
     uint32_t generation = 0;
@@ -37,6 +59,8 @@ struct NetEntityId {
     NetEntityId() = default;
     NetEntityId(uint32_t id_, uint32_t gen_) : id(id_), generation(gen_) {}
 
+    // ES: Dos IDs son iguales solo si coinciden id Y generación.
+    // EN: Two IDs are equal only if both id AND generation match.
     bool operator==(const NetEntityId& other) const {
         return id == other.id && generation == other.generation;
     }
@@ -45,10 +69,13 @@ struct NetEntityId {
         return !(*this == other);
     }
 
+    // ES: Válido si el id no es 0 (la generación no cuenta).
+    // EN: Valid if id is not 0 (generation is ignored).
     bool IsValid() const { return id != INVALID_ENTITY; }
 };
 
-// Hash support for NetEntityId (for unordered_map)
+// ES: Hash de NetEntityId para usarlo como clave de unordered_map (id en los 32 bits altos).
+// EN: Hash support for NetEntityId (for unordered_map)
 struct NetEntityIdHash {
     size_t operator()(const NetEntityId& nid) const {
         return std::hash<uint64_t>()(
@@ -57,6 +84,8 @@ struct NetEntityIdHash {
     }
 };
 
+// ES: Vector 3D de float (posiciones y velocidades) con operaciones básicas.
+// EN: 3D float vector (positions and velocities) with basic operations.
 struct Vec3 {
     float x = 0.f, y = 0.f, z = 0.f;
 
@@ -67,19 +96,25 @@ struct Vec3 {
     Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
     Vec3 operator*(float s) const { return {x * s, y * s, z * s}; }
 
+    // ES: Longitud al cuadrado (sin raíz, más barata para comparar), longitud y distancia.
+    // EN: Squared length (no sqrt, cheaper for comparisons), length and distance.
     float LengthSq() const { return x * x + y * y + z * z; }
     float Length() const { return std::sqrt(LengthSq()); }
 
     float DistanceTo(const Vec3& o) const { return (*this - o).Length(); }
 };
 
+// ES: Cuaternión de rotación (w, x, y, z) con compresión a 32 bits e interpolación esférica.
+// EN: Rotation quaternion (w, x, y, z) with 32-bit compression and spherical interpolation.
 struct Quat {
     float w = 1.f, x = 0.f, y = 0.f, z = 0.f;
 
     Quat() = default;
     Quat(float w_, float x_, float y_, float z_) : w(w_), x(x_), y(y_), z(z_) {}
 
-    // Smallest-three compression: drop largest component, pack 3 into 32 bits
+    // ES: Compresión "smallest-three": se descarta la componente de mayor valor absoluto
+    //     (se reconstruye porque |q| = 1) y las otras 3 se empaquetan en 32 bits.
+    // EN: Smallest-three compression: drop largest component, pack 3 into 32 bits
     uint32_t Compress() const {
         float abs_vals[4] = {std::abs(w), std::abs(x), std::abs(y), std::abs(z)};
         int largest = 0;
@@ -90,8 +125,10 @@ struct Quat {
         float comps[4] = {w, x, y, z};
         float sign = comps[largest] < 0.f ? -1.f : 1.f;
 
-        // Pack: 2 bits for index, 10 bits each for 3 remaining components
-        // Range [-0.7071, 0.7071] mapped to [0, 1023]
+        // ES: Empaquetado: 2 bits para el índice descartado y 10 bits por cada una de las 3 restantes.
+        //     Rango [-0.7071, 0.7071] mapeado a [0, 1023].
+        // EN: Pack: 2 bits for index, 10 bits each for 3 remaining components
+        //     Range [-0.7071, 0.7071] mapped to [0, 1023]
         uint32_t packed = static_cast<uint32_t>(largest) << 30;
         int slot = 0;
         for (int i = 0; i < 4; i++) {
@@ -106,6 +143,10 @@ struct Quat {
         return packed;
     }
 
+    // ES: Inversa de Compress: desempaqueta las 3 componentes y reconstruye la descartada
+    //     como sqrt(1 - suma de cuadrados) (siempre positiva).
+    // EN: Inverse of Compress: unpacks the 3 components and rebuilds the dropped one
+    //     as sqrt(1 - sum of squares) (always positive).
     static Quat Decompress(uint32_t packed) {
         int largest = (packed >> 30) & 0x3;
         float comps[4];
@@ -122,17 +163,25 @@ struct Quat {
         return {comps[0], comps[1], comps[2], comps[3]};
     }
 
+    // ES: Interpolación esférica entre a y b (t en [0,1]) por el camino más corto.
+    //     Si están casi alineados usa nlerp (lineal normalizada) para evitar dividir por ~0.
+    // EN: Spherical interpolation between a and b (t in [0,1]) along the shortest path.
+    //     If nearly aligned it uses nlerp (normalized linear) to avoid dividing by ~0.
     static Quat Slerp(const Quat& a, const Quat& b, float t) {
         float dot = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
         Quat b2 = b;
+        // ES: Producto escalar negativo: se invierte b para tomar el arco corto.
+        // EN: Negative dot product: flip b to take the short arc.
         if (dot < 0.f) {
             dot = -dot;
             b2 = {-b.w, -b.x, -b.y, -b.z};
         }
-        // Clamp to prevent NaN from acos(>1.0) due to floating-point drift
+        // ES: Recorte para evitar NaN de acos(>1.0) por deriva de coma flotante
+        // EN: Clamp to prevent NaN from acos(>1.0) due to floating-point drift
         if (dot > 1.f) dot = 1.f;
         if (dot >= 0.9995f) {
-            // Nlerp fallback — normalize to stay on unit sphere
+            // ES: Alternativa nlerp — se normaliza para seguir en la esfera unidad
+            // EN: Nlerp fallback — normalize to stay on unit sphere
             Quat r = {
                 a.w + t * (b2.w - a.w),
                 a.x + t * (b2.x - a.x),
@@ -159,6 +208,10 @@ struct Quat {
     }
 };
 
+// ES: Coordenada de zona (celda de la rejilla del mundo en el plano X/Z) para el
+//     sistema de interés: cada cliente solo recibe entidades de zonas cercanas.
+// EN: Zone coordinate (world grid cell on the X/Z plane) for the interest system:
+//     each client only receives entities from nearby zones.
 struct ZoneCoord {
     int32_t x = 0, y = 0;
 
@@ -168,13 +221,17 @@ struct ZoneCoord {
     bool operator==(const ZoneCoord& o) const { return x == o.x && y == o.y; }
     bool operator!=(const ZoneCoord& o) const { return !(*this == o); }
 
+    // ES: True si o está en la rejilla 3x3 alrededor de esta zona (incluida ella misma).
+    // EN: True if o is within the 3x3 grid around this zone (including itself).
     bool IsAdjacent(const ZoneCoord& o) const {
         return std::abs(x - o.x) <= 1 && std::abs(y - o.y) <= 1;
     }
 
-    // Convert world position to zone coordinate
+    // ES: Convierte una posición del mundo a coordenada de zona (usa X y Z; Y es la altura).
+    // EN: Convert world position to zone coordinate (uses X and Z; Y is height)
     static ZoneCoord FromWorldPos(const Vec3& pos, float zoneSize = 750.f) {
-        // Guard against NaN/Inf — UB to cast to int32_t
+        // ES: Protección contra NaN/Inf — convertirlos a int32_t es comportamiento indefinido
+        // EN: Guard against NaN/Inf — UB to cast to int32_t
         if (!std::isfinite(pos.x) || !std::isfinite(pos.z)) return {0, 0};
         return {
             static_cast<int32_t>(std::floor(pos.x / zoneSize)),
@@ -183,13 +240,16 @@ struct ZoneCoord {
     }
 };
 
+// ES: Hash de ZoneCoord para unordered_map (x en los 32 bits altos, y en los bajos).
+// EN: ZoneCoord hash for unordered_map (x in the high 32 bits, y in the low ones).
 struct ZoneCoordHash {
     size_t operator()(const ZoneCoord& z) const {
         return std::hash<int64_t>()(static_cast<int64_t>(z.x) << 32 | static_cast<uint32_t>(z.y));
     }
 };
 
-// Entity lifecycle state machine (spec §2.2)
+// ES: Máquina de estados del ciclo de vida de una entidad (spec §2.2).
+// EN: Entity lifecycle state machine (spec §2.2)
 enum class EntityState : uint8_t {
     Inactive    = 0, // Not in use
     Spawning    = 1, // Registered, waiting for game object creation
@@ -198,7 +258,8 @@ enum class EntityState : uint8_t {
     Frozen      = 4, // Suspended during zone authority handoff
 };
 
-// Authority model (spec §2.3)
+// ES: Modelo de autoridad en el servidor: quién decide el estado de la entidad (spec §2.3).
+// EN: Authority model (spec §2.3)
 enum class AuthorityType : uint8_t {
     None         = 0, // No owner — server-managed
     Server       = 1, // Server authoritative (NPCs, world objects)
@@ -206,8 +267,10 @@ enum class AuthorityType : uint8_t {
     Transferring = 3, // Authority handoff in progress
 };
 
-// Client-side authority state
-// Determines how the client treats inbound updates for this entity
+// ES: Estado de autoridad en el cliente: determina cómo trata el cliente las
+//     actualizaciones entrantes de esta entidad.
+// EN: Client-side authority state
+//     Determines how the client treats inbound updates for this entity
 enum class LocalAuthorityState : uint8_t {
     LocalOwned   = 0, // My character — predict locally, reconcile with server
     RemoteOwned  = 1, // Another player's entity — interpolate only
@@ -216,7 +279,8 @@ enum class LocalAuthorityState : uint8_t {
     Destroyed    = 4, // Entity removed, reject all updates
 };
 
-// Dirty flags for selective replication (spec §2.4)
+// ES: Flags "sucios" (máscara de bits) para replicar solo lo que ha cambiado (spec §2.4).
+// EN: Dirty flags for selective replication (spec §2.4)
 enum DirtyFlags : uint16_t {
     Dirty_None        = 0x000,
     Dirty_Position    = 0x001,
@@ -234,6 +298,8 @@ enum DirtyFlags : uint16_t {
     Dirty_All         = 0xFFF,
 };
 
+// ES: Tipo de entidad sincronizada (se envía en los paquetes de spawn).
+// EN: Synced entity type (sent in spawn packets).
 enum class EntityType : uint8_t {
     PlayerCharacter = 0,
     NPC             = 1,
@@ -244,6 +310,8 @@ enum class EntityType : uint8_t {
     Turret          = 6,
 };
 
+// ES: Partes del cuerpo de un personaje de Kenshi (salud por extremidad). Count = nº de partes.
+// EN: Kenshi character body parts (per-limb health). Count = number of parts.
 enum class BodyPart : uint8_t {
     Head      = 0,
     Chest     = 1,
@@ -255,6 +323,8 @@ enum class BodyPart : uint8_t {
     Count     = 7,
 };
 
+// ES: Ranuras de equipo de un personaje. Count = nº de ranuras.
+// EN: Character equipment slots. Count = number of slots.
 enum class EquipSlot : uint8_t {
     Weapon    = 0,
     Back      = 1,
@@ -273,18 +343,22 @@ enum class EquipSlot : uint8_t {
     Count     = 14,
 };
 
-// Per-limb health data for replication
+// ES: Salud por extremidad para replicar (una entrada por BodyPart, 100 por defecto).
+// EN: Per-limb health data for replication
 struct LimbHealth {
     float hp[static_cast<int>(BodyPart::Count)] = {100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f};
 };
 
-// Combat state for replication
+// ES: Estado de combate para replicar: si está en combate, objetivo y postura.
+// EN: Combat state for replication
 struct CombatInfo {
     bool     inCombat = false;
     EntityID targetId = INVALID_ENTITY;
     uint8_t  stance   = 0; // 0=passive, 1=melee, 2=ranged, 3=block
 };
 
+// ES: Información básica de un jugador conectado (ID, nombre, ping y si es el host).
+// EN: Basic info about a connected player (ID, name, ping and whether it's the host).
 struct PlayerInfo {
     PlayerID    id = INVALID_PLAYER;
     std::string name;
