@@ -67,9 +67,9 @@ Write-Host "[OK] Mod instalado"
 # EN: 6) Pre-configure the connection to the host server (auto-connect)
 $cfgDir = "$env:APPDATA\KenshiMP"
 New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
-$cfg = '{ "lastServer": "85.57.86.232", "lastPort": 27800, "playerName": "Umi" }'
+$cfg = '{ "lastServer": "IP_DEL_HOST", "lastPort": 27800, "playerName": "Umi" }'
 Set-Content -Path "$cfgDir\client.json" -Value $cfg -Encoding ascii
-Write-Host "[OK] client.json -> server 85.57.86.232:27800 (auto-connect)"
+Write-Host "[OK] client.json -> server IP_DEL_HOST:27800 (auto-connect)"
 
 Write-Host ""
 Write-Host "=== INSTALACION COMPLETA EN EL PC2 ==="

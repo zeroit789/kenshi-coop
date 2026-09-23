@@ -26,7 +26,7 @@ Tienes dos formas de hacerlo. La **Opción A es la recomendada** porque es la m�
    - **Tu nombre** (el que quieras que vean los demás en la partida).
    - En **servidor / server address**, escribe exactamente esto:
      ```
-     85.57.86.232:27800
+     IP_DEL_HOST:27800
      ```
 4. Pulsa el botón **PLAY**.
 
@@ -50,7 +50,7 @@ Una vez dentro del juego (te abrirá Kenshi tras el paso anterior):
 1. En el menú principal, pulsa **MULTIPLAYER**.
 2. Pulsa **JOIN GAME** (unirse a partida).
 3. Te pedirá la IP y el puerto del servidor. Pon:
-   - **IP:** `85.57.86.232`
+   - **IP:** `IP_DEL_HOST`
    - **Puerto:** `27800`
 4. Pulsa **CONNECT** (conectar).
 5. Pulsa **NEW GAME** (partida nueva). ⚠️ **MUY IMPORTANTE: siempre NEW GAME, nunca Load Game.**
@@ -77,7 +77,7 @@ Y ya está, en cuanto cargue el mundo te conectas con Zero automáticamente.
 **No conecta / no entra al servidor:**
 - Avisa a Zero (el host) de que **tenga el servidor abierto** en su PC. Si su servidor no está encendido, nadie puede entrar.
 - El puerto **27800 UDP** tiene que estar abierto en el router del host (con UPnP activado o abierto a mano). Eso es cosa de Zero, no tuya.
-- Comprueba que escribiste bien la IP: `85.57.86.232` y el puerto `27800`.
+- Comprueba que escribiste bien la IP: `IP_DEL_HOST` y el puerto `27800`.
 
 **No veo al otro jugador / está invisible:**
 - Espera unos segundos, a veces tarda en aparecer.
