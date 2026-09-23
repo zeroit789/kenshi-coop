@@ -1,8 +1,21 @@
 # -*- coding: utf-8 -*-
+# ES: Resuelve el slot virtual +0x58 (getController) de Character y lo desensambla. Busca las vtables de
+#     Character como las que tienen en +0xE8 el tick de IA 0x5CCD90, para confirmar si getController
+#     devuelve un objeto cuyo +0x250 es el que escribe SetControlledChar. Incluye notas de enfoques
+#     descartados. Uso: python re_getcontroller.py
+# EN: Resolves the virtual slot +0x58 (getController) of Character and disassembles it. Finds the
+#     Character vtables as those holding the AI tick 0x5CCD90 at +0xE8, to confirm whether getController
+#     returns an object whose +0x250 is the one SetControlledChar writes. Includes notes on discarded
+#     approaches. Usage: python re_getcontroller.py
+
 # Resuelve el virtual slot +0x58 (getController) del Character y desensambla su cuerpo.
 # OBJETIVO: confirmar que getController(char) devuelve un objeto cuyo +0x250 es el MISMO
 # que SetControlledChar escribe (newChar+0x250=PI). Si getController==identidad (return this)
 # o devuelve un sub-objeto fijo, el fix vale. Si devuelve otra cosa, el fix NO activa el gate.
+# EN: Resolves Character's virtual slot +0x58 (getController) and disassembles its body.
+#     GOAL: confirm that getController(char) returns an object whose +0x250 is the SAME one
+#     SetControlledChar writes (newChar+0x250=PI). If getController==identity (return this)
+#     or returns a fixed subobject, the fix works. If it returns something else, the fix does NOT trigger the gate.
 import struct
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, FlowControl
 
@@ -10,6 +23,8 @@ EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IMAGE_BASE = 0x140000000
 with open(EXE, "rb") as f:
     DATA = f.read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]
 coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]
@@ -26,6 +41,8 @@ for i in range(num_sec):
     raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
 
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def rva_to_off(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
@@ -34,6 +51,8 @@ def rva_to_off(rva):
                 return raw_off + d
     return None
 
+# ES: Lee un qword (8 bytes) en un RVA.
+# EN: Reads a qword (8 bytes) at an RVA.
 def read_q(rva):
     off = rva_to_off(rva)
     return struct.unpack_from("<Q", DATA, off)[0]
@@ -54,6 +73,9 @@ def read_q(rva):
 # Enfoque directo y robusto: localizar TODAS las vtables en .rdata cuyo slot0 caiga en .text
 # y cuyo +0x58 sea una funcion; luego para las que parezcan Character (tienen +0x1D8 y +0x268
 # y +0xE8 validos como en el AI tick) desensamblar su +0x58.
+# EN: The Character vtable: the AI tick 0x5CCD90 does mov rax,[rdi] (vtable) and call [rax+0x58].
+#     We need the concrete vtable (the rest are notes on several approaches; the final one is at the
+#     bottom: find vtables whose +0xE8 slot is the AI tick).
 RDATA = next(s for s in SECTIONS if s[0]==".rdata")
 TEXT  = next(s for s in SECTIONS if s[0]==".text")
 def in_text(rva): return TEXT[1] <= rva < TEXT[1]+TEXT[2]
@@ -63,20 +85,28 @@ def in_text(rva): return TEXT[1] <= rva < TEXT[1]+TEXT[2]
 # Character en algun sitio. Buscamos en core/sdk. Atajo final: desensamblar getController a partir
 # de la vtable de Character hallada por RTTI ".?AVCharacter@@".
 # Buscar el string del type descriptor:
+# EN: Character vtable: known from the AI tick. Finding it by slot is too costly; shortcut: use the
+#     RTTI ".?AVCharacter@@". Find the type descriptor string:
 needle = b".?AVCharacter@@"
 idx = DATA.find(needle)
 print("RTTI .?AVCharacter@@ raw off:", hex(idx) if idx>=0 else "NO ENCONTRADO")
 # raw off -> rva
+# ES: Offset de fichero -> RVA.
+# EN: File offset -> RVA.
+# EN: raw off -> rva
 def off_to_rva(off):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if raw_off <= off < raw_off+raw_size:
             return srva + (off - raw_off)
     return None
+# EN: TypeDescriptor starts 0x10 before the name
 td_rva = off_to_rva(idx-0x10) if idx>=0 else None  # TypeDescriptor empieza 0x10 antes del nombre
 print("TypeDescriptor RVA aprox:", hex(td_rva) if td_rva else None)
 
 # Localizar la vtable: COL referencia el TD; vtable[-1] = COL. Escaneamos .rdata por punteros
 # absolutos al TD (vtable_TypeDescriptor en el TypeDescriptor field del COL).
+# EN: Locate the vtable: the COL references the TD; vtable[-1] = COL. We scan .rdata for absolute
+#     pointers to the TD. (The next line evaluates to None: leftover, unused.)
 td_va = IMAGE_BASE + (idx-0x10) and None
 # Demasiado fragil. Plan B robusto: desensamblar el slot +0x58 directamente NO hace falta si
 # confirmamos por semantica: SetControlledChar escribe [newChar+0x250]=PI y el gate lee
@@ -89,20 +119,28 @@ td_va = IMAGE_BASE + (idx-0x10) and None
 # y [rdi] su vtable. Buscamos en .rdata una vtable V tal que:
 #   V[0x58/8] -> funcion getter pequena. Y desensamblamos esa.
 # Para acotar: tomamos la vtable de Character desde el COL. Escaneo de COLs:
+# EN: Too fragile. Robust plan B: confirm by semantics (notes). The definitive thing is the slot.
+#     Resolve the Character vtable by force: the AI tick 0x5CCD90 tells us 'this' (rdi) is Character
+#     and [rdi] its vtable. Find in .rdata a vtable V such that V[0x58/8] -> small getter.
 print("\n-- Buscando vtable de Character via COL/RTTI --")
 # Escanear .rdata por qwords que apunten dentro de .text con un patron de vtable de Character:
 # heuristica: una vtable de Character debe tener en offset 0x1D8 y 0x1E0 y 0x268 y 0xE8 punteros a .text.
+# EN: Scan .rdata for qwords pointing into .text with a Character vtable pattern:
+#     heuristic: a Character vtable must have .text pointers at 0x1D8, 0x1E0, 0x268 and 0xE8.
 rd_off = RDATA[3]; rd_size = RDATA[4]; rd_rva = RDATA[1]
 candidates = []
 step = 8
 # limitar escaneo: buscar qword == puntero a 0x5CD... (la rama viva pertenece a Character::updateLogic)
 # El slot que CONTIENE 0x5CCD90 (AI tick, +0xE8) identifica la vtable de Character.
+# EN: narrow the scan: look for qword == pointer to 0x5CD... (the live branch belongs to Character::updateLogic)
+#     The slot CONTAINING 0x5CCD90 (AI tick, +0xE8) identifies the Character vtable.
 target = IMAGE_BASE + 0x5CCD90
 for off in range(rd_off, rd_off+rd_size-8, step):
     q = struct.unpack_from("<Q", DATA, off)[0]
     if q == target:
         slot_rva = off_to_rva(off)
         vtbl_base = slot_rva - 0xE8  # este slot es +0xE8
+        # EN: this slot is +0xE8
         candidates.append(vtbl_base)
 print("vtables de Character candidatas (slot +0xE8 == 0x5CCD90):", [hex(c) for c in candidates])
 
@@ -111,6 +149,7 @@ for vt in candidates:
     getctl_rva = s58 - IMAGE_BASE
     print(f"\nvtable 0x{vt:X}: slot +0x58 (getController) = 0x{getctl_rva:X}")
     # desensamblar getController
+    # EN: disassemble getController
     off = rva_to_off(getctl_rva)
     if off is None:
         print("  (fuera de rango)"); continue

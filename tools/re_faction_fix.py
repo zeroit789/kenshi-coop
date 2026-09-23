@@ -1,7 +1,19 @@
 # -*- coding: utf-8 -*-
+# ES: RE para el arreglo de relaciones entre facciones del co-op: imprime los primeros bytes (base de
+#     patrones AOB) de isEnemy, isAlly, addRelation, el setter recíproco, el ctor de Faction y
+#     getRelationEntry, o desensambla uno de ellos.
+#     Uso: python re_faction_fix.py [prologues|isenemy|isally|addrel|setter|ctor|getentry]
+# EN: RE for the co-op faction relations fix: prints the first bytes (basis for AOB patterns) of isEnemy,
+#     isAlly, addRelation, the reciprocal setter, the Faction ctor and getRelationEntry, or disassembles
+#     one of them. Usage: python re_faction_fix.py [prologues|isenemy|isally|addrel|setter|ctor|getentry]
+
 # RE para el fix de relaciones de faccion (Kenshi Co-op).
 # Resuelve: prologos+AOB de isEnemy/addRelation/setter, desensamblado del setter reciproco,
 # layout de FactionManager (array de Faction*), y getter por string-id/nombre.
+# EN: RE for the faction relations fix (Kenshi Co-op).
+#     Resolves: prologues+AOB of isEnemy/addRelation/setter, disassembly of the reciprocal setter,
+#     FactionManager layout (array of Faction*), and getter by string-id/name
+#     (only prologues and disassembly are implemented).
 import struct, sys
 from iced_x86 import (Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind,
                       Register, FlowControl, OpCodeOperandKind)
@@ -11,6 +23,8 @@ IMAGE_BASE = 0x140000000
 with open(EXE, "rb") as f:
     DATA = f.read()
 
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]
 coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]
@@ -27,12 +41,16 @@ for i in range(num_sec):
     raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
 
+# ES: Nombre de la sección que contiene el RVA.
+# EN: Name of the section containing the RVA.
 def sec_of_rva(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
             return name
     return None
 
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def rva_to_off(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
@@ -41,14 +59,20 @@ def rva_to_off(rva):
                 return raw_off + d
     return None
 
+# ES: Secciones principales.
+# EN: Main sections.
 TEXT = next(s for s in SECTIONS if s[0] == ".text")
 RDATA = next(s for s in SECTIONS if s[0] == ".rdata")
 DATAS = next(s for s in SECTIONS if s[0] == ".data")
 
+# ES: n bytes en hexadecimal a partir de un RVA (para sacar patrones AOB).
+# EN: n hex bytes starting at an RVA (to derive AOB patterns).
 def hexbytes(rva, n):
     off = rva_to_off(rva)
     return " ".join(f"{b:02X}" for b in DATA[off:off+n])
 
+# ES: Desensambla un rango desde start_rva e imprime cada instrucción con anotaciones (destinos, cadenas o marcas según el script).
+# EN: Disassembles a range from start_rva and prints each instruction with annotations (targets, strings or marks depending on the script).
 def disasm(start_rva, length, label, stop_at_int3=False, max_ins=999):
     off = rva_to_off(start_rva)
     code = DATA[off:off+length]
@@ -75,6 +99,8 @@ def disasm(start_rva, length, label, stop_at_int3=False, max_ins=999):
             print(f"0x{rva:08X}  {rawhex:<28} {fmt.format(instr)}  <-- PADDING"); break
         print(f"0x{rva:08X}  {rawhex:<28} {fmt.format(instr)}{mark}")
 
+# ES: Punto de entrada: modo por argumento.
+# EN: Entry point: mode by argument.
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else "prologues"
 

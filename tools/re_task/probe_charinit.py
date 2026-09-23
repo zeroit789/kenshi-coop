@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+# ES: Confirma que char+0x20 (AITaskSytem*) empieza a NULL y se rellena en AI::create: lista los call a
+#     AI::create (0x622110), cuenta escrituras "mov [reg+0x20], reg" y busca candidatos a push_back del
+#     lektor (mov eax,[rcx+8] seguido de comparación con [rcx+0xC]). Uso: python probe_charinit.py
+# EN: Confirms that char+0x20 (AITaskSytem*) starts NULL and is filled in AI::create: lists calls to
+#     AI::create (0x622110), counts "mov [reg+0x20], reg" writes and looks for lektor push_back candidates
+#     (mov eax,[rcx+8] followed by a compare with [rcx+0xC]). Usage: python probe_charinit.py
+
 """Confirma que char+0x20 (AITaskSytem*) arranca NULL y se llena en AI::create.
 Busca: (1) quien llama AI::create 0x622110 (xref), (2) lecturas/escrituras de char+0x20,
 (3) el push real del lektor (addTask)."""
@@ -6,10 +13,13 @@ import struct
 from re_task_system import pe, disasm, print_disasm, BASE, follow_thunk
 from iced_x86 import Mnemonic, OpKind
 
+# ES: Bytes de .text para escanear a mano.
+# EN: .text bytes for manual scanning.
 text=pe.sec(".text"); tstart=text["ro"]; tsize=text["rs"]; trva=text["rva"]
 blob=pe.data[tstart:tstart+tsize]
 
 # 1) xrefs (call rel32) a AI::create 0x622110
+# EN: 1) xrefs (call rel32) to AI::create 0x622110
 print("===== callers de AI::create 0x622110 =====")
 tgt=0x622110
 cnt=0
@@ -25,8 +35,11 @@ print(f"  total mostrados: {cnt}")
 
 # 2) accesos a char+0x20: distinguir 'mov [reg+0x20],rax' (set) vs 'mov rax,[reg+0x20]' (get)
 #    Limitamos a contexto cercano a callers de spawn; aqui solo contamos.
+# EN: 2) accesses to char+0x20: tell 'mov [reg+0x20],rax' (set) from 'mov rax,[reg+0x20]' (get)
+#        We only count here (not limited to spawn callers).
 print("\n===== escrituras 'mov [reg+0x20], rax/0' en .text (set de AICore) =====")
 # patron: 48 89 4X 20  (mov [reg+0x20], reg) con modrm mod=01 disp8=0x20
+# EN: pattern: 48 89 4X 20 (mov [reg+0x20], reg) with modrm mod=01 disp8=0x20
 sets=0; nulls=0
 for i in range(len(blob)-4):
     if blob[i]==0x48 and blob[i+1]==0x89 and (blob[i+2]&0xC0)==0x40 and (blob[i+2]&7)!=4 and blob[i+3]==0x20:
@@ -37,8 +50,13 @@ print(f"  count mov [reg+0x20],reg disp8=0x20: {sets} (incluye muchos structs)")
 #    El AItaskSytem usa el lektor via metodo no-virtual. Buscamos call a una
 #    funcion que lea [rcx+8](size),[rcx+0xC](cap),[rcx+0x10](data) en ese orden.
 #    Escaneamos funciones pequenas con ese patron de bytes.
+# EN: 3) real lektor push: function taking (lektor*, Tasker**) that grows.
+#        AItaskSytem uses the lektor through a non-virtual method. We look for a call to a
+#        function reading [rcx+8](size),[rcx+0xC](cap),[rcx+0x10](data) in that order.
+#        We scan small functions with that byte pattern.
 print("\n===== buscando push_back del lektor (size+8/cap+0xC/data+0x10) =====")
 # patron de bytes tipico: 8B 41 08 (mov eax,[rcx+8]) ... 3B 41 0C (cmp eax,[rcx+0xC])
+# EN: typical byte pattern: 8B 41 08 (mov eax,[rcx+8]) ... 3B 41 0C (cmp eax,[rcx+0xC])
 needle = bytes([0x8B,0x41,0x08])  # mov eax,[rcx+8]
 idx=0; found=0
 while found<8:
@@ -46,6 +64,7 @@ while found<8:
     if p==-1: break
     idx=p+1
     # mirar ventana 16 bytes por cmp con [rcx+0xC]
+    # EN: check a 16-byte window for a cmp with [rcx+0xC] (the code uses 24 bytes)
     win=blob[p:p+24]
     if bytes([0x3B,0x41,0x0C]) in win or bytes([0x39,0x41,0x0C]) in win or bytes([0x41,0x0C]) in win:
         rva=trva+p

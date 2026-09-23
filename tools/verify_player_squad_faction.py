@@ -1,3 +1,12 @@
+# ES: Verificador de solo lectura del parche anterior: comprueba en cada copia del .mod que el campo
+#     'faction' del escuadrón del jugador apunta a Nameless (204-gamedata.base), cuenta cadenas
+#     length-prefixed válidas como control de integridad y confirma que Nameless existe en gamedata.base.
+#     Uso: python tools/verify_player_squad_faction.py
+# EN: Read-only verifier for the previous patch: checks in every .mod copy that the player squad's
+#     'faction' field points to Nameless (204-gamedata.base), counts valid length-prefixed strings as an
+#     integrity check and confirms Nameless exists in gamedata.base.
+#     Usage: python tools/verify_player_squad_faction.py
+
 """
 verify_player_squad_faction.py
 ==============================
@@ -25,6 +34,8 @@ USO:
 import struct
 import os
 
+# ES: Rutas del repo, de Steam y copias del .mod a verificar.
+# EN: Repo and Steam paths and .mod copies to verify.
 REPO = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
 STEAM = r"E:\SteamLibrary\steamapps\common\Kenshi"
 GAMEDATA = os.path.join(STEAM, 'data', 'gamedata.base')
@@ -37,6 +48,8 @@ MOD_PATHS = [
     os.path.join(STEAM, 'data', 'kenshi-online.mod'),
 ]
 
+# ES: Bloques del campo y referencias esperadas.
+# EN: Field block and expected references.
 FIELD_NAME = b'faction'
 NAMELESS_REF = b'204-gamedata.base'
 PLAYER1_REF = b'10-kenshi-online.mod'
@@ -44,6 +57,8 @@ PLAYER1_REF = b'10-kenshi-online.mod'
 FIELD_NAME_BLOCK = struct.pack('<I', len(FIELD_NAME)) + FIELD_NAME
 
 
+# ES: Cadena a la que apunta el campo 'faction' del escuadrón (primera aparición válida), o None.
+# EN: String the squad's 'faction' field points to (first valid occurrence), or None.
 def find_squad_faction(data):
     """Devuelve el string-ID al que apunta el campo 'faction' del squad del jugador,
     o None si no se encuentra el campo."""
@@ -52,6 +67,7 @@ def find_squad_faction(data):
         fpos = data.find(FIELD_NAME_BLOCK, start)
         if fpos == -1:
             return None
+        # EN: ref_count / <u32 len><string> block (inline comments)
         rc_off = fpos + len(FIELD_NAME_BLOCK)        # ref_count
         ref_off = rc_off + 4                          # bloque <u32 len><string>
         ln = struct.unpack_from('<I', data, ref_off)[0]
@@ -62,6 +78,10 @@ def find_squad_faction(data):
         start = fpos + 1
 
 
+# ES: Cuenta cadenas imprimibles length-prefixed recorriendo el fichero. Ojo: la docstring promete
+#     (ok, num, offset) pero devuelve solo el número.
+# EN: Counts printable length-prefixed strings walking the file. Note: the docstring promises
+#     (ok, num, offset) but it only returns the count.
 def structural_integrity_scan(data):
     """Recorre el archivo contando strings length-prefixed válidas y detectando si el
     stream se desincroniza. Devuelve (ok, num_strings, primer_offset_sospechoso)."""
@@ -73,6 +93,10 @@ def structural_integrity_scan(data):
     # estricto fallara, las strings caerían en sitios imposibles. Como el formato mezcla
     # strings con blobs binarios (floats/ints), no podemos parsear 100% sin el esquema,
     # así que validamos que TODAS las strings conocidas siguen siendo coherentes.
+    # EN: Integrity heuristic: count consecutive printable length-prefixed strings.
+    #     A healthy .mod has hundreds. If the strict sequential walk failed, strings would land in
+    #     impossible places. Since the format mixes strings with binary blobs (floats/ints), we cannot
+    #     parse 100% without the schema, so we validate that ALL known strings stay coherent.
     while i < n - 4:
         ln = struct.unpack_from('<I', data, i)[0]
         if 3 <= ln <= 64 and i + 4 + ln <= n:
@@ -85,6 +109,8 @@ def structural_integrity_scan(data):
     return str_count
 
 
+# ES: ¿Existe Nameless (con su id cerca) en gamedata.base? Devuelve (existe, offset).
+# EN: Does Nameless exist (with its id nearby) in gamedata.base? Returns (exists, offset).
 def nameless_relations_in_gamedata():
     """Confirma que Nameless (204-gamedata.base) existe en gamedata.base. Devuelve
     (existe, offset) o (False, -1). La red de relaciones vanilla vive aquí."""
@@ -92,18 +118,23 @@ def nameless_relations_in_gamedata():
         return None, -1
     data = open(GAMEDATA, 'rb').read()
     # Buscar el string 'Nameless' seguido de su id '204-gamedata.base'
+    # EN: Look for the 'Nameless' string followed by its id '204-gamedata.base'
     p = data.find(b'Nameless')
     if p == -1:
         return False, -1
     # ¿aparece 204-gamedata.base cerca?
+    # EN: does 204-gamedata.base appear nearby?
     window = data[p:p + 80]
     return (NAMELESS_REF in window), p
 
 
+# ES: Punto de entrada: comprueba gamedata.base y cada copia del .mod y da un veredicto.
+# EN: Entry point: checks gamedata.base and each .mod copy and gives a verdict.
 if __name__ == '__main__':
     print("=== VERIFICACIÓN: squad del jugador en Nameless + integridad del .mod ===\n")
 
     # 0) Nameless en gamedata.base (la fuente de relaciones reales)
+    # EN: 0) Nameless in gamedata.base (the source of real relations)
     exists, off = nameless_relations_in_gamedata()
     if exists is None:
         print("[gamedata.base] NO encontrado — no se puede verificar la fuente de relaciones.")
@@ -137,6 +168,7 @@ if __name__ == '__main__':
             all_ok = False
 
         # ¿Queda alguna referencia al Player 1 como faction del squad? (no debería)
+        # EN: Is there still a Player 1 reference as the squad's faction? (there should not be)
         if find_squad_faction(data) == PLAYER1_REF:
             all_ok = False
         print()

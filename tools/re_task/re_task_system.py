@@ -1,4 +1,17 @@
 # -*- coding: utf-8 -*-
+# ES: RE del sistema de tareas/órdenes de Character (Steam 1.0.68) y helper común de la carpeta re_task:
+#     define un parser PE propio (PE, pe), disasm/print_disasm/call_target y follow_thunk, y a nivel de
+#     módulo ejecuta los pasos 0-7 (RTTI -> vtables de Tasker/GOAPTaskMgr/Task_*, AI::create 0x622110,
+#     ctor de AITaskSytem, xrefs a vtables, vtable del lektor<Tasker*> y accesos a AITaskSytem+0x2E8).
+#     Ojo: como los pasos están a nivel de módulo, cualquier "from re_task_system import ..." (los probe_*)
+#     ejecuta e imprime todo el análisis antes de su propio código. Uso: python re_task_system.py
+# EN: RE of Character's task/order system (Steam 1.0.68) and common helper of the re_task folder: defines
+#     its own PE parser (PE, pe), disasm/print_disasm/call_target and follow_thunk, and at module level runs
+#     steps 0-7 (RTTI -> Tasker/GOAPTaskMgr/Task_* vtables, AI::create 0x622110, AITaskSytem ctor, vtable
+#     xrefs, lektor<Tasker*> vtable and AITaskSytem+0x2E8 accesses).
+#     Note: since the steps live at module level, any "from re_task_system import ..." (the probe_* scripts)
+#     runs and prints the whole analysis before its own code. Usage: python re_task_system.py
+
 """
 RE del SISTEMA DE TAREAS/ORDENES del Character de Kenshi (Steam 1.0.68).
 Desensambla AI::create (0x622110), localiza vtable de Tasker (RTTI 0x1CF6F50)
@@ -12,6 +25,8 @@ from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind, Code
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 BASE = 0x140000000
 
+# ES: Parser PE mínimo: fichero en memoria, base de imagen y secciones (name, vsize, rva, rs, ro).
+# EN: Minimal PE parser: file in memory, image base and sections (name, vsize, rva, rs, ro).
 class PE:
     def __init__(self, path):
         with open(path, "rb") as f:
@@ -19,6 +34,8 @@ class PE:
         self.base = BASE
         self.sections = []
         self._parse()
+    # ES: Lee la base de imagen (PE32+) y la tabla de secciones.
+    # EN: Reads the image base (PE32+) and the section table.
     def _parse(self):
         e = struct.unpack_from("<I", self.data, 0x3C)[0]
         coff = e + 4
@@ -36,6 +53,8 @@ class PE:
             rs = struct.unpack_from("<I", self.data, o+16)[0]
             ro = struct.unpack_from("<I", self.data, o+20)[0]
             self.sections.append(dict(name=name,vsize=vsize,rva=rva,rs=rs,ro=ro))
+    # ES: RVA -> offset de fichero y viceversa.
+    # EN: RVA -> file offset and back.
     def rva2off(self, rva):
         for s in self.sections:
             if s["rva"] <= rva < s["rva"] + max(s["rs"], s["vsize"]):
@@ -47,19 +66,27 @@ class PE:
             if s["ro"] <= off < s["ro"] + s["rs"]:
                 return off - s["ro"] + s["rva"]
         return None
+    # ES: Lee un qword en un RVA (None si se sale).
+    # EN: Reads a qword at an RVA (None if out of range).
     def read_q(self, rva):
         o = self.rva2off(rva)
         if o is None or o+8 > len(self.data): return None
         return struct.unpack_from("<Q", self.data, o)[0]
+    # ES: Sección por nombre (dict) o None.
+    # EN: Section by name (dict) or None.
     def sec(self, name):
         for s in self.sections:
             if s["name"] == name: return s
         return None
 
+# ES: Instancia global del PE y formateador Intel compartido.
+# EN: Global PE instance and shared Intel formatter.
 pe = PE(EXE)
 FMT = Formatter(FormatterSyntax.INTEL)
 FMT.hex_prefix = "0x"; FMT.hex_suffix = ""
 
+# ES: Lista de (rva, bytes, texto, instrucción) decodificando length bytes desde rva.
+# EN: List of (rva, bytes, text, instruction) decoding length bytes from rva.
 def disasm(rva, length=400):
     off = pe.rva2off(rva)
     if off is None:
@@ -75,6 +102,8 @@ def disasm(rva, length=400):
         if ins.code == Code.INVALID: break
     return out
 
+# ES: Imprime el desensamblado con bytes; opcionalmente para en el primer ret.
+# EN: Prints the disassembly with bytes; optionally stops at the first ret.
 def print_disasm(rva, length=400, label="", stop_on_ret=False):
     print(f"\n===== {label}  RVA 0x{rva:X} =====")
     for r, raw, s, ins in disasm(rva, length):
@@ -83,11 +112,15 @@ def print_disasm(rva, length=400, label="", stop_on_ret=False):
         if stop_on_ret and ins.mnemonic == Mnemonic.RET:
             break
 
+# ES: Destino (RVA) de un call directo, o None.
+# EN: Target (RVA) of a direct call, or None.
 def call_target(ins):
     if ins.mnemonic == Mnemonic.CALL and ins.op0_kind == OpKind.NEAR_BRANCH64:
         return ins.near_branch_target - BASE
     return None
 
+# ES: Mostrar las secciones.
+# EN: Show the sections.
 print("="*72)
 print("Secciones:")
 for s in pe.sections:
@@ -96,10 +129,13 @@ for s in pe.sections:
 # ════════════════════════════════════════════════════════════════════
 # PASO 0: RTTI -> vtable (Tasker, GOAPTaskMgr, Task_*)
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 0: RTTI -> vtable (Tasker, GOAPTaskMgr, Task_*)
 print("\n" + "="*72)
 print("PASO 0: RTTI -> vtable (CompleteObjectLocator -> TypeDescriptor)")
 print("="*72)
 
+# ES: Busca COLs (firma 0/1) cuyo campo +0xC es td_rva y devuelve [(vtable, COL)] de las vtables que apuntan a ellos.
+# EN: Finds COLs (signature 0/1) whose +0xC field is td_rva and returns [(vtable, COL)] for the vtables pointing to them.
 def find_vtables_for_typedescriptor(td_rva):
     rdata = pe.sec(".rdata")
     if not rdata: return []
@@ -126,6 +162,9 @@ def find_vtables_for_typedescriptor(td_rva):
 # Las RVAs dadas apuntan al campo `name` (mangled string) DENTRO del TypeDescriptor.
 # El TypeDescriptor MSVC x64 = { void* pVFTable; void* spare; char name[] }
 # => TD_real = name_rva - 0x10
+# EN: The given RVAs point to the `name` field (mangled string) INSIDE the TypeDescriptor.
+#     The MSVC x64 TypeDescriptor = { void* pVFTable; void* spare; char name[] }
+#     => TD_real = name_rva - 0x10
 RTTI = [("Tasker",0x1CF6F50),("GOAPTaskMgr",0x1CDE7C0),
         ("Task_MeleeAttack",0x1CF7350),("Task_GetUp",0x1CF7538),
         ("Task_GetOutOfBed",0x1CF76D8),("Task_Runaway",0x1CF79E0),
@@ -153,18 +192,21 @@ VT_GOAP   = 0x16BC1D8
 # ════════════════════════════════════════════════════════════════════
 # PASO 1: AI::create (0x622110) -> offset char+0xNNN del AICore/Tasker
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 1: AI::create (0x622110) -> char+0xNNN offset of the AICore/Tasker
 print("\n" + "="*72)
 print("PASO 1: AI::create 0x622110 - desensamblado completo")
 print("="*72)
 print_disasm(0x622110, length=900, label="AI::create")
 
 # Localizar calls (constructores/allocadores) y los `mov [reg+disp], rax` que les siguen
+# EN: Locate calls (constructors/allocators) and the `mov [reg+disp], rax` following them
 print("\n--- Analisis de stores tras CALL (candidatos a 'char+0xNNN = AICore') ---")
 ins_list = disasm(0x622110, 900)
 for i,(r,raw,s,ins) in enumerate(ins_list):
     ct = call_target(ins)
     if ct is not None:
         # mirar las ~6 instrucciones siguientes por un store de rax a [reg+disp]
+        # EN: look at the ~6 following instructions for a store of rax into [reg+disp]
         for j in range(i+1, min(i+8, len(ins_list))):
             r2,raw2,s2,ins2 = ins_list[j]
             if ins2.mnemonic == Mnemonic.MOV and ins2.op0_kind == OpKind.MEMORY \
@@ -178,23 +220,28 @@ print("\n[OK] PASO 1 hecho")
 # PASO 2: constructor del objeto char+0x20 (call 0x184F3 -> destino real)
 #   nota: 0x184F3 es un thunk; resolver el jmp/llamada interna.
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 2: constructor of the char+0x20 object (call 0x184F3 -> real target)
+#       note: 0x184F3 is a thunk; resolve the internal jmp/call.
 print("\n" + "="*72)
 print("PASO 2: constructor del AICore (char+0x20) y que vtable instala")
 print("="*72)
 print_disasm(0x184F3, length=64, label="thunk 0x184F3", stop_on_ret=True)
 # resolver el jmp del thunk
+# EN: resolve the thunk jmp
 for r,raw,s,ins in disasm(0x184F3, 32):
     if ins.mnemonic == Mnemonic.JMP and ins.op0_kind == OpKind.NEAR_BRANCH64:
         real = ins.near_branch_target - BASE
         print(f"  thunk -> 0x{real:X}")
         print_disasm(real, length=700, label="AICore::ctor (real)")
         # buscar instalacion de vtable (lea rax,[vt]; mov [reg],rax) y stores de subobjetos
+        # EN: look for a vtable install (lea rax,[vt]; mov [reg],rax) and subobject stores
         print("\n  --- vtables instaladas / stores de punteros en el ctor ---")
         cl = disasm(real, 700)
         for i,(rr,rb,ss,ii) in enumerate(cl):
             if ii.mnemonic == Mnemonic.LEA and ii.op1_kind == OpKind.MEMORY and ii.memory_base == 0:
                 tgt = ii.memory_displacement - BASE if ii.memory_displacement>=BASE else ii.memory_displacement
                 # ¿es una vtable conocida?
+                # EN: is it a known vtable?
                 tag = ""
                 if tgt == VT_TASKER: tag = "  <<< vtable TASKER"
                 elif tgt == VT_GOAP: tag = "  <<< vtable GOAPTaskMgr"
@@ -211,10 +258,14 @@ print("\n[OK] PASO 2 hecho")
 # PASO 3: identificar la clase del objeto char+0x20 via RTTI de su vtable
 #         y de las vtables de sus sub-objetos.
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 3: identify the class of the char+0x20 object through the RTTI of its vtable
+#             and of its subobjects' vtables.
 print("\n" + "="*72)
 print("PASO 3: RTTI de las vtables instaladas (vtable -> COL -> TypeDescriptor -> nombre)")
 print("="*72)
 
+# ES: Nombre de clase de una vtable: vtable[-1] -> COL -> +0xC (RVA del TD) -> +0x10 nombre.
+# EN: Class name of a vtable: vtable[-1] -> COL -> +0xC (TD RVA) -> +0x10 name.
 def vtable_to_classname(vt_rva):
     """vtable[-1] -> COL (RVA en imagen) -> +0xC (TypeDescriptor RVA) -> +0x10 name."""
     col_va = pe.read_q(vt_rva - 8)
@@ -241,6 +292,8 @@ for tag, vt in VTS_TO_NAME.items():
 
 # Tambien: ¿la vtable Tasker/GOAP aparece como puntero dentro del rango del objeto char+0x20?
 # Escaneamos el ctor por lea de cualquier vtable .rdata y la nombramos.
+# EN: Also: does the Tasker/GOAP vtable show up as a pointer inside the char+0x20 object range?
+#     We scan the ctor for leas of any .rdata vtable and name them.
 print("\n--- TODAS las vtables .rdata cargadas por lea en el ctor 0x50DB70 ---")
 seen=set()
 for r,raw,s,ins in disasm(0x50DB70, 700):
@@ -258,10 +311,15 @@ print("\n[OK] PASO 3 hecho")
 #         y rastrear xrefs (lea/mov) a esas vtables en .text para hallar
 #         constructores que las instalan, y el offset dentro del char/AICore.
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 4: the task queue. Find where the Tasker/GOAP vtable is used
+#             and trace xrefs (lea/mov) to those vtables in .text to find
+#             the constructors installing them, and the offset inside the char/AICore.
 print("\n" + "="*72)
 print("PASO 4: xrefs a vtable Tasker(0x16BDC68) y GOAP(0x16BC1D8) en .text")
 print("="*72)
 
+# ES: Instrucciones lea RIP-relativas en .text que cargan la vtable (instalación en constructores).
+# EN: RIP-relative lea instructions in .text loading the vtable (install in constructors).
 def find_lea_xrefs_to_vtable(vt_rva, limit=40):
     """Busca instrucciones lea reg,[vt_rva] en .text (instalacion de vtable)."""
     text = pe.sec(".text")
@@ -270,6 +328,7 @@ def find_lea_xrefs_to_vtable(vt_rva, limit=40):
     hits=[]
     blob = pe.data[tstart:tstart+tsize]
     # patron lea: 48 8D xx [RIP+disp32] (7 bytes). resolvemos disp.
+    # EN: lea pattern: 48 8D xx [RIP+disp32] (7 bytes). We resolve disp.
     for i in range(len(blob)-7):
         if blob[i] in (0x48,0x4C) and blob[i+1]==0x8D:
             modrm=blob[i+2];
@@ -288,6 +347,7 @@ for nm, vt in [("Tasker", VT_TASKER), ("GOAPTaskMgr", VT_GOAP)]:
     for h in hits[:8]:
         print(f"   ctor instala vtable @ RVA 0x{h:X}")
         # mostrar la instruccion siguiente (mov [reg+0],rax => offset 0 normalmente)
+        # EN: show the next instruction (mov [reg+0],rax => offset 0 usually)
         nxt = disasm(h, 24)
         for r,raw,s,ins in nxt[:3]:
             print(f"       0x{r:X}: {s}")
@@ -299,9 +359,16 @@ print("\n[OK] PASO 4 hecho")
 #   - vtable lektor = 0x16E34D0. Desensamblar sus primeros metodos.
 #   - vtable AITaskSytem = 0x16E3F30. Listar slots (para addTask).
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 5: layout of lektor<Tasker*> (the queue) and AITaskSytem vtable slots.
+#       - lektor vtable = 0x16E34D0. Disassemble its first methods.
+#       - AITaskSytem vtable = 0x16E3F30. List slots (for addTask).
 print("\n" + "="*72)
 print("PASO 5: vtable AITaskSytem (0x16E3F30) - slots y metodos")
 print("="*72)
+# ES: Lista los slots de una vtable con la primera instrucción de cada método. Ojo: si el primer slot no
+#     apunta a .text, frva queda en None y disasm(None) fallaría.
+# EN: Lists a vtable's slots with the first instruction of each method. Note: if the first slot does not
+#     point into .text, frva stays None and disasm(None) would fail.
 def dump_vtable(vt_rva, n=40, name=""):
     print(f"\n  vtable {name} 0x{vt_rva:X}:")
     for i in range(n):
@@ -310,8 +377,10 @@ def dump_vtable(vt_rva, n=40, name=""):
         frva = fp - BASE if fp and BASE<=fp<BASE+0x3000000 else None
         if frva is None or not (0x1000 <= frva < 0x1673000):
             # fin de vtable (no apunta a .text)
+            # EN: end of vtable (does not point into .text)
             if i>0: break
         # primer mnemonic del metodo
+        # EN: first mnemonic of the method
         first=""
         d=disasm(frva, 8)
         if d: first=d[0][2]
@@ -327,6 +396,9 @@ dump_vtable(0x16E34D0, 16, "lektor<Tasker*>")
 # Desensamblar un metodo del lektor que devuelva tamano/iteradores.
 # El lektor de Kenshi suele tener layout: [vtable][?][begin ptr][end ptr][capacity ptr]...
 # Mostramos varios metodos cortos para inferir offsets.
+# EN: Disassemble a lektor method returning size/iterators.
+#     Kenshi's lektor usually has the layout: [vtable][?][begin ptr][end ptr][capacity ptr]...
+#     We show several short methods to infer offsets.
 print("\n  --- Metodos del lektor (slots 1..6) ---")
 for i in range(1,7):
     fp = pe.read_q(0x16E34D0 + i*8)
@@ -344,9 +416,13 @@ print("\n[OK] PASO 5 hecho")
 # PASO 6: layout de datos del lektor (destructor revela begin/end/cap),
 #         y resolver thunks de la vtable AITaskSytem.
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 6: lektor data layout (the destructor reveals begin/end/cap),
+#             and resolve the AITaskSytem vtable thunks.
 print("\n" + "="*72)
 print("PASO 6: destructor lektor (0x50ADC0) -> layout begin/end/capacity")
 print("="*72)
+# ES: Si en rva hay un jmp directo (thunk), devuelve su destino; si no, rva.
+# EN: If there is a direct jmp (thunk) at rva, returns its target; otherwise rva.
 def follow_thunk(rva):
     d = disasm(rva, 16)
     if d and d[0][3].mnemonic==Mnemonic.JMP and d[0][3].op0_kind==OpKind.NEAR_BRANCH64:
@@ -373,12 +449,17 @@ print("\n[OK] PASO 6 hecho")
 #   Heuristica: funciones que hacen mov rcx,[obj+0x2E8] o lea rcx,[obj+0x2E8]
 #   y luego un push_back (call con store de Tasker*).
 # ════════════════════════════════════════════════════════════════════
+# EN: STEP 7: AItaskSytem::ctor through AI::create -> confirm char+0x20 and
+#             find the addTask method (push into lektor<Tasker*> +0x2E8).
+#       Heuristic: functions doing mov rcx,[obj+0x2E8] or lea rcx,[obj+0x2E8]
+#       followed by a push_back (call with a Tasker* store).
 print("\n" + "="*72)
 print("PASO 7: accesos a AITaskSytem+0x2E8 (la cola lektor<Tasker*>)")
 print("="*72)
 text=pe.sec(".text"); tstart=text["ro"]; tsize=text["rs"]; trva=text["rva"]
 blob=pe.data[tstart:tstart+tsize]
 # buscar disp32 == 0x2E8 en lea/mov [reg+0x2E8] (modrm mod=10)
+# EN: look for disp32 == 0x2E8 in lea/mov [reg+0x2E8] (modrm mod=10)
 import re
 hits=[]
 needle=struct.pack("<i",0x2E8)
@@ -387,6 +468,7 @@ while True:
     p=blob.find(needle, idx)
     if p==-1: break
     # comprobar que el byte previo forma un modrm mod=10 (disp32) tras 48 8B/8D/89
+    # EN: check that the previous bytes form a mod=10 modrm (disp32) after 48 8B/8D/89
     if p>=3:
         op=blob[p-3]; opc=blob[p-2]; modrm=blob[p-1]
         if op in (0x48,0x4C) and opc in (0x8B,0x8D,0x89) and (modrm>>6)==2:

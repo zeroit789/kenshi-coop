@@ -1,8 +1,19 @@
 # -*- coding: utf-8 -*-
-# Onyx 2026-06-19: Localiza el literal "204-gamedata.base" en .rdata y hace xref completo
+# ES: Localiza el literal "204-gamedata.base" (id de la facción Nameless) en .rdata, lista todas las
+#     instrucciones RIP-relativas de .text que lo referencian, busca punteros absolutos a él y resuelve la
+#     función contenedora de cada xref vía .pdata. Uso: python re_xref_nameless_str.py
+# EN: Finds the "204-gamedata.base" literal (Nameless faction id) in .rdata, lists every RIP-relative .text
+#     instruction referencing it, looks for absolute pointers to it and resolves each xref's containing
+#     function through .pdata. Usage: python re_xref_nameless_str.py
+
+# 2026-06-19: Localiza el literal "204-gamedata.base" en .rdata y hace xref completo
 # de todas las instrucciones `lea reg,[rip+disp]` en .text que apuntan a ese RVA.
 # Tambien busca referencias en .data/.rdata (qword punteros). Para cada xref desensambla
 # contexto y trata de identificar la funcion contenedora via .pdata.
+# EN: 2026-06-19: Finds the "204-gamedata.base" literal in .rdata and does a full xref
+#     of every `lea reg,[rip+disp]` in .text pointing to that RVA.
+#     Also looks for references in .data/.rdata (qword pointers). For each xref it disassembles
+#     context and tries to identify the containing function via .pdata.
 import struct
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind, Register
 
@@ -11,6 +22,8 @@ IMAGE_BASE = 0x140000000
 with open(EXE, "rb") as f:
     DATA = f.read()
 
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]
 coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]
@@ -27,12 +40,16 @@ for i in range(num_sec):
     raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
 
+# ES: Nombre de la sección que contiene el RVA.
+# EN: Name of the section containing the RVA.
 def sec_of(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
             return name, srva, vsize, raw_off, raw_size
     return None
 
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def rva_to_off(rva):
     s = sec_of(rva)
     if not s: return None
@@ -42,6 +59,8 @@ def rva_to_off(rva):
         return raw_off + d
     return None
 
+# ES: (RVA, offset, tamaño) de .text.
+# EN: (RVA, offset, size) of .text.
 def get_text():
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if name == ".text":
@@ -49,14 +68,17 @@ def get_text():
     return None
 
 # 1) Localizar el literal exacto "204-gamedata.base\x00" en .rdata
+# EN: 1) Find the exact literal "204-gamedata.base\x00" in .rdata
 needle = b"204-gamedata.base\x00"
 str_rva = None
 # buscar en todo el fichero, reportar RVA correspondiente
+# EN: search the whole file, report the matching RVA
 idx = -1
 while True:
     idx = DATA.find(needle, idx+1)
     if idx == -1: break
     # convertir offset->rva
+    # EN: convert offset->rva
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if raw_off <= idx < raw_off + raw_size:
             cand_rva = srva + (idx - raw_off)
@@ -72,6 +94,7 @@ print(f"\n[+] Usando str_rva = 0x{str_rva:X} (VA 0x{IMAGE_BASE+str_rva:X})\n")
 target_va = IMAGE_BASE + str_rva
 
 # 2) Escanear .text para lea reg,[rip+disp] -> target_va, y tambien mov reg,[rip+disp] / push etc.
+# EN: 2) Scan .text for lea reg,[rip+disp] -> target_va, and also mov reg,[rip+disp] / push etc.
 srva, raw_off, raw_size = get_text()
 code = DATA[raw_off:raw_off+raw_size]
 dec = Decoder(64, code, ip=IMAGE_BASE+srva)
@@ -80,6 +103,7 @@ fmt = Formatter(FormatterSyntax.INTEL); fmt.hex_prefix="0x"; fmt.hex_suffix=""
 xrefs = []
 for instr in dec:
     # iced calcula memory_displacement absoluto para RIP-relative
+    # EN: iced computes the absolute memory_displacement for RIP-relative operands
     if instr.memory_base == Register.RIP:
         disp = instr.memory_displacement
         if disp == target_va:
@@ -91,6 +115,7 @@ for rva, mn, txt in xrefs:
     print(f"  RVA 0x{rva:08X}  {txt}")
 
 # 3) Tambien buscar punteros absolutos (qword == target_va) en .rdata/.data
+# EN: 3) Also look for absolute pointers (qword == target_va) in .rdata/.data
 print("\n[+] Buscando punteros absolutos (qword == VA del literal) en todo el binario:")
 qneedle = struct.pack("<Q", target_va)
 i = -1
@@ -108,6 +133,9 @@ if found_ptr == 0:
     print("  (ninguno)")
 
 # 4) .pdata para localizar funcion contenedora de cada xref
+# EN: 4) .pdata to locate the containing function of each xref
+# ES: Localiza .pdata (RVA, offset, tamaño) y carga la lista ordenada de funciones (inicio, fin).
+# EN: Locates .pdata (RVA, offset, size) and loads the sorted function list (begin, end).
 def load_pdata():
     for name, srva2, vsize, ro, rs in SECTIONS:
         if name == ".pdata":
@@ -126,6 +154,8 @@ if pd:
             funcs.append((beg, end))
     funcs.sort()
 
+# ES: Búsqueda binaria en .pdata: (inicio, fin) de la función que contiene rva, o None.
+# EN: Binary search in .pdata: (begin, end) of the function containing rva, or None.
 def func_of(rva):
     lo, hi = 0, len(funcs)-1
     res = None
@@ -138,6 +168,8 @@ def func_of(rva):
         else: lo = mid+1
     return None
 
+# ES: Informe: función contenedora de cada xref.
+# EN: Report: containing function of each xref.
 print("\n[+] Funcion contenedora (via .pdata) de cada xref:")
 for rva, mn, txt in xrefs:
     fo = func_of(rva)

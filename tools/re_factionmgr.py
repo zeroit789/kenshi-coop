@@ -1,11 +1,27 @@
 # -*- coding: utf-8 -*-
+# ES: Utilidad para localizar FactionManager y clases relacionadas. Modos:
+#       rtti            -> RVA del TypeDescriptor de FactionManager, Faction, FactionRelations, GameData, PlayerInterface
+#       vtbl <Clase>    -> COL(s) que referencian su TD y vtable(s) que apuntan a ellos
+#       disasm <rva> [len] -> desensamblado con destinos de saltos/calls
+#       xref <rva>      -> instrucciones RIP-relativas (lea/mov) que apuntan al RVA
+#     Uso: python re_factionmgr.py rtti|vtbl|disasm|xref [...]
+# EN: Utility to locate FactionManager and related classes. Modes:
+#       rtti            -> TypeDescriptor RVA of FactionManager, Faction, FactionRelations, GameData, PlayerInterface
+#       vtbl <Class>    -> COL(s) referencing its TD and the vtable(s) pointing to them
+#       disasm <rva> [len] -> disassembly with jump/call targets
+#       xref <rva>      -> RIP-relative instructions (lea/mov) pointing to the RVA
+#     Usage: python re_factionmgr.py rtti|vtbl|disasm|xref [...]
+
 # Localiza FactionManager: RTTI, vtable, ctor, layout (array de Faction*), getter por nombre/id.
+# EN: Locates FactionManager: RTTI, vtable, ctor, layout (array of Faction*), getter by name/id.
 import struct, sys
 from iced_x86 import (Decoder, Formatter, FormatterSyntax, Mnemonic, FlowControl, Register)
 
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IMAGE_BASE = 0x140000000
 DATA = open(EXE, "rb").read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]
 coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]
@@ -21,26 +37,36 @@ for i in range(num_sec):
     raw_size = struct.unpack_from("<I", DATA, o+16)[0]
     raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
+# ES: Secciones principales.
+# EN: Main sections.
 TEXT = next(s for s in SECTIONS if s[0]==".text")
 RDATA = next(s for s in SECTIONS if s[0]==".rdata")
 DATAS = next(s for s in SECTIONS if s[0]==".data")
 
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def rva_to_off(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
             d = rva - srva
             if d < raw_size: return raw_off + d
     return None
+# ES: Offset de fichero -> RVA.
+# EN: File offset -> RVA.
 def off_to_rva(off):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if raw_off <= off < raw_off + raw_size:
             return off - raw_off + srva
     return None
+# ES: Nombre de la sección que contiene el RVA.
+# EN: Name of the section containing the RVA.
 def sec_of(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size): return name
     return None
 
+# ES: Offsets de fichero de todas las apariciones de b en [start, end).
+# EN: File offsets of every occurrence of b in [start, end).
 def find_bytes(b, start=0, end=None):
     res=[]; i=start
     end = end if end else len(DATA)
@@ -50,12 +76,17 @@ def find_bytes(b, start=0, end=None):
         res.append(p); i=p+1
     return res
 
+# ES: (offset, RVA) de cada aparición del nombre decorado ".?AV<clase>@@".
+# EN: (offset, RVA) of each occurrence of the mangled name ".?AV<class>@@".
 def find_rtti_typedesc(class_name):
+    # ES: _TypeDescriptor: puntero a vftable (8) + 0 (8) + ".?AV<nombre>@@\0"
     # _TypeDescriptor: vftable ptr (8) + 0 (8) + ".?AV<name>@@\0"
     pat = (".?AV"+class_name+"@@").encode()
     res = find_bytes(pat)
     return [(p, off_to_rva(p)) for p in res]
 
+# ES: RVAs y tipo (lea/mov/store) de las instrucciones RIP-relativas 48/4C 8D/8B/89 que apuntan a target_rva.
+# EN: RVAs and kind (lea/mov/store) of the 48/4C 8D/8B/89 RIP-relative instructions pointing to target_rva.
 def find_xref_lea_mov(target_rva, types=("lea","mov")):
     """RIP-relative refs (48/4C 8D/8B/89) en .text apuntando a target_rva."""
     tva = IMAGE_BASE + target_rva
@@ -75,10 +106,14 @@ def find_xref_lea_mov(target_rva, types=("lea","mov")):
                     out.append((instr_rva, {0x8D:"lea",0x8B:"mov",0x89:"movstore"}[b1]))
     return out
 
+# ES: Posiciones de .rdata cuyo dword es td_rva (candidatas al campo pTypeDescriptor de un COL).
+# EN: .rdata positions whose dword is td_rva (candidates for a COL's pTypeDescriptor field).
 def find_vtable_for_typedesc(td_rva):
     """Localiza COL que referencia el TD, y la vtable que apunta al COL."""
     # COL (CompleteObjectLocator) contiene en +0xC el RVA del TD (32-bit, image-relative)
     # Buscamos en .rdata un dword == td_rva (image-relative)
+    # EN: The COL (CompleteObjectLocator) holds the TD RVA at +0xC (32-bit, image-relative)
+    #     We look in .rdata for a dword == td_rva (image-relative)
     rd0=RDATA[3]; rdsz=RDATA[4]; rdrva=RDATA[1]
     cols=[]
     d=DATA
@@ -86,9 +121,12 @@ def find_vtable_for_typedesc(td_rva):
         v=struct.unpack_from("<I",d,i)[0]
         if v==td_rva:
             col_rva = off_to_rva(i)  # este i podria ser el campo pTypeDescriptor del COL
+            # EN: this i could be the COL's pTypeDescriptor field
             cols.append((i, col_rva))
     return cols
 
+# ES: Desensambla un rango desde start_rva e imprime cada instrucción con anotaciones (destinos, cadenas o marcas según el script).
+# EN: Disassembles a range from start_rva and prints each instruction with annotations (targets, strings or marks depending on the script).
 def disasm(start_rva, length, label, stop_int3=True, max_ins=999):
     off=rva_to_off(start_rva)
     code=DATA[off:off+length]
@@ -114,6 +152,8 @@ def disasm(start_rva, length, label, stop_int3=True, max_ins=999):
             print(f"0x{rva:08X}  {rh:<26} {fmt.format(instr)} <--PAD"); break
         print(f"0x{rva:08X}  {rh:<26} {fmt.format(instr)}{mark}")
 
+# ES: Punto de entrada: modo por argumento.
+# EN: Entry point: mode by argument.
 if __name__=="__main__":
     what=sys.argv[1] if len(sys.argv)>1 else "rtti"
     if what=="rtti":
@@ -125,13 +165,17 @@ if __name__=="__main__":
         tds=find_rtti_typedesc(cn)
         for p,_ in tds:
             td_rva=off_to_rva(p)-8  # TD empieza 8 bytes antes del string (vftable ptr campo)
+            # EN: TD starts 8 bytes before the string (vftable ptr field)
+            #     (note: other scripts use 0x10 before the name; here the string offset - 8 is used)
             print(f"\n{cn} TD_rva(string-8)=0x{td_rva:X}")
             cols=find_vtable_for_typedesc(td_rva)
             for ci,crva in cols[:10]:
                 # El campo pTD esta en COL+0xC. COL_base = crva-0xC
+                # EN: The pTD field is at COL+0xC. COL_base = crva-0xC
                 col_base = crva-0xC
                 print(f"  COL field@0x{crva:X} -> COL base 0x{col_base:X}")
                 # vtable apunta a (COL base) en [vtbl-8]
+                # EN: the vtable points to (COL base) at [vtbl-8]
                 colva = IMAGE_BASE+col_base
                 refs = find_bytes(struct.pack("<Q",colva), RDATA[3], RDATA[3]+RDATA[4])
                 for r in refs:

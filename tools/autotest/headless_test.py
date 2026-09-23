@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ES: Prueba sin interfaz (headless) de la capa de red del mod usando los ejecutables de test del
+#     proyecto: --integration lanza KenshiMP.IntegrationTest.exe (15 tests de protocolo, arranca el
+#     servidor solo) y --client lanza KenshiMP.Server.exe + un bot KenshiMP.TestClient.exe que conecta a
+#     127.0.0.1:27800 y patrulla. Busca los .exe en la carpeta de Kenshi de Steam (ruta fija).
+#     Uso: python headless_test.py --integration | --client [--name NOMBRE]
+#     Nota: la docstring y el nombre por defecto del bot contienen texto que no se toca aquí porque es
+#     código (cadenas), no comentarios.
+# EN: Headless test of the mod's network layer using the project's test executables: --integration runs
+#     KenshiMP.IntegrationTest.exe (15 protocol tests, starts the server by itself) and --client starts
+#     KenshiMP.Server.exe + a KenshiMP.TestClient.exe bot that connects to 127.0.0.1:27800 and patrols.
+#     Looks for the .exe files in the Steam Kenshi folder (hardcoded path).
+#     Usage: python headless_test.py --integration | --client [--name NAME]
+#     Note: the docstring and the bot's default name contain text that is not touched here because it
+#     is code (strings), not comments.
+
 """
 headless_test.py
 ================
@@ -37,6 +52,8 @@ import sys
 import time
 from pathlib import Path
 
+# ES: Rutas: carpeta del juego y ejecutables del servidor y de test.
+# EN: Paths: game folder and server/test executables.
 SCRIPT_DIR = Path(__file__).resolve().parent
 GAME_DIR = Path(r"E:\SteamLibrary\steamapps\common\Kenshi")
 
@@ -45,10 +62,14 @@ INTEGRATION = GAME_DIR / "KenshiMP.IntegrationTest.exe"
 TESTCLIENT = GAME_DIR / "KenshiMP.TestClient.exe"
 
 
+# ES: Imprime un mensaje con marca de hora.
+# EN: Prints a timestamped message.
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ES: Mata servidor/tests/bot que sigan vivos para empezar limpio.
+# EN: Kills any leftover server/tests/bot so we start clean.
 def matar_procesos():
     """Arranque limpio."""
     for exe in ("KenshiMP.Server.exe", "KenshiMP.IntegrationTest.exe", "KenshiMP.TestClient.exe"):
@@ -56,6 +77,8 @@ def matar_procesos():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ES: Ejecuta la suite de integración (15 tests) y muestra su salida y código de retorno.
+# EN: Runs the integration suite (15 tests) and shows its output and return code.
 def run_integration():
     """
     Lanza KenshiMP.IntegrationTest.exe. Este exe descubre/arranca el server
@@ -71,6 +94,7 @@ def run_integration():
     matar_procesos()
     time.sleep(1)
     # cwd = GAME_DIR para que encuentre server.json y el server exe.
+    # EN: cwd = GAME_DIR so it finds server.json and the server exe.
     proc = subprocess.run([str(INTEGRATION)], cwd=str(GAME_DIR),
                           capture_output=True, text=True, timeout=300)
     print("\n----- SALIDA IntegrationTest -----")
@@ -84,6 +108,8 @@ def run_integration():
     matar_procesos()
 
 
+# ES: Lanza el servidor y el bot TestClient en consolas separadas (no espera a que terminen).
+# EN: Starts the server and the TestClient bot in separate consoles (does not wait for them).
 def run_client(nombre):
     """
     Lanza el server + un bot TestClient que conecta a 127.0.0.1:27800,
@@ -116,6 +142,8 @@ def run_client(nombre):
     log("Cierra las ventanas manualmente cuando termines, o ejecuta taskkill.")
 
 
+# ES: Punto de entrada: elige modo --integration o --client.
+# EN: Entry point: picks --integration or --client mode.
 def main():
     parser = argparse.ArgumentParser(description="Pruebas headless de red del mod Kenshi co-op.")
     g = parser.add_mutually_exclusive_group(required=True)

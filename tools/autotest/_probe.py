@@ -1,13 +1,23 @@
+# ES: Sonda del autotest: enfoca la ventana del cliente de Kenshi (la más ancha que no sea el servidor) y
+#     hace clic con pyautogui en un botón del panel multijugador del mod (host / join / browser),
+#     usando coordenadas relativas medidas a ojo. Uso: python _probe.py [host|join|browser]
+# EN: Autotest probe: focuses the Kenshi client window (the widest one that is not the server) and clicks
+#     with pyautogui on a button of the mod's multiplayer panel (host / join / browser), using relative
+#     coordinates measured by eye. Usage: python _probe.py [host|join|browser]
+
 # Sonda temporal para probar clics en el panel MP del mod (JOIN GAME).
+# EN: Temporary probe to test clicks on the mod's MP panel (JOIN GAME).
 import pyautogui, pygetwindow as gw, time, sys
 
 # Localizar la ventana del juego (la mas ancha, excluyendo el server).
+# EN: Find the game window (the widest one, excluding the server).
 ws = [w for w in gw.getWindowsWithTitle("Kenshi") if "Server" not in w.title and ".exe" not in w.title.lower()]
 w = max(ws, key=lambda v: v.width)
 w.activate(); time.sleep(0.5)
 
 accion = sys.argv[1] if len(sys.argv) > 1 else "join"
 # Coordenadas relativas de los botones del panel MP del mod (medidas a ojo).
+# EN: Relative coordinates of the mod's MP panel buttons (measured by eye).
 botones = {
     "host":   (0.575, 0.22),
     "join":   (0.575, 0.31),

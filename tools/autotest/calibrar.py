@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ES: Calibrador de coordenadas del autotest: cada 0.5 s imprime la posición del ratón en píxeles y en
+#     coordenadas relativas (0..1) a la ventana de Kenshi, para copiar rel_x/rel_y a config.json.
+#     Con --shot guarda además debug_screenshot.png. Uso: python calibrar.py [--shot] (Ctrl+C para salir).
+# EN: Autotest coordinate calibrator: every 0.5 s prints the mouse position in pixels and in coordinates
+#     relative (0..1) to the Kenshi window, so rel_x/rel_y can be copied into config.json.
+#     With --shot it also saves debug_screenshot.png. Usage: python calibrar.py [--shot] (Ctrl+C to quit).
+
 """
 calibrar.py
 ===========
@@ -26,6 +33,8 @@ import time
 import sys
 from pathlib import Path
 
+# ES: Dependencias de automatización de GUI; sin ellas el script no puede funcionar.
+# EN: GUI automation dependencies; the script cannot work without them.
 try:
     import pyautogui
     import pygetwindow as gw
@@ -37,6 +46,8 @@ except ImportError as e:
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+# ES: Devuelve la primera ventana cuyo título contiene "Kenshi" (o None).
+# EN: Returns the first window whose title contains "Kenshi" (or None).
 def encontrar_ventana_kenshi():
     """Localiza la ventana de Kenshi por titulo."""
     for titulo in ("Kenshi", "kenshi"):
@@ -46,6 +57,8 @@ def encontrar_ventana_kenshi():
     return None
 
 
+# ES: Punto de entrada: argumentos, búsqueda de la ventana, captura opcional y bucle de medición.
+# EN: Entry point: arguments, window lookup, optional screenshot and measuring loop.
 def main():
     parser = argparse.ArgumentParser(description="Calibrador de coordenadas para autotest Kenshi.")
     parser.add_argument("--shot", action="store_true",
@@ -64,6 +77,8 @@ def main():
         print(f"[OK] Screenshot guardado en {ruta}")
 
     print("\nMueve el raton sobre el boton a medir. Ctrl+C para salir.\n")
+    # ES: Bucle de medición hasta Ctrl+C; sin ventana usa coordenadas relativas a la pantalla.
+    # EN: Measuring loop until Ctrl+C; without a window it uses screen-relative coordinates.
     try:
         while True:
             px, py = pyautogui.position()

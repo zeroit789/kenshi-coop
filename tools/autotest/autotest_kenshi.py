@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ES: Autotest del mod co-op (v2, guiado por log): automatiza el ciclo de prueba completo sin que nadie
+#     juegue a mano. Mata Kenshi, asegura el servidor KenshiMP.Server.exe, fuerza en settings.cfg el save
+#     que carga CONTINUE, lanza kenshi_x64.exe, pulsa OK en el launcher de configuración, recoloca la
+#     ventana (evita que el render se pare fuera de pantalla), y avanza leyendo en vivo el log
+#     KenshiOnline_<PID>.log (phase=MainMenu, gameLoaded=true, connected=true) para clicar MULTIPLAYER y
+#     CONTINUE, conectar (o /connect) y opcionalmente atacar. Al final resume el log (fases y DIAG-*).
+#     Configuración en config.json. Uso: python autotest_kenshi.py [--no-attack] [--dry-run]
+#     [--keep-open] [--no-server]. Nota: la docstring y un print contienen texto que no se cambia aquí
+#     porque es código (cadenas), no comentarios.
+# EN: Co-op mod autotest (v2, log-driven): automates the whole test cycle without anyone playing by hand.
+#     Kills Kenshi, makes sure the KenshiMP.Server.exe server is running, forces in settings.cfg the save
+#     that CONTINUE loads, launches kenshi_x64.exe, presses OK on the config launcher, repositions the
+#     window (prevents the renderer from stalling off-screen), and advances by reading the live log
+#     KenshiOnline_<PID>.log (phase=MainMenu, gameLoaded=true, connected=true) to click MULTIPLAYER and
+#     CONTINUE, connect (or /connect) and optionally attack. At the end it summarizes the log (phases and
+#     DIAG-*). Configuration in config.json. Usage: python autotest_kenshi.py [--no-attack] [--dry-run]
+#     [--keep-open] [--no-server]. Note: the docstring and one print contain text that is not changed
+#     here because it is code (strings), not comments.
+
 """
 autotest_kenshi.py  (v2 — guiado por log)
 =========================================
@@ -57,6 +76,7 @@ import time
 from pathlib import Path
 
 # ---- Dependencias de automatizacion GUI ----
+# EN: ---- GUI automation dependencies ----
 try:
     import pyautogui
     import pygetwindow as gw
@@ -67,22 +87,30 @@ except ImportError as e:
 
 # pyautogui: fail-safe = mover el raton a la esquina sup-izq aborta. Lo dejamos ON
 # como seguridad, pero metemos pausas para que no vaya disparado.
+# EN: pyautogui: fail-safe = moving the mouse to the top-left corner aborts. We keep it ON
+#     as a safety net, but add pauses so it does not run too fast.
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.3  # pausa entre acciones de pyautogui
 
 # Ruta de este script (para encontrar config.json al lado)
+# EN: Path of this script (to find config.json next to it)
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 
 
 # ======================================================================
-# Utilidades de log de consola (lo que ve Onyx por stdout)
+# Utilidades de log de consola (lo que se ve por stdout)
 # ======================================================================
+# EN: Console log utilities (what is seen on stdout)
+# ES: Imprime un mensaje con marca de hora (hh:mm:ss).
+# EN: Prints a message with a timestamp (hh:mm:ss).
 def log(msg):
     """Imprime con timestamp para que Onyx siga el flujo."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ES: Lee config.json (junto al script); aborta si no existe.
+# EN: Reads config.json (next to the script); aborts if missing.
 def cargar_config():
     """Lee config.json. Aborta si no existe o esta mal formado."""
     if not CONFIG_PATH.exists():
@@ -95,6 +123,9 @@ def cargar_config():
 # ======================================================================
 # Gestion de procesos (matar / lanzar)
 # ======================================================================
+# EN: Process management (kill / launch)
+# ES: Mata solo kenshi_x64.exe; el servidor se deja vivo.
+# EN: Kills only kenshi_x64.exe; the server is left running.
 def matar_kenshi():
     """Mata SOLO Kenshi (no el server). La tarea pide dejar el server vivo."""
     subprocess.run(["taskkill", "/F", "/IM", "kenshi_x64.exe"],
@@ -102,9 +133,12 @@ def matar_kenshi():
     log("Instancia previa de Kenshi terminada (si la habia). El server NO se toca.")
 
 
+# ES: True si KenshiMP.Server.exe aparece en tasklist.
+# EN: True if KenshiMP.Server.exe shows up in tasklist.
 def server_corriendo():
     """Devuelve True si KenshiMP.Server.exe esta en ejecucion."""
     # tasklist filtra por nombre de imagen; si aparece la linea, esta vivo.
+    # EN: tasklist filters by image name; if the line shows up, it is alive.
     out = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq KenshiMP.Server.exe", "/NH"],
         capture_output=True, text=True
@@ -112,6 +146,8 @@ def server_corriendo():
     return "KenshiMP.Server.exe" in out.stdout
 
 
+# ES: Lanza el servidor en una consola propia si no está corriendo (y está permitido); devuelve el proceso o None.
+# EN: Starts the server in its own console if it is not running (and allowed); returns the process or None.
 def asegurar_server(cfg, tocar_server):
     """
     Si el server ya corre, no hace nada (lo deja como pide la tarea).
@@ -130,6 +166,7 @@ def asegurar_server(cfg, tocar_server):
         log(f"[FATAL] No existe el server: {server}")
         sys.exit(2)
     # cwd = game_dir para que encuentre server.json. Ventana propia para no bloquear.
+    # EN: cwd = game_dir so it finds server.json. Own window so it does not block.
     proc = subprocess.Popen([server], cwd=game_dir,
                             creationflags=subprocess.CREATE_NEW_CONSOLE)
     log(f"Server MP lanzado (PID {proc.pid}) en 127.0.0.1:{cfg['red']['server_port']}.")
@@ -137,6 +174,8 @@ def asegurar_server(cfg, tocar_server):
     return proc
 
 
+# ES: Lanza kenshi_x64.exe desde la carpeta del juego; el mod se carga solo como plugin de Ogre.
+# EN: Launches kenshi_x64.exe from the game folder; the mod loads itself as an Ogre plugin.
 def lanzar_kenshi(cfg):
     """Arranca kenshi_x64.exe. El mod se carga solo (plugin de Ogre)."""
     kenshi = cfg["rutas"]["kenshi_exe"]
@@ -152,6 +191,9 @@ def lanzar_kenshi(cfg):
 # ======================================================================
 # Preparar el save que cargara CONTINUE
 # ======================================================================
+# EN: Prepare the save that CONTINUE will load
+# ES: Escribe continue=<save> en settings.cfg para que CONTINUE cargue ese save (salta la creación de personaje).
+# EN: Writes continue=<save> into settings.cfg so CONTINUE loads that save (skips character creation).
 def forzar_continue_save(cfg):
     """
     Reescribe la clave 'continue=<save>' en settings.cfg para que CONTINUE
@@ -170,6 +212,8 @@ def forzar_continue_save(cfg):
         log(f"[AVISO] No existe settings.cfg en {settings}; no puedo forzar continue.")
         return
 
+    # ES: Sustituye (o añade) la línea continue= conservando el resto del fichero.
+    # EN: Replaces (or appends) the continue= line keeping the rest of the file.
     lineas = settings.read_text(encoding="utf-8", errors="ignore").splitlines()
     nuevas, encontrada = [], False
     for ln in lineas:
@@ -187,6 +231,9 @@ def forzar_continue_save(cfg):
 # ======================================================================
 # Localizacion y lectura EN VIVO del log
 # ======================================================================
+# EN: Locating and reading the log LIVE
+# ES: Espera a que aparezca un KenshiOnline_<PID>.log nuevo tras lanzar Kenshi y devuelve su ruta (o None).
+# EN: Waits for a new KenshiOnline_<PID>.log to appear after launching Kenshi and returns its path (or None).
 def esperar_log_nuevo(cfg, desde_ts, timeout=30):
     """
     Tras lanzar Kenshi, espera a que aparezca un KenshiOnline_<PID>.log nuevo
@@ -210,6 +257,8 @@ def esperar_log_nuevo(cfg, desde_ts, timeout=30):
     return None
 
 
+# ES: Lee el log de forma incremental hasta que una línea casa con el patrón (regex) o vence el timeout.
+# EN: Reads the log incrementally until a line matches the pattern (regex) or the timeout expires.
 def esperar_patron_en_log(ruta, patron, timeout, poll, etiqueta):
     """
     Lee el log EN VIVO y espera a que aparezca 'patron' (regex). Devuelve la
@@ -244,6 +293,11 @@ def esperar_patron_en_log(ruta, patron, timeout, poll, etiqueta):
 # ======================================================================
 # Recolocacion de ventana (CAUSA RAIZ del cuelgue en splash)
 # ======================================================================
+# EN: Window repositioning (ROOT CAUSE of the splash hang)
+# ES: Mueve la ventana del juego a (0,0) 1920x1080 y al frente: si se lanza desde una sesión no
+#     interactiva la ventana sale fuera de pantalla y el render de Kenshi no avanza.
+# EN: Moves the game window to (0,0) 1920x1080 and to the front: when launched from a non-interactive
+#     session the window opens off-screen and Kenshi's renderer does not progress.
 def recolocar_ventana_kenshi(timeout=25):
     """
     *** ARREGLO CRITICO (verificado 2026-06-18) ***
@@ -262,6 +316,7 @@ def recolocar_ventana_kenshi(timeout=25):
     Devuelve True si recoloco la ventana, False si no la encontro a tiempo.
     """
     # Constantes Win32
+    # EN: Win32 constants
     SWP_NOZORDER = 0x0004
     SW_RESTORE = 9
     user32 = ctypes.windll.user32
@@ -269,10 +324,14 @@ def recolocar_ventana_kenshi(timeout=25):
     t0 = time.time()
     while time.time() - t0 < timeout:
         # Buscamos la ventana de Kenshi (la mas ancha = el juego, NO el server).
+        # EN: Look for the Kenshi window (the widest = the game, NOT the server).
         win = encontrar_ventana_kenshi()
         # No recolocar si lo unico que hay es el launcher estrecho de config:
         # eso lo maneja manejar_launcher_config(); redimensionarlo a 1920 romperia
         # la deteccion del boton OK. Solo recolocamos la ventana grande del juego.
+        # EN: Do not reposition if all there is is the narrow config launcher:
+        #     manejar_launcher_config() handles it; resizing it to 1920 would break
+        #     the OK button detection. We only reposition the big game window.
         if win is not None and win.width < 800:
             time.sleep(1.0)
             continue
@@ -284,6 +343,7 @@ def recolocar_ventana_kenshi(timeout=25):
             if hwnd:
                 user32.ShowWindow(hwnd, SW_RESTORE)
                 # Mover a 0,0 y forzar 1920x1080 (resolucion configurada del juego).
+                # EN: Move to 0,0 and force 1920x1080 (configured game resolution).
                 user32.SetWindowPos(hwnd, 0, 0, 0, 1920, 1080, SWP_NOZORDER)
                 user32.SetForegroundWindow(hwnd)
                 time.sleep(1.0)
@@ -299,6 +359,9 @@ def recolocar_ventana_kenshi(timeout=25):
 # ======================================================================
 # Foco y geometria de la ventana de Kenshi
 # ======================================================================
+# EN: Kenshi window focus and geometry
+# ES: Ventanas cuyo título contiene "Kenshi", excluyendo la consola del servidor (títulos con Server o .exe).
+# EN: Windows whose title contains "Kenshi", excluding the server console (titles with Server or .exe).
 def _ventanas_kenshi_validas():
     """
     Devuelve TODAS las ventanas cuyo titulo contiene 'Kenshi' EXCLUYENDO la
@@ -317,10 +380,13 @@ def _ventanas_kenshi_validas():
             if "Server" in t or ".exe" in t.lower():
                 continue  # es la consola del server, no el juego/launcher
             # Clave por geometria+titulo para no duplicar la misma ventana.
+            # EN: Key by geometry+title to avoid duplicating the same window.
             vistas[(v.left, v.top, v.width, v.height, t)] = v
     return list(vistas.values())
 
 
+# ES: Ventana del juego/launcher (no la del servidor); si hay varias, la más ancha.
+# EN: Game/launcher window (not the server one); if several, the widest.
 def encontrar_ventana_kenshi():
     """
     Busca la ventana del JUEGO/launcher de Kenshi (NO la del server).
@@ -333,6 +399,8 @@ def encontrar_ventana_kenshi():
     return max(candidatas, key=lambda v: v.width)
 
 
+# ES: Ventana del launcher de configuración: la más estrecha (<= ancho_max_launcher), o None.
+# EN: Config launcher window: the narrowest one (<= ancho_max_launcher), or None.
 def encontrar_launcher_config(cfg):
     """
     Localiza la ventana del LAUNCHER de config (el dialogo pequeno con OK).
@@ -345,9 +413,14 @@ def encontrar_launcher_config(cfg):
     if not estrechas:
         return None
     # Si hay varias estrechas, la mas pequena es el dialogo de config.
+    # EN: If there are several narrow ones, the smallest is the config dialog.
     return min(estrechas, key=lambda v: v.width)
 
 
+# ES: Espera al launcher de configuración que sale al arrancar Kenshi y pulsa su OK (por imagen
+#     boton_ok.png o por coordenadas relativas), con un reintento. Sin ese OK el juego no arranca.
+# EN: Waits for the config launcher shown when Kenshi starts and presses its OK (by image boton_ok.png or
+#     by relative coordinates), with one retry. Without that OK the game does not start.
 def manejar_launcher_config(cfg):
     """
     *** PASO NUEVO (pista de Zero, verificado 2026-06-18) ***
@@ -378,6 +451,7 @@ def manejar_launcher_config(cfg):
     confianza = lc.get("confianza_match", 0.8)
 
     # 1) Esperar a que el launcher aparezca.
+    # EN: 1) Wait for the launcher to appear.
     log(f"Esperando la ventana de CONFIGURACION inicial (launcher) "
         f"(timeout {timeout}s)...")
     t0 = time.time()
@@ -393,11 +467,14 @@ def manejar_launcher_config(cfg):
     if win_launcher is None:
         # No siempre sale (p.ej. si ya esta cargando). No es error fatal: puede
         # que el juego pase directo. Avisamos y seguimos al flujo de menu.
+        # EN: It does not always show up (e.g. if it is already loading). Not a fatal error: the game
+        #     may go straight through. We warn and continue with the menu flow.
         log("[AVISO] No apareció la ventana de config en el tiempo esperado. "
             "Quizá Kenshi pasó directo a cargar. Sigo al flujo de menu.")
         return True
 
     # Traer el launcher al frente para que el clic le llegue.
+    # EN: Bring the launcher to the front so the click reaches it.
     try:
         if win_launcher.isMinimized:
             win_launcher.restore()
@@ -407,12 +484,14 @@ def manejar_launcher_config(cfg):
         log(f"[AVISO] No pude activar el launcher: {e}. Intento clicar igual.")
 
     # 2a) Intento por IMAGEN (preferido: robusto a la posicion).
+    # EN: 2a) Attempt by IMAGE (preferred: robust to position).
     ok_clicado = False
     if plantilla.exists():
         try:
             loc = pyautogui.locateOnScreen(str(plantilla), confidence=confianza)
         except Exception as e:
             # locateOnScreen lanza si no encuentra (segun version) o si falta opencv.
+            # EN: locateOnScreen raises if it finds nothing (depending on version) or if opencv is missing.
             log(f"[AVISO] locateOnScreen fallo o no encontro el OK por imagen: {e}")
             loc = None
         if loc is not None:
@@ -425,8 +504,10 @@ def manejar_launcher_config(cfg):
         log(f"[AVISO] No existe la plantilla {plantilla.name}. Uso coords relativas.")
 
     # 2b) Fallback por COORDS RELATIVAS dentro de la ventana del launcher.
+    # EN: 2b) Fallback by RELATIVE COORDS inside the launcher window.
     if not ok_clicado:
         # Re-leer la geometria por si se movio.
+        # EN: Re-read the geometry in case it moved.
         win_launcher = encontrar_launcher_config(cfg) or win_launcher
         rx, ry = lc.get("ok_rel_x", 0.74), lc.get("ok_rel_y", 0.96)
         x = win_launcher.left + int(win_launcher.width * rx)
@@ -438,11 +519,13 @@ def manejar_launcher_config(cfg):
         ok_clicado = True
 
     # 3) Margen para que arranque la carga del juego.
+    # EN: 3) Margin for the game load to start.
     espera = lc.get("espera_tras_ok", 3)
     log(f"OK pulsado. Espero {espera}s a que el juego empiece a cargar de verdad.")
     time.sleep(espera)
 
     # Verificacion: la ventana estrecha deberia desaparecer (o crecer a juego).
+    # EN: Check: the narrow window should disappear (or grow into the game).
     aun_launcher = encontrar_launcher_config(cfg)
     if aun_launcher is not None:
         log("[AVISO] El launcher de config SIGUE visible tras pulsar OK. "
@@ -453,6 +536,7 @@ def manejar_launcher_config(cfg):
         except Exception:
             pass
         # Reintento por imagen y luego relativo.
+        # EN: Retry by image and then by relative coords.
         reintento_ok = False
         if plantilla.exists():
             try:
@@ -481,6 +565,8 @@ def manejar_launcher_config(cfg):
     return True
 
 
+# ES: Trae la ventana de Kenshi al frente (restaurándola si está minimizada); devuelve la ventana o None.
+# EN: Brings the Kenshi window to the front (restoring it if minimized); returns the window or None.
 def enfocar_kenshi():
     """Trae la ventana de Kenshi al frente para que reciba clics/teclas."""
     win = encontrar_ventana_kenshi()
@@ -500,6 +586,8 @@ def enfocar_kenshi():
     return win
 
 
+# ES: Convierte coordenadas relativas (0..1) de la ventana (o de la pantalla) a píxeles.
+# EN: Converts relative (0..1) window (or screen) coordinates to pixels.
 def rel_a_pixel(win, rel_x, rel_y):
     """Convierte coords relativas (0..1) a pixeles de pantalla via geometria
     de la ventana de Kenshi (o pantalla completa si no hay ventana)."""
@@ -516,6 +604,9 @@ def rel_a_pixel(win, rel_x, rel_y):
 # ======================================================================
 # Acciones del flujo (clics y teclas)
 # ======================================================================
+# EN: Flow actions (clicks and keys)
+# ES: Clic en el centro del botón MULTIPLAYER (rectángulo relativo de config.json).
+# EN: Click in the center of the MULTIPLAYER button (relative rectangle from config.json).
 def clic_boton_multiplayer(cfg, win):
     """Clica el CENTRO del boton MULTIPLAYER del menu principal."""
     c = cfg["coordenadas_boton_multiplayer"]
@@ -528,6 +619,8 @@ def clic_boton_multiplayer(cfg, win):
     time.sleep(1.5)
 
 
+# ES: Clic en CONTINUE (coordenadas de config.json): carga el save forzado.
+# EN: Click on CONTINUE (coordinates from config.json): loads the forced save.
 def clic_continue(cfg, win):
     """Clica el boton CONTINUE (primer item del menu). Coords desde config."""
     c = cfg["coordenadas_boton_continue"]
@@ -537,6 +630,8 @@ def clic_continue(cfg, win):
     pyautogui.click()
 
 
+# ES: Plan B de conexión: abre el chat/consola del mod con Enter y escribe "/connect <ip>".
+# EN: Connection fallback: opens the mod chat/console with Enter and types "/connect <ip>".
 def consola_connect(cfg, win):
     """Red de seguridad: abre la consola (Enter) y manda '/connect <ip>'."""
     ip = cfg["red"]["server_ip"]
@@ -551,6 +646,8 @@ def consola_connect(cfg, win):
     time.sleep(0.5)
 
 
+# ES: Intento de ataque "best-effort": clic izquierdo y derecho en un punto relativo de la pantalla.
+# EN: Best-effort attack attempt: left and right click on a relative screen point.
 def intentar_ataque(cfg, win):
     """Best-effort: clic izq (foco) + clic der (orden de ataque) en el centro."""
     a = cfg["ataque"]
@@ -570,8 +667,11 @@ def intentar_ataque(cfg, win):
 
 
 # ======================================================================
-# Resumen final del log (veredicto para Onyx)
+# Resumen final del log (veredicto)
 # ======================================================================
+# EN: Final log summary (verdict)
+# ES: Imprime fases alcanzadas, recuento de [DIAG-PAUSE]/[DIAG-FAC], señales de error en la cola del log y un veredicto.
+# EN: Prints reached phases, [DIAG-PAUSE]/[DIAG-FAC] counts, error signals in the log tail and a verdict.
 def resumen_log(ruta, fases):
     """
     Resume el resultado: que fases se alcanzaron (por log) + conteo de
@@ -582,6 +682,7 @@ def resumen_log(ruta, fases):
     print("=" * 70)
 
     # Veredicto por fases (lo mas fiable: viene del propio mod).
+    # EN: Verdict by phases (most reliable: it comes from the mod itself).
     print("  FASES ALCANZADAS (segun el log del mod):")
     for nombre, alcanzada in fases.items():
         marca = "[OK]" if alcanzada else "[--]"
@@ -602,14 +703,17 @@ def resumen_log(ruta, fases):
         return
 
     # Conteo global de las marcas DIAG (la tarea pide encontrarlas).
+    # EN: Global count of the DIAG markers (the task asks to find them).
     n_pause = sum(1 for ln in lineas if "[DIAG-PAUSE]" in ln)
     n_fac = sum(1 for ln in lineas if "[DIAG-FAC]" in ln)
 
     # Ultimos ejemplos de cada DIAG.
+    # EN: Latest examples of each DIAG.
     ej_pause = [ln.strip() for ln in lineas if "[DIAG-PAUSE]" in ln][-2:]
     ej_fac = [ln.strip() for ln in lineas if "[DIAG-FAC]" in ln][-2:]
 
     # Senales de fallo en la cola.
+    # EN: Failure signals in the tail.
     senales_fallo = [r"\[error\]", r"crash", r"Disconnected",
                      r"Connection failed", r"assert"]
     cola = lineas[-400:]
@@ -634,7 +738,8 @@ def resumen_log(ruta, fases):
         print(f"    [!!] {h[:150]}")
     print("-" * 70)
 
-    # Veredicto resumido para Onyx.
+    # Veredicto resumido.
+        # EN: Short verdict.
     llego_mundo = fases.get("Entro al mundo (gameLoaded=true)", False)
     if llego_mundo and (n_pause > 0 or n_fac > 0):
         print("  VEREDICTO: OK — el autotest LLEGO AL MUNDO y el log tiene DIAG.")
@@ -650,6 +755,9 @@ def resumen_log(ruta, fases):
 # ======================================================================
 # Orquestacion principal
 # ======================================================================
+# EN: Main orchestration
+# ES: Flujo principal: argumentos, configuración y los pasos 1-9 del ciclo de prueba.
+# EN: Main flow: arguments, configuration and steps 1-9 of the test cycle.
 def main():
     parser = argparse.ArgumentParser(description="Autotest del mod co-op de Kenshi (v2).")
     parser.add_argument("--no-attack", action="store_true",
@@ -685,6 +793,7 @@ def main():
         return
 
     # Estado de fases para el veredicto final.
+    # EN: Phase state for the final verdict.
     fases = {
         "Menu principal visible (phase=MainMenu)": False,
         "Entro al mundo (gameLoaded=true)": False,
@@ -692,14 +801,17 @@ def main():
     }
 
     # 1. Limpieza (solo Kenshi)
+    # EN: 1. Cleanup (Kenshi only)
     matar_kenshi()
     time.sleep(2)
 
     # 2. Server (solo si no corre)
+    # EN: 2. Server (only if not running); the continue save is forced first
     forzar_continue_save(cfg)
     asegurar_server(cfg, tocar_server=not args.no_server)
 
     # 3. Lanzar Kenshi + localizar su log
+    # EN: 3. Launch Kenshi + locate its log
     ts_lanzamiento = time.time()
     lanzar_kenshi(cfg)
     ruta_log = esperar_log_nuevo(cfg, ts_lanzamiento, timeout=30)
@@ -709,12 +821,21 @@ def main():
     #     un boton OK. El render del juego NO arranca (y phase=MainMenu NO llega
     #     al log) hasta pulsar ese OK. El intento anterior se quedaba atascado
     #     aqui. Pulsamos OK (por imagen boton_ok.png o coords relativas).
+    # EN: 3b. *** CRITICAL STEP 1 *** Handle the config LAUNCHER.
+    #     Launching kenshi_x64.exe ALWAYS shows a config dialog first with
+    #     an OK button. The game renderer does NOT start (and phase=MainMenu does NOT reach
+    #     the log) until that OK is pressed. The previous attempt got stuck
+    #     here. We press OK (by image boton_ok.png or relative coords).
     manejar_launcher_config(cfg)
 
     # 3c. *** PASO CRITICO 2 *** Recolocar la ventana del JUEGO a pantalla
     #     visible (tras el OK, el juego abre su ventana grande). Si arranca
     #     off-screen, su render se queda parado. Moverla a (0,0) 1920x1080
     #     despierta el render. Reintenta unos segundos por si tarda en crearse.
+    # EN: 3c. *** CRITICAL STEP 2 *** Move the GAME window to the visible screen
+    #     (after OK, the game opens its big window). If it starts
+    #     off-screen, its renderer stalls. Moving it to (0,0) 1920x1080
+    #     wakes the renderer up. Retries for a few seconds in case it is slow to appear.
     recolocar_ventana_kenshi(timeout=25)
 
     # 4. Esperar al menu principal POR LOG (no por sleep ciego)
@@ -723,6 +844,12 @@ def main():
     #    tardo ~37s desde el arranque del mod. Si NO aparece, NO clicamos a ciegas:
     #    un clic en la ventana de splash (pequena) puede pulsar Quit y cerrar el
     #    juego. Abortamos limpiamente para no romper nada.
+    # EN: 4. Wait for the main menu BY LOG (not by blind sleep)
+    #     IMPORTANT: the phase=MainMenu pattern ONLY appears when Kenshi IS ALREADY
+    #     rendering the real menu (not splash/loading). In the good session
+    #     it took ~37s from mod start. If it does NOT appear, we do NOT click blindly:
+    #     a click on the (small) splash window could press Quit and close the
+    #     game. We abort cleanly so nothing breaks.
     hit = esperar_patron_en_log(ruta_log, d["patron_menu_principal"],
                                 t["timeout_menu_principal"], poll,
                                 "menu principal (phase=MainMenu)")
@@ -744,6 +871,9 @@ def main():
     # 5. Clic MULTIPLAYER -> ESC -> CONTINUE
     #    Re-medimos la ventana JUSTO antes de clicar y verificamos que tiene un
     #    tamano de menu real (>800px ancho). Si es pequena, sigue en splash.
+    # EN: 5. Click MULTIPLAYER -> ESC -> CONTINUE
+    #     We re-measure the window RIGHT before clicking and check it has a
+    #     real menu size (>800px wide). If it is small, it is still on the splash.
     win = enfocar_kenshi()
     if win is not None and win.width < 800:
         log(f"[AVISO] La ventana mide {win.width}x{win.height} (demasiado "
@@ -758,6 +888,7 @@ def main():
     clic_continue(cfg, win)
 
     # 6. Esperar a ENTRAR AL MUNDO por log (gameLoaded=true)
+    # EN: 6. Wait to ENTER THE WORLD by log (gameLoaded=true)
     hit = esperar_patron_en_log(ruta_log, d["patron_mundo_cargado"],
                                 t["timeout_entrar_mundo"], poll,
                                 "entrada al mundo (gameLoaded=true)")
@@ -767,6 +898,7 @@ def main():
         log("[AVISO] No se confirmo gameLoaded=true por log dentro del timeout.")
 
     # 7. Esperar conexion al server (connected=true). Si no, /connect manual.
+    # EN: 7. Wait for the server connection (connected=true). Otherwise, manual /connect.
     hit = esperar_patron_en_log(ruta_log, d["patron_conectado"],
                                 t["timeout_conexion"], poll,
                                 "conexion al server (connected=true)")
@@ -781,6 +913,7 @@ def main():
             fases["Conectado al server (connected=true)"] = True
 
     # 8. Ataque (opcional, best-effort)
+    # EN: 8. Attack (optional, best-effort)
     if not args.no_attack and fases["Entro al mundo (gameLoaded=true)"]:
         time.sleep(t["espera_antes_ataque"])
         win = enfocar_kenshi()
@@ -788,10 +921,12 @@ def main():
         time.sleep(3)
 
     # 9. Resultado
+    # EN: 9. Result
     log("Generando resumen del log (fases + DIAG-PAUSE/DIAG-FAC)...")
     resumen_log(ruta_log, fases)
 
     # Cierre: matar SOLO Kenshi (el server se deja como pide la tarea).
+    # EN: Shutdown: kill ONLY Kenshi (the server is left running as the task asks).
     if args.keep_open:
         log("--keep-open: dejo Kenshi abierto. Cierralo tu cuando acabes.")
     else:
@@ -802,6 +937,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # ES: Punto de entrada: avisa si el script no corre como administrador (los clics podrían no llegar
+    #     a un Kenshi elevado) y lanza main().
+    # EN: Entry point: warns if the script is not running as administrator (clicks might not reach an
+    #     elevated Kenshi) and runs main().
     try:
         es_admin = ctypes.windll.shell32.IsUserAnAdmin()
         if not es_admin:

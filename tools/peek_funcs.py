@@ -1,11 +1,23 @@
 # -*- coding: utf-8 -*-
+# ES: Vuelca el prólogo de varias funciones clave llamadas desde la rama viva del tick de IA (reloj por
+#     personaje 0x66CB50, commit de acción a GameWorld 0xA0AF10, función de char+0x648 0x5C67C0, y los
+#     "think" vtbl+0x1D8 / +0x1E0) mostrando las cadenas referenciadas para identificar su papel.
+#     Uso: python peek_funcs.py
+# EN: Dumps the prologue of several key functions called from the live branch of the AI tick
+#     (per-character clock 0x66CB50, action commit to GameWorld 0xA0AF10, char+0x648 function 0x5C67C0, and
+#     the vtbl+0x1D8 / +0x1E0 "think" functions) showing referenced strings to identify their role.
+#     Usage: python peek_funcs.py
+
 # Inspecciona prologos de funciones clave y busca strings ancla cercanos para identificar su rol.
+# EN: Inspects the prologues of key functions and looks for nearby anchor strings to identify their role.
 import struct
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind
 
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IMAGE_BASE = 0x140000000
 with open(EXE,"rb") as f: DATA=f.read()
+# ES: Tabla de secciones leída de las cabeceras PE; conversiones RVA <-> offset de fichero.
+# EN: Section table read from the PE headers; RVA <-> file offset conversions.
 e=struct.unpack_from("<I",DATA,0x3C)[0]; coff=e+4
 ns=struct.unpack_from("<H",DATA,coff+2)[0]; osz=struct.unpack_from("<H",DATA,coff+16)[0]
 so=coff+20+osz; SEC=[]
@@ -25,6 +37,8 @@ def o2r(o):
 
 fmt=Formatter(FormatterSyntax.INTEL); fmt.hex_prefix="0x"; fmt.hex_suffix=""
 
+# ES: Imprime hasta n instrucciones desde rva anotando cadenas cargadas con lea/mov RIP-relativo.
+# EN: Prints up to n instructions from rva annotating strings loaded through RIP-relative lea/mov.
 def dump(rva, n, label):
     print(f"\n=== {label}  RVA 0x{rva:X} ===")
     o=r2o(rva); code=DATA[o:o+n]
@@ -33,6 +47,7 @@ def dump(rva, n, label):
     for ins in dec:
         rr=ins.ip-IMAGE_BASE
         # detectar lea rip-relativo a string
+        # EN: detect rip-relative lea to a string
         s=""
         if ins.mnemonic in (Mnemonic.LEA,Mnemonic.MOV) and ins.op1_kind==OpKind.MEMORY and ins.memory_base==0:
             tgt=ins.memory_displacement
@@ -46,6 +61,8 @@ def dump(rva, n, label):
         cnt+=1
         if cnt>n or ins.mnemonic==Mnemonic.INT3: break
 
+# ES: Funciones a inspeccionar.
+# EN: Functions to inspect.
 dump(0x66CB50, 40, "recalc reloj por-char (0x5CD1C0 call)")
 dump(0xA0AF10, 60, "commit accion a GameWorld (0x5CD254 call)")
 dump(0x5C67C0, 40, "func de char+0x648 (0x5CD26B call)")

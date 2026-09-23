@@ -1,3 +1,16 @@
+# ES: Parchea el .mod de Kenshi Co-op: cambia la facción del escuadrón del jugador del gamestart
+#     "Multiplayer" de la facción huérfana "Player 1" (10-kenshi-online.mod) a la vanilla "Nameless"
+#     (204-gamedata.base), que sí tiene relaciones reales. Busca el campo 'faction' por patrón (no por
+#     offset), reconstruye el buffer (-3 bytes), hace copia .bak-pre-nameless y escribe. Aplica a varias
+#     copias (repo, dist, versión 16 jugadores e instalación de Steam en E:).
+#     Uso: python tools/set_player_squad_faction_nameless.py [--dry-run]
+# EN: Patches the Kenshi Co-op .mod: changes the faction of the player's squad in the "Multiplayer"
+#     gamestart from the orphan "Player 1" faction (10-kenshi-online.mod) to vanilla "Nameless"
+#     (204-gamedata.base), which does have real relations. Finds the 'faction' field by pattern (not by
+#     offset), rebuilds the buffer (-3 bytes), keeps a .bak-pre-nameless copy and writes. Applies to several
+#     copies (repo, dist, 16-player version and the Steam install on E:).
+#     Usage: python tools/set_player_squad_faction_nameless.py [--dry-run]
+
 """
 set_player_squad_faction_nameless.py
 =====================================
@@ -53,17 +66,21 @@ import sys
 import shutil
 
 # ── Constantes del formato ────────────────────────────────────────────────────
+# EN: -- Format constants --
 FIELD_NAME      = b'faction'                 # nombre del campo de referencia a tocar
 OLD_FACTION_REF = b'10-kenshi-online.mod'    # facción Player 1 (huérfana), 20 chars
 NEW_FACTION_REF = b'204-gamedata.base'       # facción Nameless (vanilla), 17 chars
 
 # Patrón a localizar: <u32 len=7>"faction"<u32 ref_count=1><u32 len=20>"10-kenshi-online.mod"
 # Lo construimos por piezas para tolerar variaciones de ref_count.
+# EN: Pattern to find: <u32 len=7>"faction"<u32 ref_count=1><u32 len=20>"10-kenshi-online.mod"
+#     We build it piece by piece to tolerate ref_count variations.
 FIELD_NAME_BLOCK = struct.pack('<I', len(FIELD_NAME)) + FIELD_NAME            # 'faction' length-prefixed
 OLD_REF_BLOCK    = struct.pack('<I', len(OLD_FACTION_REF)) + OLD_FACTION_REF  # ref vieja length-prefixed
 NEW_REF_BLOCK    = struct.pack('<I', len(NEW_FACTION_REF)) + NEW_FACTION_REF  # ref nueva length-prefixed
 
 # ── Lista de copias del .mod a parchear ───────────────────────────────────────
+# EN: -- List of .mod copies to patch --
 REPO = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
 STEAM = r"E:\SteamLibrary\steamapps\common\Kenshi"
 
@@ -76,6 +93,8 @@ MOD_PATHS = [
 ]
 
 
+# ES: Aplica el cambio a una copia; devuelve True si parcheó (o parchearía en dry-run).
+# EN: Applies the change to one copy; returns True if it patched (or would patch in dry-run).
 def patch_mod(path, dry_run=False):
     """Cambia la facción del squad del jugador a Nameless en UNA copia del .mod.
     Devuelve True si parcheó, False si no aplicaba o ya estaba parcheado."""
@@ -88,12 +107,15 @@ def patch_mod(path, dry_run=False):
 
     # 1) ¿Ya está parcheado? (el squad del jugador ya apunta a Nameless)
     #    Buscamos el bloque 'faction' + ref_count + NEW_REF.
+    # EN: 1) Already patched? (the player's squad already points to Nameless)
+    #        We look for the 'faction' block + ref_count + NEW_REF.
     already = _find_field_ref(data, NEW_REF_BLOCK)
     if already is not None:
         print(f"  YA PARCHEADO (squad del jugador ya en Nameless): {path}")
         return False
 
     # 2) Localizar el campo 'faction' del squad del jugador apuntando a Player 1.
+    # EN: 2) Locate the player's squad 'faction' field pointing to Player 1.
     hit = _find_field_ref(data, OLD_REF_BLOCK)
     if hit is None:
         print(f"  SKIP (no se halló el campo 'faction'->'10-kenshi-online.mod'): {path}")
@@ -101,6 +123,7 @@ def patch_mod(path, dry_run=False):
 
     ref_block_off = hit  # offset del bloque <u32 len><string> de la referencia vieja
     # Reconstruir el buffer: parte previa + nueva referencia + parte posterior.
+    # EN: Rebuild the buffer: previous part + new reference + following part.
     new_data = data[:ref_block_off] + NEW_REF_BLOCK + data[ref_block_off + len(OLD_REF_BLOCK):]
     size_after = len(new_data)
     delta = size_after - size_before
@@ -109,15 +132,19 @@ def patch_mod(path, dry_run=False):
     print(f"  Cambio: '10-kenshi-online.mod'(20) -> '204-gamedata.base'(17)  | tamaño {size_before} -> {size_after} ({delta:+d})")
 
     # 3) Verificación de cordura: el archivo debe encoger exactamente 3 bytes.
+    # EN: 3) Sanity check: the file must shrink by exactly 3 bytes.
     expected_delta = len(NEW_REF_BLOCK) - len(OLD_REF_BLOCK)  # = -3
     if delta != expected_delta:
         print(f"  ABORTADO: delta inesperado ({delta}, esperado {expected_delta}). NO se escribe.")
         return False
 
     # 4) Verificación: la referencia vieja del squad ya no debe quedar como faction del squad.
+    # EN: 4) Check: the old reference should no longer be the squad's faction.
     if _find_field_ref(new_data, OLD_REF_BLOCK) is not None:
         # Puede quedar OTRA referencia 'faction'->Player1 (p.ej. en otro objeto), pero
         # para el squad del jugador concreto ya la cambiamos. Avisamos si hay más.
+        # EN: Another 'faction'->Player1 reference may remain (e.g. in another object), but
+        #     for this specific player squad we already changed it. Warn if there are more.
         print(f"  NOTA: queda al menos otro campo 'faction'->'10-kenshi-online.mod' en el archivo "
               f"(otro objeto). Revisar si era esperado.")
 
@@ -126,6 +153,7 @@ def patch_mod(path, dry_run=False):
         return True
 
     # 5) Backup .bak-pre-nameless si no existe, y escribir.
+    # EN: 5) Backup .bak-pre-nameless if it does not exist, and write.
     backup = path + '.bak-pre-nameless'
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
@@ -136,6 +164,8 @@ def patch_mod(path, dry_run=False):
     return True
 
 
+# ES: Offset del bloque de referencia que sigue a 'faction' + ref_count (u32), o None.
+# EN: Offset of the reference block following 'faction' + ref_count (u32), or None.
 def _find_field_ref(data, ref_block):
     """Localiza el bloque de referencia (ref_block = <u32 len><string>) que sigue al
     campo 'faction' + ref_count(uint32). Devuelve el offset del ref_block, o None.
@@ -147,6 +177,7 @@ def _find_field_ref(data, ref_block):
         if fpos == -1:
             return None
         # Tras 'faction'(len-prefixed) viene ref_count(uint32) y luego el ref_block.
+        # EN: After 'faction'(len-prefixed) comes ref_count(uint32) and then the ref_block.
         rc_off = fpos + len(FIELD_NAME_BLOCK)
         ref_off = rc_off + 4
         if data[ref_off:ref_off + len(ref_block)] == ref_block:
@@ -154,6 +185,8 @@ def _find_field_ref(data, ref_block):
         start = fpos + 1
 
 
+# ES: Punto de entrada: recorre las copias del .mod.
+# EN: Entry point: walks the .mod copies.
 if __name__ == '__main__':
     dry = '--dry-run' in sys.argv
     print("=== Poner el squad del jugador (gamestart Multiplayer) en Nameless (204-gamedata.base) ===")

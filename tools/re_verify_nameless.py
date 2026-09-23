@@ -1,13 +1,27 @@
 # -*- coding: utf-8 -*-
+# ES: Verifica en bytes las funciones para localizar la facción "Nameless" vía FactionManager:
+#     desensambla Faction::getName/getData, RootObjectBase::getGameData/getName,
+#     FactionMgr::getFactionByStringID/getFactionByName/getAllFactions, Faction::isThePlayer e
+#     isNotARealFaction. Uso: python re_verify_nameless.py [all|filtro]
+# EN: Verifies in bytes the functions used to locate the "Nameless" faction through FactionManager:
+#     disassembles Faction::getName/getData, RootObjectBase::getGameData/getName,
+#     FactionMgr::getFactionByStringID/getFactionByName/getAllFactions, Faction::isThePlayer and
+#     isNotARealFaction. Usage: python re_verify_nameless.py [all|filter]
+
 # Verifica en BYTES los offsets para localizar la faccion "Nameless" via FactionManager.
 # Desensambla: Faction::getName, Faction::getData, FactionManager::getFactionByStringID,
 # getFactionByName, getAllFactions, y RootObjectBase::getGameData.
+# EN: Verifies in BYTES the offsets to locate the "Nameless" faction through FactionManager.
+#     Disassembles: Faction::getName, Faction::getData, FactionManager::getFactionByStringID,
+#     getFactionByName, getAllFactions, and RootObjectBase::getGameData.
 import struct, sys
 from iced_x86 import (Decoder, Formatter, FormatterSyntax, Mnemonic, FlowControl)
 
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IMAGE_BASE = 0x140000000
 DATA = open(EXE, "rb").read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]
 coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]
@@ -24,27 +38,37 @@ for i in range(num_sec):
     raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
 
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def rva_to_off(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
             d = rva - srva
             if d < raw_size: return raw_off + d
     return None
+# ES: Offset de fichero -> RVA.
+# EN: File offset -> RVA.
 def off_to_rva(off):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if raw_off <= off < raw_off + raw_size:
             return off - raw_off + srva
     return None
+# ES: Nombre de la sección que contiene el RVA.
+# EN: Name of the section containing the RVA.
 def sec_of(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size): return name
     return None
 
+# ES: Lee una cadena ASCII terminada en 0 (devuelve None si no parece texto imprimible, según la variante).
+# EN: Reads a NUL-terminated ASCII string (returns None if it does not look printable, depending on the variant).
 def read_cstr(off, maxlen=64):
     e = DATA.find(b"\x00", off, off+maxlen)
     if e==-1: e=off+maxlen
     return DATA[off:e].decode("ascii","ignore")
 
+# ES: Desensambla un rango desde start_rva e imprime cada instrucción con anotaciones (destinos, cadenas o marcas según el script).
+# EN: Disassembles a range from start_rva and prints each instruction with annotations (targets, strings or marks depending on the script).
 def disasm(start_rva, length, label, stop_int3=True, max_ins=120):
     off=rva_to_off(start_rva)
     code=DATA[off:off+length]
@@ -66,6 +90,7 @@ def disasm(start_rva, length, label, stop_int3=True, max_ins=120):
                 if t: mark=f"   ; -> 0x{t:X} ({sec_of(t)})"
             except: pass
         # Resolver RIP-relativo a strings en .rdata
+        # EN: Resolve RIP-relative references to strings in .rdata
         try:
             if instr.is_ip_rel_memory_operand:
                 tgt = instr.ip_rel_memory_address - IMAGE_BASE
@@ -81,6 +106,8 @@ def disasm(start_rva, length, label, stop_int3=True, max_ins=120):
             print(f"0x{rva:08X}  {rh:<26} {fmt.format(instr)} <--PAD"); break
         print(f"0x{rva:08X}  {rh:<26} {fmt.format(instr)}{mark}")
 
+# ES: Funciones a verificar: nombre -> (RVA, bytes a desensamblar).
+# EN: Functions to verify: name -> (RVA, bytes to disassemble).
 TARGETS = {
     "Faction::getName":              (0x286780, 0x60),
     "Faction::getData":              (0x6E000,  0x40),
@@ -93,6 +120,8 @@ TARGETS = {
     "Faction::isNotARealFaction":    (0x166EA0, 0x40),
 }
 
+# ES: Punto de entrada: todas o las que contengan el filtro.
+# EN: Entry point: all of them or those containing the filter.
 if __name__=="__main__":
     sel = sys.argv[1] if len(sys.argv)>1 else "all"
     for name,(rva,ln) in TARGETS.items():

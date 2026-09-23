@@ -1,3 +1,18 @@
+# ES: Escáner de ingeniería inversa v3 (heredado del proyecto base): analiza kenshi_x64.exe sin
+#     dependencias externas para (1a) localizar funciones por las cadenas que referencian y sacar su
+#     patrón AOB estilo IDA (con comodines en desplazamientos), (1b) deducir offsets de estructuras,
+#     (1c) buscar vtables, (1d) buscar singletons globales en .data, (2) validar offsets conocidos,
+#     (3-4) minar más patrones y cadenas del motor. Guarda patterns.json y offsets.json en
+#     <carpeta del exe>/KenshiMP/docs e imprime bloques C++ para patterns.h y game_types.h.
+#     Muchos offsets de salida son "CE fallback" fijos, no descubiertos. Uso: python re_scanner.py [ruta_exe]
+# EN: Reverse-engineering scanner v3 (inherited from the base project): analyzes kenshi_x64.exe with no
+#     external dependencies to (1a) locate functions by the strings they reference and derive their
+#     IDA-style AOB pattern (wildcarding displacements), (1b) infer struct offsets, (1c) find vtables,
+#     (1d) find global singletons in .data, (2) validate known offsets, (3-4) mine more patterns and
+#     engine strings. Saves patterns.json and offsets.json into <exe folder>/KenshiMP/docs and prints C++
+#     blocks for patterns.h and game_types.h. Many output offsets are fixed "CE fallback" values, not
+#     discovered ones. Usage: python re_scanner.py [exe_path]
+
 """
 Kenshi-Online Reverse Engineering Scanner v3
 Analyzes kenshi_x64.exe to find function signatures, struct offsets, and vtables.
@@ -17,7 +32,13 @@ import json
 from collections import defaultdict
 
 
+# ES: Parser mínimo de PE: carga el fichero entero, lee secciones (.text/.rdata/.data) y ofrece
+#     búsquedas de cadenas, xrefs RIP-relativos, inicio de función, patrones AOB y vtables.
+# EN: Minimal PE parser: loads the whole file, reads sections (.text/.rdata/.data) and offers string
+#     searches, RIP-relative xrefs, function start detection, AOB patterns and vtables.
 class PEParser:
+    # ES: Carga el fichero y parsea las cabeceras.
+    # EN: Loads the file and parses the headers.
     def __init__(self, filepath):
         with open(filepath, 'rb') as f:
             self.data = f.read()
@@ -34,6 +55,8 @@ class PEParser:
         self.data_rva = 0
         self._parse_pe()
 
+    # ES: Valida MZ/PE, lee la base de imagen (PE32+) y la tabla de secciones, guardando .text/.rdata/.data.
+    # EN: Validates MZ/PE, reads the image base (PE32+) and the section table, storing .text/.rdata/.data.
     def _parse_pe(self):
         if self.data[:2] != b'MZ':
             raise ValueError("Not a valid PE file")
@@ -72,6 +95,8 @@ class PEParser:
                 self.data_size = raw_size
                 self.data_rva = rva
 
+    # ES: RVA -> offset de fichero / offset -> RVA.
+    # EN: RVA -> file offset / offset -> RVA.
     def rva_to_offset(self, rva):
         for s in self.sections:
             if s['rva'] <= rva < s['rva'] + s['raw_size']:
@@ -84,6 +109,8 @@ class PEParser:
                 return offset - s['raw_offset'] + s['rva']
         return None
 
+    # ES: Offsets de fichero de todas las apariciones de la cadena.
+    # EN: File offsets of every occurrence of the string.
     def find_string(self, target):
         if isinstance(target, str):
             target = target.encode('ascii')
@@ -97,6 +124,8 @@ class PEParser:
             start = idx + 1
         return results
 
+    # ES: Offsets de instrucciones de .text (lea/mov/cmp RIP-relativos) que referencian la cadena.
+    # EN: Offsets of .text instructions (RIP-relative lea/mov/cmp) that reference the string.
     def find_string_xrefs(self, string_offset, search_all=True):
         """Find code that references a string via RIP-relative addressing."""
         string_rva = self.offset_to_rva(string_offset)
@@ -111,6 +140,8 @@ class PEParser:
             b0 = text_data[i]
             b1 = text_data[i + 1] if i + 1 < text_end else 0
 
+            # ES: Cada bloque decodifica a mano una forma de instrucción RIP-relativa y compara su destino.
+            # EN: Each block hand-decodes one RIP-relative instruction form and compares its target.
             # REX.W LEA: 48 8D xx [RIP+disp32] (7 bytes)
             # REX.WR LEA: 4C 8D xx [RIP+disp32] (7 bytes)
             if b0 in (0x48, 0x4C) and b1 == 0x8D and i + 6 < text_end:
@@ -169,11 +200,14 @@ class PEParser:
 
         return xrefs
 
+    # ES: Retrocede desde un offset hasta el prólogo de la función con tres estrategias de menos a más laxas.
+    # EN: Walks back from an offset to the function prologue with three strategies, strict to loose.
     def find_function_start(self, offset, max_search=2048):
         """Walk backwards from an offset to find the function prologue."""
         search_start = max(self.text_start, offset - max_search)
         d = self.data
 
+        # ES: Estrategia 1: relleno CC/C3 seguido de un prólogo
         # Strategy 1: Find CC/C3 padding then next prologue
         for i in range(offset - 1, search_start, -1):
             if d[i] in (0xCC, 0xC3):
@@ -183,12 +217,14 @@ class PEParser:
                 if candidate < offset and self._is_prologue(candidate):
                     return candidate
 
+        # ES: Estrategia 2: prólogo precedido de relleno/ret
         # Strategy 2: Prologue with alignment verification
         for i in range(offset - 1, search_start, -1):
             if self._is_prologue(i) and (offset - i) < 512:
                 if i > 0 and d[i - 1] in (0xCC, 0xC3, 0xCB):
                     return i
 
+        # ES: Estrategia 3: el prólogo más cercano
         # Strategy 3: Nearest prologue
         for i in range(offset - 1, search_start, -1):
             if self._is_prologue(i) and (offset - i) < 256:
@@ -196,6 +232,8 @@ class PEParser:
 
         return None
 
+    # ES: ¿Empiezan en offset bytes típicos de prólogo x64 de MSVC (guardar registros, push, sub rsp...)?
+    # EN: Do the bytes at offset look like a typical MSVC x64 prologue (save registers, push, sub rsp...)?
     def _is_prologue(self, offset):
         if offset + 5 > len(self.data):
             return False
@@ -261,6 +299,10 @@ class PEParser:
 
         return False
 
+    # ES: Genera un patrón AOB estilo IDA de length bytes poniendo "?" en desplazamientos de pila,
+    #     tamaños de sub rsp, destinos de call/jmp rel32 y desplazamientos RIP-relativos (lo que cambia entre builds).
+    # EN: Builds an IDA-style AOB pattern of length bytes putting "?" on stack displacements, sub rsp sizes,
+    #     rel32 call/jmp targets and RIP-relative displacements (what changes between builds).
     def make_smart_pattern(self, func_offset, length=32):
         """Create IDA-style pattern wildcarding displacement bytes."""
         if func_offset + length > len(self.data):
@@ -328,6 +370,8 @@ class PEParser:
 
             i += 1
 
+        # ES: Serializar: "?" para comodines y hexadecimal para el resto.
+        # EN: Serialize: "?" for wildcards and hex for the rest.
         parts = []
         for j, b in enumerate(data):
             if j in wildcards:
@@ -336,6 +380,8 @@ class PEParser:
                 parts.append(f'{b:02X}')
         return ' '.join(parts)
 
+    # ES: Para cada aparición de la cadena: xrefs, inicio de función, patrón y distancia xref-inicio.
+    # EN: For each occurrence of the string: xrefs, function start, pattern and xref-to-start distance.
     def find_all_functions_referencing_string(self, string_bytes, label=""):
         """Find ALL functions that reference a given string."""
         offsets = self.find_string(string_bytes)
@@ -366,6 +412,8 @@ class PEParser:
                     })
         return results
 
+    # ES: Busca una secuencia contigua de punteros absolutos (una vtable) a los RVAs dados.
+    # EN: Searches for a contiguous sequence of absolute pointers (a vtable) to the given RVAs.
     def scan_for_vtable_pattern(self, rva_list):
         """Look for a sequence of RVAs in .rdata (vtable detection)."""
         if len(rva_list) < 2:
@@ -384,6 +432,8 @@ class PEParser:
             idx = pos + 1
         return results
 
+    # ES: Lectores de qword/u32/i32 por offset de fichero (None si se sale).
+    # EN: qword/u32/i32 readers by file offset (None if out of range).
     def read_pointer(self, offset):
         if offset + 8 <= len(self.data):
             return struct.unpack_from('<Q', self.data, offset)[0]
@@ -399,6 +449,8 @@ class PEParser:
             return struct.unpack_from('<i', self.data, offset)[0]
         return None
 
+    # ES: Offsets de .data que contienen un puntero absoluto a target_rva.
+    # EN: .data offsets holding an absolute pointer to target_rva.
     def find_global_pointer_to_rva(self, target_rva):
         target_va = self.base + target_rva
         target_bytes = struct.pack('<Q', target_va)
@@ -413,8 +465,13 @@ class PEParser:
             idx = pos + 8
         return results
 
+    # ES: ── Nuevo en v3: descubrimiento de offsets de estructuras ──
     # ── New v3: Structure offset discovery ──
 
+    # ES: Recorre una función (hasta ret o max_scan bytes) y apunta los desplazamientos [reg+disp] de
+    #     MOV/LEA/MOVSS: candidatos a campos de estructura. Devuelve {offset: descripción}.
+    # EN: Walks a function (until ret or max_scan bytes) and records the [reg+disp] displacements of
+    #     MOV/LEA/MOVSS: struct field candidates. Returns {offset: description}.
     def extract_struct_offsets_from_function(self, func_offset, max_scan=512):
         """Scan a function body for MOV/MOVSS instructions that reveal struct field offsets.
         Returns dict of offset -> instruction description."""
@@ -424,10 +481,12 @@ class PEParser:
 
         i = func_offset
         while i < end:
+            # ES: Parar en RET
             # Stop at RET
             if d[i] == 0xC3 or d[i] == 0xCB:
                 break
 
+            # ES: MOV/LEA reg, [reg+disp32] o [reg+disp8]
             # MOV reg, [reg+disp32]: 48 8B xx [mod=10 rm!=4,5]
             if i + 6 < end and d[i] in (0x48, 0x4C) and d[i+1] in (0x8B, 0x89, 0x8D):
                 modrm = d[i+2]
@@ -449,6 +508,7 @@ class PEParser:
                     i += 4
                     continue
 
+            # ES: MOVSS xmm, [reg+disp] (lectura de float)
             # MOVSS xmm, [reg+disp32]: F3 0F 10 xx
             if i + 7 < end and d[i] == 0xF3 and d[i+1] == 0x0F and d[i+2] == 0x10:
                 modrm = d[i+3]
@@ -467,6 +527,7 @@ class PEParser:
                     i += 5
                     continue
 
+            # ES: MOVSS [reg+disp], xmm (escritura de float)
             # MOVSS [reg+disp32], xmm: F3 0F 11 xx
             if i + 7 < end and d[i] == 0xF3 and d[i+1] == 0x0F and d[i+2] == 0x11:
                 modrm = d[i+3]
@@ -483,6 +544,8 @@ class PEParser:
 
         return offsets_found
 
+    # ES: Lecturas/lea RIP-relativos a .data cerca de un xref de código (candidatos a variables globales).
+    # EN: RIP-relative reads/leas into .data near a code xref (global variable candidates).
     def find_data_globals_near_xref(self, xref_offset, search_range=128):
         """Find RIP-relative references to .data section near a code xref."""
         globals_found = []
@@ -513,6 +576,8 @@ class PEParser:
                         })
         return globals_found
 
+    # ES: Busca en .rdata punteros alineados a funciones conocidas y estima el inicio de la vtable.
+    # EN: Searches .rdata for aligned pointers to known functions and estimates the vtable start.
     def scan_vtable_in_rdata(self, known_func_rvas):
         """Scan .rdata for vtables containing known function RVAs."""
         if not known_func_rvas:
@@ -521,6 +586,7 @@ class PEParser:
         rdata = self.data[self.rdata_start:self.rdata_start + self.rdata_size]
         target_vas = set(self.base + rva for rva in known_func_rvas)
 
+        # ES: Buscar punteros alineados en .rdata
         # Scan for aligned pointers in .rdata
         for i in range(0, len(rdata) - 8, 8):
             val = struct.unpack_from('<Q', rdata, i)[0]
@@ -536,12 +602,16 @@ class PEParser:
                     })
         return results
 
+    # ES: Retrocede mientras el qword anterior apunte a .text; ahí empieza la vtable.
+    # EN: Walks back while the previous qword points into .text; that is where the vtable starts.
     def _find_vtable_start(self, rdata, ptr_offset):
         """Walk backwards from a matched pointer to find the start of the vtable."""
+        # ES: Las vtables suelen empezar tras un cero o un puntero RTTI
         # Vtables typically start after a zero or RTTI pointer
         i = ptr_offset
         while i >= 8:
             val = struct.unpack_from('<Q', rdata, i - 8)[0]
+            # ES: ¿El puntero anterior está en .text (puntero a función válido)?
             # Check if previous pointer is in .text (valid function pointer)
             rva = val - self.base if val > self.base else 0
             if self.text_rva <= rva < self.text_rva + self.text_size:
@@ -551,6 +621,10 @@ class PEParser:
         return i
 
 
+# ES: Fase 1b: deduce offsets de campos a partir de las funciones encontradas (posición, rotación,
+#     cadena de salud, nombre...) y rellena el resto con valores fijos "CE fallback".
+# EN: Phase 1b: infers field offsets from the functions found (position, rotation, health chain,
+#     name...) and fills the rest with fixed "CE fallback" values.
 def discover_struct_offsets(pe, patterns_found):
     """Phase 1b: Discover struct field offsets by analyzing function bodies."""
     offsets = {}
@@ -560,14 +634,17 @@ def discover_struct_offsets(pe, patterns_found):
     print("PHASE 1b: Structure Offset Discovery")
     print("=" * 70)
 
+    # ES: setPosition -> offset de la posición
     # setPosition function -> position offset
     if 'CHARACTER_SET_POSITION' in patterns_found:
         info = patterns_found['CHARACTER_SET_POSITION']
         func_offsets = pe.extract_struct_offsets_from_function(info['offset'])
         if func_offsets:
+            # ES: Las escrituras de posición suelen ser MOVSS a floats consecutivos
             # Position writes are typically MOVSS stores to consecutive floats
             float_stores = {k: v for k, v in func_offsets.items()
                           if 'MOVSS' in v or 'MOV_STORE' in v}
+            # ES: Buscar 3 offsets de float consecutivos (x, y, z)
             # Look for 3 consecutive float offsets (x, y, z)
             sorted_offsets = sorted(float_stores.keys())
             for j in range(len(sorted_offsets) - 2):
@@ -577,15 +654,18 @@ def discover_struct_offsets(pe, patterns_found):
                     print(f"  Position offset: 0x{a:X} (from setPosition float stores)")
                     break
             if 'position' not in offsets:
+                # ES: Alternativa: el primer MOVSS de escritura probablemente es position.x
                 # Fallback: first MOVSS store is likely position.x
                 for off in sorted(float_stores.keys()):
                     offsets['position'] = off
                     print(f"  Position offset: 0x{off:X} (first MOVSS store in setPosition)")
                     break
 
+            # ES: Comprobar también la rotación (4 floats consecutivos tras la posición)
             # Also check for rotation (4 consecutive floats after position)
             if 'position' in offsets:
                 pos = offsets['position']
+                # ES: La rotación suele estar en posición + 12 o + 16 (con relleno)
                 # Rotation is typically at position + 12 or position + 16 (with padding)
                 for candidate in [pos + 12, pos + 16, pos + 0x10]:
                     if candidate in func_offsets:
@@ -593,12 +673,15 @@ def discover_struct_offsets(pe, patterns_found):
                         print(f"  Rotation offset: 0x{candidate:X} (near position)")
                         break
 
+    # ES: Sistema de salud: analizar las funciones de pérdida de sangre / daño
     # Health system: analyze blood loss / damage functions
     for label in ['HEALTH_UPDATE', 'APPLY_DAMAGE']:
         if label in patterns_found:
             info = patterns_found[label]
             func_offsets = pe.extract_struct_offsets_from_function(info['offset'])
             if func_offsets:
+                # ES: Las cadenas de salud suelen implicar varias desreferencias; buscar los offsets de la cadena de
+                #     Cheat Engine: +2B8, +5F8, +40
                 # Health chains typically involve multiple pointer dereferences
                 # Look for characteristic offsets from CE chain: +2B8, +5F8, +40
                 for off in sorted(func_offsets.keys()):
@@ -612,11 +695,13 @@ def discover_struct_offsets(pe, patterns_found):
                         offsets['health_base'] = off
                         print(f"  Health base offset: 0x{off:X}")
 
+                # ES: Imprimir todos los offsets encontrados para análisis
                 # Print all offsets found for analysis
                 print(f"  [{label}] All struct offsets in function:")
                 for off in sorted(func_offsets.keys())[:20]:
                     print(f"    +0x{off:X}: {func_offsets[off]}")
 
+    # ES: Creación de personaje -> offsets de plantilla y facción
     # Character creation -> template ID, faction offsets
     if 'CHARACTER_CREATE' in patterns_found:
         info = patterns_found['CHARACTER_CREATE']
@@ -625,11 +710,13 @@ def discover_struct_offsets(pe, patterns_found):
             print(f"  [CHARACTER_CREATE] Offsets found in function:")
             for off in sorted(func_offsets.keys())[:20]:
                 print(f"    +0x{off:X}: {func_offsets[off]}")
+            # ES: El nombre suele ser una de las primeras cargas de puntero; la facción, un puntero a offset medio
             # Name is typically one of the early pointer loads
             # Faction is typically a pointer at a medium offset
             pointer_loads = {k: v for k, v in func_offsets.items() if 'MOV' in v and 'STORE' not in v}
             if pointer_loads:
                 sorted_ptr = sorted(pointer_loads.keys())
+                # ES: Heurística: el nombre suele estar en +0x10 o +0x18 (std::string de MSVC)
                 # Heuristic: name is often at +0x10 or +0x18 (MSVC std::string)
                 for candidate in [0x10, 0x18, 0x20, 0x28, 0x30]:
                     if candidate in pointer_loads:
@@ -637,6 +724,7 @@ def discover_struct_offsets(pe, patterns_found):
                         print(f"  Name offset (heuristic): 0x{candidate:X}")
                         break
 
+    # ES: Creación de escuadrón -> offset de la lista de miembros
     # Squad creation -> squad member list offset
     if 'SQUAD_CREATE' in patterns_found:
         info = patterns_found['SQUAD_CREATE']
@@ -646,6 +734,7 @@ def discover_struct_offsets(pe, patterns_found):
             for off in sorted(func_offsets.keys())[:15]:
                 print(f"    +0x{off:X}: {func_offsets[off]}")
 
+    # ES: Sistema de inventario
     # Inventory system
     for label in ['ITEM_PICKUP', 'INVENTORY_TRANSFER']:
         if label in patterns_found:
@@ -656,6 +745,8 @@ def discover_struct_offsets(pe, patterns_found):
                 for off in sorted(func_offsets.keys())[:15]:
                     print(f"    +0x{off:X}: {func_offsets[off]}")
 
+    # ES: Aplicar los offsets conocidos de Cheat Engine a todo lo no descubierto (valores fijos, pueden no
+    #     corresponder a la versión actual)
     # Apply CE-known fallback offsets for anything not discovered
     ce_fallbacks = {
         'health_chain_1': 0x2B8,
@@ -694,6 +785,10 @@ def discover_struct_offsets(pe, patterns_found):
     return offsets
 
 
+# ES: Fase 1c: busca vtables que contengan funciones ya encontradas y lista funciones que referencian
+#     las cadenas de FrameListener de Ogre.
+# EN: Phase 1c: looks for vtables containing already found functions and lists functions referencing
+#     Ogre's FrameListener strings.
 def discover_vtables(pe, patterns_found):
     """Phase 1c: Scan for vtables containing known function RVAs."""
     vtables = {}
@@ -703,6 +798,7 @@ def discover_vtables(pe, patterns_found):
     print("PHASE 1c: Vtable Discovery")
     print("=" * 70)
 
+    # ES: Recoger los RVAs de funciones conocidas
     # Collect known function RVAs
     known_rvas = []
     for label, info in patterns_found.items():
@@ -721,6 +817,7 @@ def discover_vtables(pe, patterns_found):
                 'index': hit['matched_at_index'],
             }
 
+    # ES: Buscar la vtable del FrameListener de Ogre a través de xrefs a cadenas
     # Search for Ogre FrameListener vtable via string xrefs
     for s in [b"frameRenderingQueued", b"frameStarted", b"frameEnded"]:
         str_offsets = pe.find_string(s)
@@ -737,6 +834,8 @@ def discover_vtables(pe, patterns_found):
     return vtables
 
 
+# ES: Fase 1d: para cada cadena ancla, busca cerca de su primer xref un acceso a .data (posible singleton).
+# EN: Phase 1d: for each anchor string, looks near its first xref for a .data access (possible singleton).
 def discover_singletons(pe, patterns_found):
     """Phase 1d: Find global singleton pointers in .data section."""
     singletons = {}
@@ -746,6 +845,8 @@ def discover_singletons(pe, patterns_found):
     print("PHASE 1d: Global Singleton Discovery")
     print("=" * 70)
 
+    # ES: Cadena ancla -> nombre del singleton buscado.
+    # EN: Anchor string -> name of the singleton looked for.
     singleton_strings = [
         (b"Kenshi 1.0.", "GAME_VERSION"),
         (b"zone.%d.%d.zone", "ZONE_MANAGER"),
@@ -786,6 +887,8 @@ def discover_singletons(pe, patterns_found):
     return singletons
 
 
+# ES: Genera el texto C++ para pegar en patterns.h (constantes de patrones) y game_types.h (offsets).
+# EN: Generates C++ text to paste into patterns.h (pattern constants) and game_types.h (offsets).
 def generate_cpp_output(patterns_found, offsets, singletons, vtables):
     """Generate C++ code blocks for patterns.h and game_types.h."""
     output_lines = []
@@ -799,6 +902,7 @@ def generate_cpp_output(patterns_found, offsets, singletons, vtables):
     output_lines.append("namespace kmp { namespace patterns {")
     output_lines.append("")
 
+    # ES: Mapear etiquetas del escáner a nombres de constantes C++
     # Map pattern labels to C++ constant names
     pattern_mapping = {
         'CHARACTER_CREATE': 'CHARACTER_SPAWN',
@@ -838,6 +942,7 @@ def generate_cpp_output(patterns_found, offsets, singletons, vtables):
     output_lines.append("}} // namespace kmp::patterns")
     output_lines.append("")
 
+    # ES: Offsets para game_types.h
     # Offsets for game_types.h
     output_lines.append("=" * 70)
     output_lines.append("C++ GAME_TYPES.H OFFSET UPDATE")
@@ -884,6 +989,8 @@ def generate_cpp_output(patterns_found, offsets, singletons, vtables):
     return '\n'.join(output_lines)
 
 
+# ES: Punto de entrada: carga el exe (argumento o ruta de Steam por defecto) y ejecuta todas las fases.
+# EN: Entry point: loads the exe (argument or default Steam path) and runs every phase.
 def main():
     exe_path = sys.argv[1] if len(sys.argv) > 1 else \
         r"C:\Program Files (x86)\Steam\steamapps\common\Kenshi\kenshi_x64.exe"
@@ -905,6 +1012,7 @@ def main():
               f"Raw: 0x{s['raw_offset']:08X}")
     print()
 
+    # ES: FASE 1a: descubrimiento dirigido de funciones (etiqueta, cadenas ancla, descripción)
     # ═══════════════════════════════════════════════════════
     # PHASE 1a: Targeted Function Discovery
     # ═══════════════════════════════════════════════════════
@@ -1063,24 +1171,28 @@ def main():
         if not found_any:
             print(f"  [{label}] not found")
 
+    # ES: FASE 1b: descubrimiento de offsets de estructuras
     # ═══════════════════════════════════════════════════════
     # PHASE 1b: Structure Offset Discovery
     # ═══════════════════════════════════════════════════════
 
     offsets = discover_struct_offsets(pe, patterns_found)
 
+    # ES: FASE 1c: descubrimiento de vtables
     # ═══════════════════════════════════════════════════════
     # PHASE 1c: Vtable Discovery
     # ═══════════════════════════════════════════════════════
 
     vtables = discover_vtables(pe, patterns_found)
 
+    # ES: FASE 1d: descubrimiento de singletons
     # ═══════════════════════════════════════════════════════
     # PHASE 1d: Singleton Discovery
     # ═══════════════════════════════════════════════════════
 
     singletons = discover_singletons(pe, patterns_found)
 
+    # ES: FASE 2: validación de offsets conocidos (valor de la versión 1.0.52)
     # ═══════════════════════════════════════════════════════
     # PHASE 2: Known Offset Validation
     # ═══════════════════════════════════════════════════════
@@ -1104,6 +1216,7 @@ def main():
         else:
             print(f"  [{name}] RVA 0x{rva:08X} -> NOT in any section (version mismatch?)")
 
+    # ES: FASE 3: minado de patrones adicionales con cadenas alternativas
     # ═══════════════════════════════════════════════════════
     # PHASE 3: Additional Pattern Mining
     # ═══════════════════════════════════════════════════════
@@ -1147,6 +1260,7 @@ def main():
         else:
             print(f"  [{label}] not found")
 
+    # ES: FASE 4: descubrimiento de estructura del juego (versión y cadenas de Ogre/D3D11/OIS/FCS)
     # ═══════════════════════════════════════════════════════
     # PHASE 4: Game Structure Discovery
     # ═══════════════════════════════════════════════════════
@@ -1174,6 +1288,7 @@ def main():
             if found:
                 print(f"  {category} string \"{s.decode()}\": {len(found)} occurrence(s)")
 
+    # ES: SALIDA: resumen, JSON y bloques C++
     # ═══════════════════════════════════════════════════════
     # OUTPUT
     # ═══════════════════════════════════════════════════════
@@ -1189,6 +1304,7 @@ def main():
         print(f'    Pattern: {info["pattern"]}')
         print(f'    String:  "{info["string"]}"')
 
+    # ES: Guardar patterns.json (en <carpeta del exe>/KenshiMP/docs)
     # Save patterns.json
     output_dir = os.path.join(os.path.dirname(exe_path), 'KenshiMP', 'docs')
     os.makedirs(output_dir, exist_ok=True)
@@ -1209,6 +1325,7 @@ def main():
         json.dump(serializable, f, indent=2)
     print(f"\nPatterns saved to: {output_path}")
 
+    # ES: Guardar offsets.json (nuevo en v3)
     # Save offsets.json (NEW in v3)
     offsets_path = os.path.join(output_dir, 'offsets.json')
     offsets_output = {
@@ -1224,6 +1341,7 @@ def main():
         json.dump(offsets_output, f, indent=2)
     print(f"Offsets saved to: {offsets_path}")
 
+    # ES: Generar la salida C++
     # Generate C++ output
     cpp_output = generate_cpp_output(patterns_found, offsets, singletons, vtables)
     print(cpp_output)

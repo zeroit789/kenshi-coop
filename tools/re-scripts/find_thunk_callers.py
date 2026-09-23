@@ -1,3 +1,10 @@
+# ES: Lista los call E8 a los thunks descubiertos de las factories (process 0x29195, create 0x2C5A2) y
+#     desensambla con Capstone los 64 bytes previos a cada llamada para ver sus argumentos.
+#     Usa kdis.py. Uso: python find_thunk_callers.py
+# EN: Lists the E8 calls to the discovered factory thunks (process 0x29195, create 0x2C5A2) and
+#     disassembles with Capstone the 64 bytes before each call to see its arguments.
+#     Uses kdis.py. Usage: python find_thunk_callers.py
+
 import kdis, capstone, struct
 
 IB = kdis.image_base
@@ -5,6 +12,7 @@ md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 md.detail = True
 
 # thunks descubiertos
+# EN: discovered thunks
 thunk_process = 0x29195
 thunk_create = 0x2C5A2
 targets = {thunk_process: 'process_thunk', thunk_create: 'create_thunk'}
@@ -24,6 +32,8 @@ for i in range(len(text) - 5):
         if dst_rva in targets:
             callers[dst_rva].append(src_rva)
 
+# ES: Contexto de un call: desensambla desde back bytes antes hasta la propia llamada.
+# EN: Context of a call: disassembles from back bytes before up to the call itself.
 def ctx(rva, back=64, fwd=8):
     """Desensambla `back` bytes antes hasta `fwd` instr despues del call."""
     start = rva - back

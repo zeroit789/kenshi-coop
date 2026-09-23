@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
+# ES: Desensamblador genérico por línea de comandos: anota destinos de saltos/calls (con sección) y
+#     cadenas o datos de operandos RIP-relativos; para en int3. Uso: python re_disasm_range.py <rva_hex> [longitud_hex=0x200]
+# EN: Generic command-line disassembler: annotates jump/call targets (with section) and strings or data of
+#     RIP-relative operands; stops at int3. Usage: python re_disasm_range.py <rva_hex> [length_hex=0x200]
+
 # Desensamblador generico con resolucion de strings RIP-rel y llamadas. Uso:
 #   python re_disasm_range.py 0x86DB80 0x260
+# EN: Generic disassembler resolving RIP-rel strings and calls. Usage:
+#       python re_disasm_range.py 0x86DB80 0x260
 import struct, sys
 from iced_x86 import (Decoder, Formatter, FormatterSyntax, Mnemonic, FlowControl)
 
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IMAGE_BASE = 0x140000000
 DATA = open(EXE, "rb").read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]
 coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]
@@ -23,21 +32,29 @@ for i in range(num_sec):
     raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
 
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def rva_to_off(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
             d = rva - srva
             if d < raw_size: return raw_off + d
     return None
+# ES: Nombre de la sección que contiene el RVA.
+# EN: Name of the section containing the RVA.
 def sec_of(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size): return name
     return None
+# ES: Lee una cadena ASCII terminada en 0 (devuelve None si no parece texto imprimible, según la variante).
+# EN: Reads a NUL-terminated ASCII string (returns None if it does not look printable, depending on the variant).
 def read_cstr(off, maxlen=80):
     e = DATA.find(b"\x00", off, off+maxlen)
     if e==-1: e=off+maxlen
     return DATA[off:e].decode("ascii","ignore")
 
+# ES: Desensambla un rango desde start_rva e imprime cada instrucción con anotaciones (destinos, cadenas o marcas según el script).
+# EN: Disassembles a range from start_rva and prints each instruction with annotations (targets, strings or marks depending on the script).
 def disasm(start_rva, length, max_ins=400):
     off=rva_to_off(start_rva)
     code=DATA[off:off+length]
@@ -79,6 +96,8 @@ def disasm(start_rva, length, max_ins=400):
         if instr.mnemonic==Mnemonic.INT3:
             break
 
+# ES: Punto de entrada por línea de comandos.
+# EN: Command-line entry point.
 if __name__=="__main__":
     rva=int(sys.argv[1],16)
     ln=int(sys.argv[2],16) if len(sys.argv)>2 else 0x200
