@@ -1,3 +1,9 @@
+// ES: Tipos de datos del depurador de pipeline replicado por red: tipos de evento,
+//     el registro PipelineEvent, el snapshot binario compacto PipelineSnapshot (48 bytes,
+//     se envía a 1 Hz a los demás jugadores), tipos de anomalía y ayudas de formato.
+// EN: Data types for the network-replicated pipeline debugger: event types, the
+//     PipelineEvent record, the compact binary PipelineSnapshot (48 bytes, sent at 1 Hz
+//     to the other players), anomaly types and formatting helpers.
 #pragma once
 #include "kmp/types.h"
 #include <cstdint>
@@ -7,6 +13,7 @@
 
 namespace kmp {
 
+// ES: TIPOS DE EVENTO DEL PIPELINE (spawn, carga, entidades, hooks y red).
 // ══════════════════════════════════════════════════════════════════════════════
 // PIPELINE EVENT TYPES
 // ══════════════════════════════════════════════════════════════════════════════
@@ -39,6 +46,9 @@ enum class PipelineEventType : uint8_t {
     SnapshotReceived    = 0x41,
 };
 
+// ES: ── Evento del pipeline ──
+//     Registro de longitud variable para el buffer circular y el envío por red.
+//     Parte fija: 16 bytes. Texto de detalle: máximo 64 caracteres.
 // ── Pipeline Event ──
 // Variable-length record for ring buffer + network broadcast.
 // Fixed part: 16 bytes. Detail string: max 64 chars.
@@ -52,6 +62,10 @@ struct PipelineEvent {
     std::string       detail;       // Human-readable (max 64 chars on wire)
 };
 
+// ES: SNAPSHOT DEL PIPELINE — 48 bytes empaquetados (#pragma pack 1).
+//     Snapshot binario compacto del estado local del pipeline, enviado a 1 Hz.
+//     Todos los campos son de tamaño fijo para serializarlo tal cual con WriteRaw/ReadRaw.
+//     Los comentarios "(N bytes)" de cada grupo suman 48; el static_assert lo comprueba.
 // ══════════════════════════════════════════════════════════════════════════════
 // PIPELINE SNAPSHOT — 48 bytes packed
 // ══════════════════════════════════════════════════════════════════════════════
@@ -111,6 +125,8 @@ struct PipelineSnapshot {
 
 static_assert(sizeof(PipelineSnapshot) == 48, "PipelineSnapshot must be 48 bytes");
 
+// ES: DETECCIÓN DE ANOMALÍAS: tipos de anomalía y el registro de una anomalía
+//     (tipo, jugador origen, cuándo se detectó, descripción y si está resuelta).
 // ══════════════════════════════════════════════════════════════════════════════
 // ANOMALY DETECTION
 // ══════════════════════════════════════════════════════════════════════════════
@@ -133,6 +149,7 @@ struct PipelineAnomaly {
     bool          resolved = false;
 };
 
+// ES: Ayuda: nombre de la fase de carga para mostrarlo en el HUD/volcados.
 // Helper: phase name for display
 inline const char* GetPhaseName(uint8_t phase) {
     switch (phase) {

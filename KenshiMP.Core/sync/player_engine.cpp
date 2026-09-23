@@ -1,3 +1,5 @@
+// ES: Implementación de PlayerEngine (ver player_engine.h).
+// EN: PlayerEngine implementation (see player_engine.h).
 #include "player_engine.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -5,11 +7,16 @@
 
 namespace kmp {
 
+// ES: Constructor: guarda la referencia al controlador.
+// EN: Constructor: stores the controller reference.
 PlayerEngine::PlayerEngine(PlayerController& controller)
     : m_controller(controller) {}
 
+// ES: ---- Máquina de estados ----
 // ---- State Machine ----
 
+// ES: Cambia el estado del jugador local o de una sesión remota existente.
+// EN: Changes the state of the local player or of an existing remote session.
 void PlayerEngine::SetState(PlayerID id, PlayerState newState) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -28,6 +35,8 @@ void PlayerEngine::SetState(PlayerID id, PlayerState newState) {
     }
 }
 
+// ES: Estado de un jugador; Disconnected si no se conoce.
+// EN: A player's state; Disconnected if unknown.
 PlayerState PlayerEngine::GetState(PlayerID id) const {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -40,8 +49,11 @@ PlayerState PlayerEngine::GetState(PlayerID id) const {
     return PlayerState::Disconnected;
 }
 
+// ES: ---- Registro ----
 // ---- Registration ----
 
+// ES: El servidor aceptó el handshake: guarda id y nombre locales y pasa a Loading.
+// EN: The server accepted the handshake: stores local id and name and moves to Loading.
 void PlayerEngine::OnHandshakeAck(PlayerID localId, const std::string& name) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_localPlayerId = localId;
@@ -51,6 +63,8 @@ void PlayerEngine::OnHandshakeAck(PlayerID localId, const std::string& name) {
     spdlog::info("PlayerEngine: Local player initialized id={} name='{}'", localId, name);
 }
 
+// ES: Crea (o reemplaza) la sesión de un jugador remoto, directamente en InGame.
+// EN: Creates (or replaces) a remote player's session, directly in InGame.
 void PlayerEngine::OnRemotePlayerJoined(PlayerID id, const std::string& name) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -67,6 +81,8 @@ void PlayerEngine::OnRemotePlayerJoined(PlayerID id, const std::string& name) {
     spdlog::info("PlayerEngine: Remote player joined id={} name='{}'", id, name);
 }
 
+// ES: Marca al jugador remoto como Disconnected. Nota: la sesión NO se borra del mapa.
+// EN: Marks the remote player as Disconnected. Note: the session is NOT removed from the map.
 void PlayerEngine::OnRemotePlayerLeft(PlayerID id) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -77,14 +93,19 @@ void PlayerEngine::OnRemotePlayerLeft(PlayerID id) {
     }
 }
 
+// ES: Snapshot del mundo recibido: el jugador local pasa a InGame.
+// EN: World snapshot received: the local player moves to InGame.
 void PlayerEngine::OnWorldSnapshotReceived(int entityCount) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_localState = PlayerState::InGame;
     spdlog::info("PlayerEngine: World snapshot received ({} entities), state -> InGame", entityCount);
 }
 
+// ES: ---- Seguimiento de actividad ----
 // ---- Activity Tracking ----
 
+// ES: Actualiza la última actividad de un jugador remoto.
+// EN: Updates a remote player's last activity.
 void PlayerEngine::RecordActivity(PlayerID id) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -92,6 +113,7 @@ void PlayerEngine::RecordActivity(PlayerID id) {
     if (it != m_sessions.end()) {
         it->second.lastActivity = std::chrono::steady_clock::now();
 
+        // ES: Si estaba AFK, vuelve a InGame.
         // If player was AFK, transition back to InGame
         if (it->second.state == PlayerState::AFK) {
             it->second.state = PlayerState::InGame;
@@ -101,6 +123,8 @@ void PlayerEngine::RecordActivity(PlayerID id) {
     }
 }
 
+// ES: Guarda posición y zona de un jugador remoto (también cuenta como actividad).
+// EN: Stores a remote player's position and zone (also counts as activity).
 void PlayerEngine::UpdatePlayerPosition(PlayerID id, const Vec3& pos, const ZoneCoord& zone) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -113,6 +137,10 @@ void PlayerEngine::UpdatePlayerPosition(PlayerID id, const Vec3& pos, const Zone
     }
 }
 
+// ES: Pasa a AFK a los jugadores InGame sin actividad durante afkTimeoutSeconds y
+//     devuelve los que acaban de pasar a AFK.
+// EN: Moves InGame players with no activity for afkTimeoutSeconds to AFK and
+//     returns the ones that just became AFK.
 std::vector<PlayerID> PlayerEngine::CheckAFK(float afkTimeoutSeconds) {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<PlayerID> newlyAfk;
@@ -133,8 +161,13 @@ std::vector<PlayerID> PlayerEngine::CheckAFK(float afkTimeoutSeconds) {
     return newlyAfk;
 }
 
+// ES: ---- Consultas ----
 // ---- Query API ----
 
+// ES: Puntero a la sesión (nullptr si no existe). Ojo: el puntero se usa fuera del
+//     mutex y puede quedar inválido si el mapa cambia.
+// EN: Pointer to the session (nullptr if missing). Note: the pointer is used outside
+//     the mutex and may become invalid if the map changes.
 const PlayerSession* PlayerEngine::GetSession(PlayerID id) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_sessions.find(id);
@@ -144,6 +177,8 @@ const PlayerSession* PlayerEngine::GetSession(PlayerID id) const {
     return nullptr;
 }
 
+// ES: Jugadores remotos en un estado dado.
+// EN: Remote players in a given state.
 std::vector<PlayerID> PlayerEngine::GetByState(PlayerState state) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<PlayerID> result;
@@ -155,6 +190,8 @@ std::vector<PlayerID> PlayerEngine::GetByState(PlayerState state) const {
     return result;
 }
 
+// ES: Jugadores remotos en una zona dada.
+// EN: Remote players in a given zone.
 std::vector<PlayerID> PlayerEngine::GetByZone(const ZoneCoord& zone) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<PlayerID> result;
@@ -166,9 +203,12 @@ std::vector<PlayerID> PlayerEngine::GetByZone(const ZoneCoord& zone) const {
     return result;
 }
 
+// ES: Primer jugador cuyo nombre contiene partialName (sin distinguir mayúsculas).
+// EN: First player whose name contains partialName (case-insensitive).
 PlayerID PlayerEngine::FindByName(const std::string& partialName) const {
     std::lock_guard<std::mutex> lock(m_mutex);
 
+    // ES: Coincidencia parcial sin distinguir mayúsculas/minúsculas.
     // Case-insensitive partial match
     std::string lowerPartial = partialName;
     std::transform(lowerPartial.begin(), lowerPartial.end(), lowerPartial.begin(),
@@ -185,6 +225,8 @@ PlayerID PlayerEngine::FindByName(const std::string& partialName) const {
     return INVALID_PLAYER;
 }
 
+// ES: Copia de todas las sesiones remotas.
+// EN: Copy of all remote sessions.
 std::vector<PlayerSession> PlayerEngine::GetAllSessions() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<PlayerSession> result;
@@ -195,6 +237,8 @@ std::vector<PlayerSession> PlayerEngine::GetAllSessions() const {
     return result;
 }
 
+// ES: Cuenta las sesiones remotas por estado.
+// EN: Counts remote sessions by state.
 PlayerEngine::StateCount PlayerEngine::GetStateCounts() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     StateCount counts;
@@ -210,6 +254,7 @@ PlayerEngine::StateCount PlayerEngine::GetStateCounts() const {
     return counts;
 }
 
+// ES: ---- Jugador local ---- (lecturas sin mutex)
 // ---- Local Player ----
 
 PlayerID PlayerEngine::GetLocalPlayerId() const {
@@ -220,8 +265,11 @@ const std::string& PlayerEngine::GetLocalPlayerName() const {
     return m_localPlayerName;
 }
 
+// ES: ---- Reinicio ----
 // ---- Reset ----
 
+// ES: Borra sesiones y datos del jugador local y vuelve al estado inicial.
+// EN: Clears sessions and local player data and goes back to the initial state.
 void PlayerEngine::Reset() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_sessions.clear();

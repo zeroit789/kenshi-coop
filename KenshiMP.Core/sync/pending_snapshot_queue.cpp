@@ -1,12 +1,18 @@
+// ES: Implementación de PendingSnapshotQueue.
+// EN: PendingSnapshotQueue implementation.
 #include "pending_snapshot_queue.h"
 #include "../core.h"
 #include <spdlog/spdlog.h>
 
 namespace kmp {
 
+// ES: Almacenamiento estático: mapa id de entidad -> lista de snapshots, y su mutex.
+// EN: Static storage: entity id -> snapshot list map, and its mutex.
 std::unordered_map<uint32_t, std::vector<PendingSnapshot>> PendingSnapshotQueue::s_pending;
 std::mutex PendingSnapshotQueue::s_mutex;
 
+// ES: Guarda el snapshot con la hora actual de sesión como marca de tiempo.
+// EN: Stores the snapshot stamped with the current session time.
 void PendingSnapshotQueue::Queue(const CharacterPosition& pos, uint32_t sourcePlayer) {
     std::lock_guard<std::mutex> lock(s_mutex);
 
@@ -21,6 +27,10 @@ void PendingSnapshotQueue::Queue(const CharacterPosition& pos, uint32_t sourcePl
     spdlog::debug("Queued snapshot for entity {} (total={})", pos.entityId, total);
 }
 
+// ES: Pasa al interpolador todos los snapshots guardados de la entidad y borra su
+//     entrada. Se usa la hora de encolado como tiempo del snapshot.
+// EN: Feeds every stored snapshot of the entity into the interpolator and removes
+//     its entry. The queue time is used as the snapshot time.
 void PendingSnapshotQueue::FlushForEntity(uint32_t entityId) {
     std::lock_guard<std::mutex> lock(s_mutex);
 
@@ -46,6 +56,10 @@ void PendingSnapshotQueue::FlushForEntity(uint32_t entityId) {
     s_pending.erase(it);
 }
 
+// ES: Elimina snapshots anteriores a (currentTime - maxAge) y las entradas vacías.
+//     Se llama periódicamente desde core.cpp (maxAge = 10 s).
+// EN: Removes snapshots older than (currentTime - maxAge) and empty entries.
+//     Called periodically from core.cpp (maxAge = 10 s).
 void PendingSnapshotQueue::CleanupOld(float currentTime, float maxAge) {
     std::lock_guard<std::mutex> lock(s_mutex);
 
@@ -55,6 +69,7 @@ void PendingSnapshotQueue::CleanupOld(float currentTime, float maxAge) {
     for (auto it = s_pending.begin(); it != s_pending.end();) {
         auto& snapshots = it->second;
 
+        // ES: Quitar los snapshots viejos.
         // Remove old snapshots
         auto removeIt = std::remove_if(snapshots.begin(), snapshots.end(),
             [cutoffTime, &cleanedCount](const PendingSnapshot& s) {
@@ -67,6 +82,7 @@ void PendingSnapshotQueue::CleanupOld(float currentTime, float maxAge) {
 
         snapshots.erase(removeIt, snapshots.end());
 
+        // ES: Si no quedan snapshots para esta entidad, borrar la entrada.
         // If no snapshots left for this entity, remove the entry
         if (snapshots.empty()) {
             it = s_pending.erase(it);
