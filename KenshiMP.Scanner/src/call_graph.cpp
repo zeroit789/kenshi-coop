@@ -1,3 +1,11 @@
+// ES: call_graph.cpp — implementación del grafo de llamadas (ver call_graph.h).
+//     El recorrido es byte a byte (no desensambla): cualquier byte E8/E9 seguido de un
+//     destino dentro de .text se toma como llamada, así que puede haber aristas falsas
+//     cuando E8/E9 aparece dentro de otra instrucción. Suficiente para etiquetado aproximado.
+// EN: call_graph.cpp — call graph implementation (see call_graph.h).
+//     The walk is byte by byte (no disassembly): any E8/E9 byte followed by a target
+//     inside .text is taken as a call, so there may be false edges when E8/E9 shows
+//     up inside another instruction. Good enough for approximate labeling.
 #include "kmp/call_graph.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -7,10 +15,13 @@
 
 namespace kmp {
 
+// ES: Helper SEH (sin objetos C++ con destructor).
 // ═══════════════════════════════════════════════════════════════════════════
 //  SEH HELPER — No C++ objects with destructors allowed
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Arista cruda en formato POD para rellenar dentro del __try.
+// EN: Raw POD edge to fill inside the __try.
 struct RawCallEdge {
     uintptr_t callerAddr;
     uintptr_t calleeAddr;
@@ -18,6 +29,9 @@ struct RawCallEdge {
     bool      isJmp;
 };
 
+// ES: Recorre el cuerpo de una función buscando CALL rel32 (E8) y JMP rel32 (E9) cuyo
+//     destino cae en .text, y los escribe en un array C. Los JMP a la propia función
+//     se ignoran. Si hay violación de acceso devuelve lo encontrado hasta entonces.
 // Scans a function body for CALL/JMP instructions and writes results
 // into a plain-C array. Returns the number of edges found.
 static size_t SEH_AnalyzeFunction(uintptr_t funcAddr, size_t funcSize,
@@ -31,6 +45,7 @@ static size_t SEH_AnalyzeFunction(uintptr_t funcAddr, size_t funcSize,
         for (size_t i = 0; i + 5 <= funcSize && count < maxEdges; i++) {
             uintptr_t instrAddr = funcAddr + i;
 
+            // ES: E8 = CALL rel32.
             // E8 xx xx xx xx — CALL rel32
             if (code[i] == 0xE8) {
                 int32_t rel;
@@ -48,6 +63,7 @@ static size_t SEH_AnalyzeFunction(uintptr_t funcAddr, size_t funcSize,
                 continue;
             }
 
+            // ES: E9 = JMP rel32 (tail call).
             // E9 xx xx xx xx — JMP rel32 (tail call)
             if (code[i] == 0xE9) {
                 int32_t rel;
@@ -72,10 +88,13 @@ static size_t SEH_AnalyzeFunction(uintptr_t funcAddr, size_t funcSize,
     return count;
 }
 
+// ES: Analizador del grafo de llamadas.
 // ═══════════════════════════════════════════════════════════════════════════
 //  CALL GRAPH ANALYZER
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Guarda módulo y .pdata y localiza .text. Devuelve false si falta alguno.
+// EN: Stores module and .pdata and locates .text. Returns false if any is missing.
 bool CallGraphAnalyzer::Init(uintptr_t moduleBase, size_t moduleSize,
                               const PDataEnumerator* pdata) {
     m_moduleBase = moduleBase;
@@ -85,6 +104,8 @@ bool CallGraphAnalyzer::Init(uintptr_t moduleBase, size_t moduleSize,
     return m_textBase != 0 && m_pdata != nullptr;
 }
 
+// ES: Busca la sección .text en las cabeceras PE.
+// EN: Finds the .text section in the PE headers.
 void CallGraphAnalyzer::FindTextSection() {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(m_moduleBase);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -104,10 +125,14 @@ void CallGraphAnalyzer::FindTextSection() {
     }
 }
 
+// ES: ¿Está la dirección dentro de .text?
+// EN: Is the address inside .text?
 bool CallGraphAnalyzer::IsInText(uintptr_t addr) const {
     return addr >= m_textBase && addr < m_textBase + m_textSize;
 }
 
+// ES: Devuelve el nodo de 'addr', creándolo si no existe.
+// EN: Returns the node for 'addr', creating it if missing.
 CallNode& CallGraphAnalyzer::GetOrCreateNode(uintptr_t addr) {
     auto it = m_nodes.find(addr);
     if (it != m_nodes.end()) return it->second;
@@ -118,10 +143,15 @@ CallNode& CallGraphAnalyzer::GetOrCreateNode(uintptr_t addr) {
     return result.first->second;
 }
 
+// ES: Análisis de una función.
 // ═══════════════════════════════════════════════════════════════════════════
 //  FUNCTION ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Convierte las aristas crudas del helper SEH en CallEdge. Ojo: el buffer de
+//     4096 aristas (~128 KB) va en la pila del hilo que llama.
+// EN: Converts the SEH helper raw edges into CallEdge. Note: the 4096-edge buffer
+//     (~128 KB) lives on the calling thread's stack.
 std::vector<CallEdge> CallGraphAnalyzer::AnalyzeFunction(uintptr_t funcAddr,
                                                           size_t funcSize) const {
     std::vector<CallEdge> edges;
@@ -148,10 +178,15 @@ std::vector<CallEdge> CallGraphAnalyzer::AnalyzeFunction(uintptr_t funcAddr,
     return edges;
 }
 
+// ES: Construcción del grafo completo.
 // ═══════════════════════════════════════════════════════════════════════════
 //  FULL GRAPH BUILD
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Recorre TODAS las funciones de .pdata, analiza sus llamadas y rellena nodos
+//     (llamadores/llamados/contador de llamadas). Devuelve el número de aristas.
+// EN: Walks ALL .pdata functions, analyzes their calls and fills nodes
+//     (callers/callees/call count). Returns the number of edges.
 size_t CallGraphAnalyzer::BuildFullGraph() {
     if (!m_pdata) return 0;
 
@@ -194,6 +229,10 @@ size_t CallGraphAnalyzer::BuildFullGraph() {
     return m_totalEdges;
 }
 
+// ES: Igual que BuildFullGraph pero solo para las funciones indicadas (si la dirección
+//     no es inicio de función se usa la función que la contiene). Acumula aristas.
+// EN: Same as BuildFullGraph but only for the given functions (if the address is
+//     not a function start, the containing function is used). Accumulates edges.
 size_t CallGraphAnalyzer::BuildGraphFor(const std::vector<uintptr_t>& functionAddrs) {
     size_t edges = 0;
 
@@ -229,10 +268,15 @@ size_t CallGraphAnalyzer::BuildGraphFor(const std::vector<uintptr_t>& functionAd
     return edges;
 }
 
+// ES: Propagación de etiquetas.
 // ═══════════════════════════════════════════════════════════════════════════
 //  LABEL PROPAGATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Aplica las etiquetas conocidas y, durante 'depth' rondas, etiqueta a los vecinos
+//     sin nombre como "callee_of_X" / "caller_of_X". Devuelve cuántas se añadieron.
+// EN: Applies the known labels and, for 'depth' rounds, labels unnamed neighbors
+//     as "callee_of_X" / "caller_of_X". Returns how many were added.
 size_t CallGraphAnalyzer::PropagateLabels(
     const std::unordered_map<uintptr_t, std::string>& knownLabels, int depth) {
     for (const auto& [addr, label] : knownLabels) {
@@ -275,15 +319,20 @@ size_t CallGraphAnalyzer::PropagateLabels(
     return labeled;
 }
 
+// ES: API de consultas.
 // ═══════════════════════════════════════════════════════════════════════════
 //  QUERY API
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Nodo de una función (nullptr si no está en el grafo).
+// EN: Node for a function (nullptr if not in the graph).
 const CallNode* CallGraphAnalyzer::GetNode(uintptr_t funcAddr) const {
     auto it = m_nodes.find(funcAddr);
     return it != m_nodes.end() ? &it->second : nullptr;
 }
 
+// ES: Llamadores / llamados de una función (copia del vector).
+// EN: Callers / callees of a function (vector copy).
 std::vector<uintptr_t> CallGraphAnalyzer::GetCallers(uintptr_t funcAddr) const {
     auto* node = GetNode(funcAddr);
     return node ? node->callers : std::vector<uintptr_t>{};
@@ -294,6 +343,8 @@ std::vector<uintptr_t> CallGraphAnalyzer::GetCallees(uintptr_t funcAddr) const {
     return node ? node->callees : std::vector<uintptr_t>{};
 }
 
+// ES: Las 'topN' funciones más llamadas (funciones "calientes").
+// EN: The 'topN' most called functions ("hot" functions).
 std::vector<std::pair<uintptr_t, size_t>> CallGraphAnalyzer::GetMostCalled(size_t topN) const {
     std::vector<std::pair<uintptr_t, size_t>> result;
     for (const auto& [addr, node] : m_nodes) {
@@ -305,6 +356,8 @@ std::vector<std::pair<uintptr_t, size_t>> CallGraphAnalyzer::GetMostCalled(size_
     return result;
 }
 
+// ES: Funciones hoja (no llaman a nada) y raíz (nadie las llama en el grafo).
+// EN: Leaf functions (call nothing) and root functions (nobody calls them in the graph).
 std::vector<uintptr_t> CallGraphAnalyzer::GetLeafFunctions() const {
     std::vector<uintptr_t> result;
     for (const auto& [addr, node] : m_nodes) {
@@ -321,6 +374,10 @@ std::vector<uintptr_t> CallGraphAnalyzer::GetRootFunctions() const {
     return result;
 }
 
+// ES: BFS desde 'source' siguiendo llamados hasta encontrar 'target' (máximo maxDepth saltos).
+//     Devuelve el camino o vacío.
+// EN: BFS from 'source' following callees until 'target' is found (at most maxDepth hops).
+//     Returns the path or empty.
 std::vector<uintptr_t> CallGraphAnalyzer::FindCallPath(uintptr_t source,
                                                          uintptr_t target,
                                                          int maxDepth) const {
@@ -358,6 +415,8 @@ std::vector<uintptr_t> CallGraphAnalyzer::FindCallPath(uintptr_t source,
     return {};
 }
 
+// ES: Conjunto de funciones a como mucho 'radius' saltos (llamadores y llamados).
+// EN: Set of functions within 'radius' hops (callers and callees).
 std::unordered_set<uintptr_t> CallGraphAnalyzer::GetNeighborhood(uintptr_t funcAddr,
                                                                    int radius) const {
     std::unordered_set<uintptr_t> result;
@@ -392,6 +451,8 @@ std::unordered_set<uintptr_t> CallGraphAnalyzer::GetNeighborhood(uintptr_t funcA
     return result;
 }
 
+// ES: Itera todos los nodos.
+// EN: Iterates all nodes.
 void CallGraphAnalyzer::ForEachNode(
     const std::function<void(const CallNode&)>& callback) const {
     for (const auto& [addr, node] : m_nodes) callback(node);

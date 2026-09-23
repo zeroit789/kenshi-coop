@@ -1,3 +1,12 @@
+// ES: orchestrator.cpp — implementación del PatternOrchestrator (camino A, ver
+//     orchestrator.h y docs/architecture/03-scanner.md): registro de todas las entradas
+//     de Kenshi (patrón AOB, string ancla, RVA fija de referencia, slot de vtable),
+//     métodos de resolución y el pipeline de 8 fases que escribe las direcciones en
+//     GameFunctions.
+// EN: orchestrator.cpp — PatternOrchestrator implementation (path A, see orchestrator.h
+//     and docs/architecture/03-scanner.md): registry of every Kenshi entry (AOB pattern,
+//     anchor string, reference fixed RVA, vtable slot), resolution methods and the
+//     8-phase pipeline that writes the addresses into GameFunctions.
 #include "kmp/orchestrator.h"
 #include "kmp/memory.h"
 #include <spdlog/spdlog.h>
@@ -7,10 +16,13 @@
 
 namespace kmp {
 
+// ES: Nombres de los métodos de resolución.
 // ═══════════════════════════════════════════════════════════════════════════
 //  RESOLUTION METHOD NAMES
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Texto corto de cada método (para logs e informes).
+// EN: Short text for each method (for logs and reports).
 const char* ResolutionMethodName(ResolutionMethod method) {
     switch (method) {
         case ResolutionMethod::None:            return "None";
@@ -26,10 +38,15 @@ const char* ResolutionMethodName(ResolutionMethod method) {
     }
 }
 
+// ES: Inicialización.
 // ═══════════════════════════════════════════════════════════════════════════
 //  INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Inicializa el motor de escaneo del módulo y los analizadores (.pdata, strings,
+//     vtables, grafo). No ejecuta ninguna fase todavía.
+// EN: Initializes the module scan engine and the analyzers (.pdata, strings, vtables,
+//     graph). Does not run any phase yet.
 bool PatternOrchestrator::Init(const char* moduleName, const OrchestratorConfig& config) {
     m_config = config;
 
@@ -51,10 +68,13 @@ bool PatternOrchestrator::Init(const char* moduleName, const OrchestratorConfig&
     return true;
 }
 
+// ES: Registro de patrones.
 // ═══════════════════════════════════════════════════════════════════════════
 //  PATTERN REGISTRY
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Añade una entrada; si ya existe una con el mismo id, la sustituye.
+// EN: Adds an entry; if one with the same id exists, it is replaced.
 void PatternOrchestrator::Register(PatternEntry entry) {
     // Check for duplicate
     auto it = m_entryIndex.find(entry.id);
@@ -68,6 +88,8 @@ void PatternOrchestrator::Register(PatternEntry entry) {
     m_entries.push_back(std::move(entry));
 }
 
+// ES: Quita una entrada y reconstruye el índice id -> posición.
+// EN: Removes an entry and rebuilds the id -> index map.
 void PatternOrchestrator::Unregister(const std::string& id) {
     auto it = m_entryIndex.find(id);
     if (it == m_entryIndex.end()) return;
@@ -83,6 +105,8 @@ void PatternOrchestrator::Unregister(const std::string& id) {
     }
 }
 
+// ES: Consultas de entradas por id (const y mutable) y por categoría.
+// EN: Entry lookups by id (const and mutable) and by category.
 const PatternEntry* PatternOrchestrator::GetEntry(const std::string& id) const {
     auto it = m_entryIndex.find(id);
     return it != m_entryIndex.end() ? &m_entries[it->second] : nullptr;
@@ -102,11 +126,30 @@ std::vector<const PatternEntry*> PatternOrchestrator::GetByCategory(
     return result;
 }
 
+// ES: Registro de todas las entradas de Kenshi.
 // ═══════════════════════════════════════════════════════════════════════════
 //  REGISTER BUILT-IN PATTERNS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Registra todas las funciones y globales de Kenshi que usa el mod, enlazando cada
+//     entrada al campo de GameFunctions donde se escribirá la dirección. Para cada una:
+//     id, categoría, descripción, patrón AOB (patterns.h), string ancla + longitud, RVA
+//     de referencia (v1.0.68) y si es crítica (si no se resuelve, su hook no se instala).
+//     Ojo: algunas longitudes de ancla no coinciden con patterns.cpp (CharacterDestroy 31
+//     vs 32, CharacterDeath 28 vs 29, BuildingPlace 45 vs 44). Con 31/28 solo se recorta el
+//     texto, pero con 45 el std::string incluye el '\0' final y probablemente la búsqueda
+//     por subcadena de BuildingPlace nunca casa (sin verificar en runtime).
+// EN: Registers every Kenshi function and global the mod uses, binding each entry to the
+//     GameFunctions field that will receive the address. For each one: id, category,
+//     description, AOB pattern (patterns.h), anchor string + length, reference RVA
+//     (v1.0.68) and whether it is critical (if unresolved, its hook is not installed).
+//     Note: some anchor lengths differ from patterns.cpp (CharacterDestroy 31 vs 32,
+//     CharacterDeath 28 vs 29, BuildingPlace 45 vs 44). 31/28 just trim the text, but with
+//     45 the std::string includes the trailing '\0' and the BuildingPlace substring search
+//     probably never matches (not verified at runtime).
 void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
+    // ES: Helper para registrar una función (escribe en un void* de GameFunctions).
+    // EN: Helper to register a function (writes into a GameFunctions void*).
     auto reg = [&](const char* id, const char* cat, const char* desc,
                    const char* pat, const char* str, int strLen,
                    uint32_t rva, void** target, bool crit = false) {
@@ -123,6 +166,10 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         Register(std::move(e));
     };
 
+    // ES: Helper para registrar un puntero global (escribe en un uintptr_t de GameFunctions).
+    //     Nota: no se usa; los globales se registran a mano más abajo.
+    // EN: Helper to register a global pointer (writes into a GameFunctions uintptr_t).
+    //     Note: unused; the globals are registered by hand further below.
     auto regGlobal = [&](const char* id, const char* cat, const char* desc,
                          uint32_t rva, uintptr_t* target) {
         PatternEntry e;
@@ -135,6 +182,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         Register(std::move(e));
     };
 
+    // ES: Ciclo de vida de entidades (CharacterSpawn/Destroy son CRÍTICAS para el multijugador).
     // ── Entity Lifecycle ── (CharacterSpawn/Destroy are CRITICAL for multiplayer)
     reg("CharacterSpawn", "entity", "RootObjectFactory::process",
         patterns::CHARACTER_SPAWN, "[RootObjectFactory::process] Character", 38,
@@ -153,6 +201,8 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::CHARACTER_KO, "knockout", 8,
         0x00345C10, &funcs.CharacterKO);
 
+    // ES: Movimiento. CharacterMoveTo no tiene patrón (nullptr) y su ancla "pathfind" es
+    //     genérica; su RVA 0x2EF4E3 no está alineada, así que ResolveEntry la rechaza.
     // ── Movement ──
     reg("CharacterSetPosition", "movement", "HavokCharacter::setPosition",
         patterns::CHARACTER_SET_POSITION,
@@ -162,6 +212,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::CHARACTER_MOVE_TO, "pathfind", 8,
         0x002EF4E3, &funcs.CharacterMoveTo);
 
+    // ES: Combate (daño, ataque, muerte, salud, modificadores, artes marciales).
     // ── Combat ──
     reg("ApplyDamage", "combat", "Attack damage effect handler",
         patterns::APPLY_DAMAGE, "Attack damage effect", 20,
@@ -189,6 +240,11 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     // resuelva al AOB, PERO el hook DIAG de combate que lo usaba está deshabilitado
     // (combat_hooks.cpp) para no hookear una función UI por error. La orden real entra por
     // Tasker/GOAPTaskMgr (RVA sin resolver). NO tratar como dispatcher de órdenes.
+    // EN: IssueOrder NOT CONFIRMED — 0x722EF0 is UI/MyGUI (UString), NOT the player order
+    //     (REFUTED by byte-level RE 2026-06-18). The registration is kept so funcs.IssueOrder
+    //     resolves to the AOB, BUT the combat DIAG hook that used it is disabled
+    //     (combat_hooks.cpp) so a UI function is not hooked by mistake. The real order goes
+    //     through Tasker/GOAPTaskMgr (RVA unresolved). Do NOT treat it as an order dispatcher.
     reg("IssueOrder", "combat", "UI string builder (NO es IssueOrder — refutado)",
         patterns::ISSUE_ORDER, nullptr, 0,
         0x00722EF0, &funcs.IssueOrder);
@@ -200,6 +256,15 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     // Prólogo limpio (48 85 D2 0F 84 ...), NO mov rax,rsp → hookeable sin el fix MovRaxRsp.
     // AOB único en .text (1 match). El hook DIAG solo registra (no muta) para confirmar en
     // runtime si la orden del HOST entra y a QUÉ Tasker.
+    // EN: Tasker::pushOrder (0x674300) — DIAG-PUSHORDER (Phase 4). RE 2026-06-19 (byte level):
+    //     where the attack order ENTERS the platoon Tasker map (this = *(char+0x658
+    //     ActivePlatoon +0x98)). Confirmed chain: attackTarget 0x5CB0A0 -> enqueueCombatOrder
+    //     0x6744A0 (mode=4, after 2 isAlly gates) -> getTasker 0x791B10 (returns char+0x658)
+    //     -> [+0x98] -> pushOrder 0x674300 -> inserts node. Clean prologue (48 85 D2 0F 84 ...),
+    //     NOT mov rax,rsp. Unique AOB in .text (1 match). The DIAG hook only logs (no mutation)
+    //     to confirm at runtime whether the HOST order enters and into WHICH Tasker.
+    //     Note: no pattern is registered here (nullptr), so it resolves via the fixed RVA
+    //     validated by .pdata (TryHardcodedOffset).
     reg("PushOrder", "combat", "Tasker::pushOrder — inserta orden en el map del Tasker del platoon",
         nullptr, nullptr, 0,
         0x00674300, &funcs.PushOrder);
@@ -211,12 +276,22 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     // AOB de 32 bytes ÚNICO en .text (el prólogo corto de 18 daba 2 matches). Prólogo limpio
     // sin mov rax,rsp → hookeable sin el fix MovRaxRsp. Solo usa rcx/edx/r8 (verificado:
     // 0 usos de r9/args de pila en los 0x783 bytes de la función).
+    // EN: Character::addOrder "normal/replace" backend (0x5D1940) — DIAG-ADDORDER-BACKEND.
+    //     RE 2026-07-11/12: order VALIDATOR. If the arm check fails it returns true (order
+    //     "handled") WITHOUT queueing, so the attack/eat/carry order is silently swallowed with
+    //     the native bubble ("My arm is broken!" / "I can't carry anyone with this arm.").
+    //     If it passes it returns false and the order continues (Task -> queue 0x508380).
+    //     32-byte AOB UNIQUE in .text (the short 18-byte prologue gave 2 matches). Clean
+    //     prologue without mov rax,rsp. Only uses rcx/edx/r8 (verified: 0 uses of r9/stack
+    //     args in the function's 0x783 bytes).
     reg("AddOrderBackend", "combat",
         "Character::addOrder backend normal/replace — validador que traga órdenes (bool en al)",
         patterns::ADD_ORDER_BACKEND, nullptr, 0,
         0x005D1940, &funcs.AddOrderBackend);
     // ── Character::attackTarget (0x5CB0A0) — ya usada por el [AUTOTEST] vía RVA directa ──
     // Se registra también en GameFunctions para que el resto del mod la tenga resuelta.
+    // EN: Character::attackTarget (0x5CB0A0) — already used by [AUTOTEST] via direct RVA.
+    //     Also registered in GameFunctions so the rest of the mod has it resolved (fixed RVA).
     reg("AttackTarget", "combat", "Character::attackTarget — orden de ataque directa (encola mode=4)",
         nullptr, nullptr, 0,
         0x005CB0A0, &funcs.AttackTarget);
@@ -227,6 +302,13 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     // platoon y su Tasker (ActivePlatoon+0x98) queda huérfano (orden encolada pero NO consumida).
     // Prólogo estándar (48 89 5C 24 08 57) → hookeable/llamable sin el fix MovRaxRsp.
     // AOB único en .text (1 match): 48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 89 91 58 06 00 00
+    // EN: Character::setActivePlatoon (0x6213F0) — FIX-PLATOON (Phase 4). RE 2026-06-19 (byte
+    //     level, Steam 1.0.68): does the AI<->platoon REGISTRATION the mod's clone spawn SKIPS.
+    //     Writes [char+0x658]=platoon, loads AI=[char+0x650] and calls 0x506CC0, which sets
+    //     [AI+0x10]=platoon->me (=[platoon+0x78]). Without that the AI tick cannot find the
+    //     platoon and its Tasker (ActivePlatoon+0x98) is orphaned (order queued but NOT
+    //     consumed). Standard prologue (48 89 5C 24 08 57), hookable/callable without the fix.
+    //     The unique AOB is written in the comment but not registered (pattern nullptr).
     reg("SetActivePlatoon", "combat", "Character::setActivePlatoon — registro AI<->platoon (FIX-PLATOON)",
         nullptr, nullptr, 0,
         0x006213F0, &funcs.SetActivePlatoon);
@@ -238,6 +320,13 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     // el estado (contador de percepciones, currentTarget, AI+0x28) para localizar qué campo cambia
     // entre "host en frío" y "host tras golpear el muñeco de entrenamiento". SOLO lee/loguea, no muta.
     // Prólogo LIMPIO (40 53 48 83 EC 20 48 8B D9, sin mov rax,rsp) → hookeable sin el fix MovRaxRsp.
+    // EN: CombatClass::update(float) (0x60D650) — DIAG-COMBATSEED (diagnostics only). Mangled
+    //     ?update@CombatClass@@UEAAXM@Z: virtual, void, 1 float (dt in xmm1, this in rcx). It is
+    //     the CombatClass AI tick: consumes the perception array (CombatClass+0x208, counter
+    //     +0x200) to produce currentTarget (CombatClass+0x290) and trigger Task_MeleeAttack.
+    //     The DIAG-COMBATSEED hook (combat_hooks.cpp) instruments it ONLY for the HOST
+    //     CombatClass and logs the state to find which field changes between "cold host" and
+    //     "host after hitting the training dummy". Read/log only. CLEAN prologue.
     reg("CombatClassUpdate", "combat", "CombatClass::update(float) — AI tick de combate (DIAG-COMBATSEED)",
         nullptr, nullptr, 0,
         0x0060D650, &funcs.CombatClassUpdate);
@@ -248,7 +337,14 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     // RVA (inventory_hooks.cpp: Hook_BuyItem, sync de red + guard UAF fusionados) se instala sobre
     // funcs.BuyItem — no hace falta un segundo registro de la misma RVA bajo otro nombre. Registro
     // eliminado para quitar la doble etiqueta; funcs.BuyItem sigue resolviendo 0x74A630 igual que antes.
+    // EN: NOTE (2026-07-15): there used to be a "CombatTargetResolve" registration here for
+    //     RVA 0x0074A630, a DUPLICATE of the same address already registered as "BuyItem"
+    //     (below, "inventory" category, "buyItem" xref). Later RE confirmed 0x74A630 is BuyItem
+    //     (AI TRADE routine), not a combat target selector. The hook on that RVA
+    //     (inventory_hooks.cpp: Hook_BuyItem) is installed on funcs.BuyItem, so the duplicate
+    //     registration was removed; funcs.BuyItem still resolves 0x74A630 as before.
 
+    // ES: Mundo / zonas. Navmesh no tiene ancla (solo patrón o RVA).
     // ── World / Zones ──
     reg("ZoneLoad", "world", "Zone loading",
         patterns::ZONE_LOAD, "zone.%d.%d.zone", 15,
@@ -270,6 +366,12 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::SPAWN_CHECK, " tried to spawn inside walls!", 29,
         0x004FFAD0, &funcs.SpawnCheck);
 
+    // ES: Bypass de spawn de escuadrones (sacado de la RE de un mod de investigación): el
+    //     pipeline de spawn comprueba si debe generar escuadrones cerca del jugador; hookearlo
+    //     permitiría inyectar personajes de jugadores remotos por el pipeline natural del juego.
+    //     OJO: es una dirección a mitad de función (0x4FF47C, no alineada), así que
+    //     ResolveEntry la rechaza por patrón/RVA; y el patrón en línea tiene un "FF" de más
+    //     respecto a SPAWN_CHECK ("... 30 FF FF FF FF 48 81 EC"), probablemente una errata.
     // ── Squad Spawn Bypass (from research mod RE) ──
     // The squad spawning pipeline checks whether to spawn squads near the player.
     // Hooking this allows injecting remote player characters through the game's
@@ -279,6 +381,11 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         " tried to spawn inside walls!", 29,
         0x004FF47C, &funcs.SquadSpawnBypass);
 
+    // ES: Actualización de animación de personaje: se ejecuta para CADA personaje en cada
+    //     frame; el mod de investigación la usa para seguir a todos los personajes por nombre.
+    //     Patrón de GOG: mov rcx,[rbx+320]; mov [rbx+37C],sil. También es una dirección a
+    //     mitad de función (0x65F6C7, no alineada), así que el filtro de alineación de
+    //     ResolveEntry la rechaza por patrón/RVA.
     // Character animation update — fires for EVERY character each frame.
     // Research mod uses this to track all characters by name in real time.
     // Pattern from GOG: mov rcx,[rbx+320]; mov [rbx+37C],sil
@@ -287,6 +394,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         nullptr, 0,
         0x0065F6C7, &funcs.CharAnimUpdate);
 
+    // ES: Bucle de juego / tiempo (CRÍTICAS para el tick del multijugador).
     // ── Game Loop / Time ── (CRITICAL for multiplayer tick)
     reg("GameFrameUpdate", "core", "Main game frame tick",
         patterns::GAME_FRAME_UPDATE, "Kenshi 1.0.", 11,
@@ -295,6 +403,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::TIME_UPDATE, "timeScale", 9,
         0x00214B50, &funcs.TimeUpdate, true);
 
+    // ES: Guardar / cargar / estadísticas.
     // ── Save / Load ──
     reg("SaveGame", "save", "Save game function",
         patterns::SAVE_GAME, "quicksave", 9,
@@ -309,11 +418,16 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::CHARACTER_STATS, "CharacterStats_Attributes", 25,
         0x008BA700, &funcs.CharacterStats);
 
+    // ES: Escuadrón / platoon.
     // ── Squad / Platoon ──
     reg("SquadCreate", "squad", "Squad position reset / management",
         patterns::SQUAD_CREATE, "Reset squad positions", 21,
         0x00480B50, &funcs.SquadCreate);
 
+    // ES: SquadAddMember se resuelve por RTTI: función del slot 2 (+0x10) de la vtable de
+    //     ActivePlatoon. El ancla "delayedSpawningChecks" se quitó porque en Steam cae en otra
+    //     función. vtableClass admite varios candidatos separados por "|". La RVA 0x928423 no
+    //     está alineada, por lo que como RVA fija se rechazaría.
     // SquadAddMember: resolved via RTTI vtable scan.
     // The addMember function is at vtable slot 2 (offset +0x10) of the ActivePlatoon class.
     // String anchor "delayedSpawningChecks" is REMOVED — finds wrong function on Steam.
@@ -333,6 +447,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         Register(std::move(e));
     }
 
+    // ES: Inventario / objetos.
     // ── Inventory / Items ──
     reg("ItemPickup", "inventory", "Inventory addItem",
         patterns::ITEM_PICKUP, "addItem", 7,
@@ -344,11 +459,13 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::BUY_ITEM, "buyItem", 7,
         0x0074A630, &funcs.BuyItem);
 
+    // ES: Facción / diplomacia.
     // ── Faction / Diplomacy ──
     reg("FactionRelation", "faction", "Faction relation handler",
         patterns::FACTION_RELATION, "faction relation", 16,
         0x00872E00, &funcs.FactionRelation);
 
+    // ES: Sistema de IA (AICreate es CRÍTICA: hace falta para suprimir la IA de los remotos).
     // ── AI System ── (AICreate is CRITICAL — needed to suppress remote AI)
     reg("AICreate", "ai", "AI controller creation",
         patterns::AI_CREATE, "[AI::create] No faction for", 27,
@@ -357,6 +474,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::AI_PACKAGES, "AI packages", 11,
         0x00271620, &funcs.AIPackages);
 
+    // ES: Torretas / distancia.
     // ── Turret / Ranged ──
     reg("GunTurret", "combat", "Turret operation handler",
         patterns::GUN_TURRET, "gun turret", 10,
@@ -365,6 +483,7 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::GUN_TURRET_FIRE, nullptr, 0,
         0x0043CDB0, &funcs.GunTurretFire);
 
+    // ES: Gestión de edificios.
     // ── Building Management ──
     reg("BuildingDismantle", "building", "Building dismantle handler",
         patterns::BUILDING_DISMANTLE, "dismantle", 9,
@@ -376,6 +495,20 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         patterns::BUILDING_REPAIR, nullptr, 0,
         0x00555650, &funcs.BuildingRepair);
 
+    // ES: Punteros globales (PlayerBase es CRÍTICO para recorrer entidades). Tienen string
+    //     ancla para descubrirlos con FindGlobalNearString en GOG y Steam; las RVAs fijas son
+    //     respaldo. Posible problema (según el código, sin verificar en runtime): la fase 5
+    //     ejecuta TryStringXref también sobre globales, y como "CharacterStats_Attributes"
+    //     existe, PlayerBase podría quedar resuelto con la dirección de la FUNCIÓN que usa el
+    //     string (el filtro de alineación no se aplica a globales). RetryGlobalDiscovery lo
+    //     corregiría después al validar el valor.
+    // EN: Global pointers (PlayerBase is CRITICAL for entity iteration). They have anchor
+    //     strings to discover them via FindGlobalNearString on GOG and Steam; fixed RVAs are a
+    //     fallback. Possible issue (from reading the code, not verified at runtime): phase 5
+    //     runs TryStringXref on globals too, and since "CharacterStats_Attributes" exists,
+    //     PlayerBase could be resolved to the address of the FUNCTION using the string (the
+    //     alignment filter does not apply to globals). RetryGlobalDiscovery would fix it later
+    //     when validating the value.
     // ── Global Pointers ── (PlayerBase is CRITICAL for entity iteration)
     // NOTE: These have string anchors so the orchestrator can discover them
     // via FindGlobalNearString on BOTH GOG and Steam versions.
@@ -403,14 +536,30 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
         // NO hay que dereferenciar.
         // Historial de RVAs: 0x02133040 (erroneo) -> 0x02131020 (era de 1.0.65, daba NULL) ->
         // 0x02134110 (CORRECTO 1.0.68, verificado RTTI/xref).
+        // EN: RVA of the static GameWorld INSTANCE embedded in .data for Kenshi Steam 1.0.68.
+        //     Verified via RTTI + ctor/dtor + 513 binary xrefs: on 1.0.68 GameWorld is NOT a global
+        //     pointer (GameWorld* ou), it is the INSTANCE itself. So base+0x2134110 IS the GameWorld
+        //     object (its first qword is the .text vtable 0x1722608), no dereference needed.
+        //     RVA history: 0x02133040 (wrong) -> 0x02131020 (1.0.65 era, gave NULL) -> 0x02134110
+        //     (CORRECT 1.0.68, verified RTTI/xref).
         e.hardcodedRVA = 0x02134110; e.isGlobalPointer = true; e.critical = true;
         e.targetUintptr = &funcs.GameWorldSingleton;
+        // ES: Ancla "dayTime": según docs/03-scanner.md NO existe en la v1.0.68, así que el
+        //     descubrimiento por string de GameWorld no funciona en esa versión.
         // GameWorld is loaded by functions referencing time/speed/zone strings.
         e.stringAnchor = "dayTime";
         e.stringAnchorLen = 7;
         Register(std::move(e));
     }
 
+    // ES: Patrones ampliados: entradas "aspiracionales" de otros sistemas del juego registradas
+    //     solo con un string ancla (sin patrón, sin RVA y sin destino en GameFunctions). Con
+    //     anclas tan genéricas ("heal", "camp", "price"...) no resuelven nada útil hoy; son
+    //     ganchos para RE futuro y solo aparecen en el informe.
+    // EN: Expanded patterns: "aspirational" entries for other game systems registered with
+    //     only an anchor string (no pattern, no RVA and no GameFunctions target). With such
+    //     generic anchors ("heal", "camp", "price"...) they resolve nothing useful today; they
+    //     are hooks for future RE and only show up in the report.
     // ═══════════════════════════════════════════════════════════════════════
     //  EXPANDED PATTERNS — New game systems discovered via RE
     // ═══════════════════════════════════════════════════════════════════════
@@ -572,10 +721,19 @@ void PatternOrchestrator::RegisterBuiltinPatterns(GameFunctions& funcs) {
     spdlog::info("Orchestrator: Registered {} pattern entries", m_entries.size());
 }
 
+// ES: Métodos internos de resolución.
 // ═══════════════════════════════════════════════════════════════════════════
 //  INTERNAL RESOLUTION METHODS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Marca una entrada como resuelta y escribe la dirección en su destino. Filtro de
+//     alineación: una FUNCIÓN resuelta por patrón, string o RVA fija que no esté alineada a
+//     16 se rechaza (probable acierto a mitad de función) y se deja sin resolver para que lo
+//     intenten fases posteriores. No aplica a globales ni a vtable/complex/callgraph.
+// EN: Marks an entry as resolved and writes the address into its target. Alignment
+//     filter: a FUNCTION resolved by pattern, string or fixed RVA that is not 16-byte
+//     aligned is rejected (likely mid-function hit) and left unresolved so later phases can
+//     try. Does not apply to globals nor to vtable/complex/callgraph.
 void PatternOrchestrator::ResolveEntry(PatternEntry& entry, uintptr_t address,
                                         ResolutionMethod method, float confidence) {
     // MSVC x64 functions are 16-byte aligned. A non-aligned address from pattern scan
@@ -607,6 +765,10 @@ void PatternOrchestrator::ResolveEntry(PatternEntry& entry, uintptr_t address,
                  entry.id, address, ResolutionMethodName(method), confidence * 100);
 }
 
+// ES: Resolución por patrón AOB (primera coincidencia, confianza 1.0). Nota: devuelve true
+//     aunque ResolveEntry haya rechazado la dirección por alineación.
+// EN: AOB pattern resolution (first match, confidence 1.0). Note: returns true even if
+//     ResolveEntry rejected the address because of alignment.
 bool PatternOrchestrator::TryPatternScan(PatternEntry& entry) {
     if (!entry.pattern) return false;
     auto result = m_scanner.Find(entry.pattern);
@@ -615,6 +777,14 @@ bool PatternOrchestrator::TryPatternScan(PatternEntry& entry) {
     return true;
 }
 
+// ES: Resolución por string: estrategia 1 = funciones que referencian el string según la
+//     base de xrefs del StringAnalyzer (toma la primera, 0.85); estrategia 2 = buscar el
+//     string y usar la función de su primer xref (0.8) o, si .pdata no la mapea,
+//     retroceder hasta el prólogo (0.7). La búsqueda es por subcadena.
+// EN: String resolution: strategy 1 = functions referencing the string according to the
+//     StringAnalyzer xref database (takes the first, 0.85); strategy 2 = find the string
+//     and use its first xref's function (0.8) or, if .pdata cannot map it, walk back to
+//     the prologue (0.7). The search is by substring.
 bool PatternOrchestrator::TryStringXref(PatternEntry& entry) {
     if (!entry.stringAnchor || entry.stringAnchorLen <= 0) return false;
 
@@ -665,6 +835,10 @@ bool PatternOrchestrator::TryStringXref(PatternEntry& entry) {
     return false;
 }
 
+// ES: Resolución por vtable: prueba cada clase candidata ("A|B|C") y toma la función del
+//     slot indicado en la primera clase que exista (confianza 0.9).
+// EN: Vtable resolution: tries each candidate class ("A|B|C") and takes the function in
+//     the given slot of the first class that exists (confidence 0.9).
 bool PatternOrchestrator::TryVTableSlot(PatternEntry& entry) {
     if (entry.vtableClass.empty() || entry.vtableSlot < 0) return false;
 
@@ -691,6 +865,16 @@ bool PatternOrchestrator::TryVTableSlot(PatternEntry& entry) {
     return false;
 }
 
+// ES: Resolución por RVA fija (base + hardcodedRVA). Globales: se aceptan si el valor es 0
+//     (partida sin cargar, 0.5) o un puntero legible con doble desreferencia (0.95).
+//     Funciones: SEGURIDAD — si la entrada tiene patrón y el patrón falló, el binario es
+//     otro (p.ej. Steam vs GOG) y la RVA apuntaría a otra función -> NO se acepta. Sin
+//     patrón, solo se acepta si .pdata confirma que es inicio de función (0.6).
+// EN: Fixed RVA resolution (base + hardcodedRVA). Globals: accepted if the value is 0
+//     (game not loaded, 0.5) or a readable pointer with double dereference (0.95).
+//     Functions: SAFETY — if the entry has a pattern and the pattern failed, the binary is
+//     different (e.g. Steam vs GOG) and the RVA would point to another function -> NOT
+//     accepted. Without a pattern, only accepted if .pdata confirms a function start (0.6).
 bool PatternOrchestrator::TryHardcodedOffset(PatternEntry& entry) {
     if (entry.hardcodedRVA == 0) return false;
     uintptr_t addr = m_scanner.GetBase() + entry.hardcodedRVA;
@@ -722,6 +906,7 @@ bool PatternOrchestrator::TryHardcodedOffset(PatternEntry& entry) {
         return false;
     }
 
+    // ES: No fiarse a ciegas de RVAs fijas (ver explicación en inglés abajo).
     // ═══ SAFETY: Don't blindly trust GOG hardcoded RVAs on Steam ═══
     // Hardcoded RVAs are version-specific (GOG v1.0.68). On Steam, these addresses
     // point to DIFFERENT functions. If we have a pattern for this function and the
@@ -739,6 +924,7 @@ bool PatternOrchestrator::TryHardcodedOffset(PatternEntry& entry) {
         return false;
     }
 
+    // ES: Sin patrón: validación más débil con .pdata.
     // No pattern available — validate via .pdata as a weaker check
     auto* func = m_pdata.FindFunction(addr);
     if (func) {
@@ -751,6 +937,8 @@ bool PatternOrchestrator::TryHardcodedOffset(PatternEntry& entry) {
     return false;
 }
 
+// ES: Resolución por patrón compuesto (ancla + componentes) con el motor de escaneo.
+// EN: Composite pattern resolution (anchor + components) via the scan engine.
 bool PatternOrchestrator::TryComplexPattern(PatternEntry& entry) {
     if (entry.complexPattern.components.empty()) return false;
     auto result = m_scanner.FindComplex(entry.complexPattern);
@@ -759,6 +947,10 @@ bool PatternOrchestrator::TryComplexPattern(PatternEntry& entry) {
     return true;
 }
 
+// ES: "Grafo de llamadas": en realidad solo busca una función etiquetada por strings cuyo
+//     nombre coincida con el id de la entrada (confianza 0.6); no recorre el grafo.
+// EN: "Call graph": it actually just looks for a string-labeled function whose name
+//     matches the entry id (confidence 0.6); it does not walk the graph.
 bool PatternOrchestrator::TryCallGraphTrace(PatternEntry& entry) {
     if (!entry.stringAnchor) return false;
 
@@ -773,10 +965,19 @@ bool PatternOrchestrator::TryCallGraphTrace(PatternEntry& entry) {
     return false;
 }
 
+// ES: Retroceso hasta el prólogo.
 // ═══════════════════════════════════════════════════════════════════════════
 //  PROLOGUE WALK-BACK
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Retrocede desde una dirección de código hasta el inicio de la función. Estrategia 1:
+//     buscar padding CC y comprobar que lo siguiente parece un prólogo MSVC conocido.
+//     Estrategia 2: probar direcciones alineadas a 16 con 'mov rax,rsp' o 'push REX'.
+//     Nota: usa la base del módulo como límite inferior, no el inicio de .text.
+// EN: Walks back from a code address to the function start. Strategy 1: look for CC
+//     padding and check that what follows looks like a known MSVC prologue. Strategy 2:
+//     try 16-byte aligned addresses with 'mov rax,rsp' or 'push REX'. Note: it uses the
+//     module base as lower bound, not the start of .text.
 uintptr_t PatternOrchestrator::WalkBackToPrologue(uintptr_t codeAddr, int maxDistance) const {
     // Walk backwards from a code address looking for common x64 function prologues.
     // Kenshi (MSVC-compiled) uses these consistently:
@@ -798,6 +999,7 @@ uintptr_t PatternOrchestrator::WalkBackToPrologue(uintptr_t codeAddr, int maxDis
     uintptr_t searchStart = codeAddr - maxDistance;
     if (searchStart < textBase) searchStart = textBase;
 
+    // ES: Estrategia 1: padding CC -> inicio de función con prólogo reconocido.
     // Strategy 1: Walk back looking for CC padding → function start
     for (uintptr_t addr = codeAddr - 1; addr >= searchStart; addr--) {
         uint8_t byte = 0;
@@ -824,6 +1026,7 @@ uintptr_t PatternOrchestrator::WalkBackToPrologue(uintptr_t codeAddr, int maxDis
         }
     }
 
+    // ES: Estrategia 2: direcciones alineadas a 16 con prólogo típico.
     // Strategy 2: Walk back checking for prologue patterns at aligned addresses
     // Functions are often (but not always) 16-byte aligned
     for (uintptr_t addr = codeAddr & ~0xF; addr >= searchStart; addr -= 16) {
@@ -838,16 +1041,26 @@ uintptr_t PatternOrchestrator::WalkBackToPrologue(uintptr_t codeAddr, int maxDis
     return 0;
 }
 
+// ES: Búsqueda directa de string (respaldo de emergencia).
 // ═══════════════════════════════════════════════════════════════════════════
 //  DIRECT STRING SEARCH (emergency fallback)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Emergencia (fase 8): busca el string byte a byte en .rdata, luego un LEA
+//     RIP-relativo (48 8D / 4C 8D) en .text que lo referencie y retrocede hasta el prólogo.
+//     Como alternativa usa .pdata, pero con FindFunction (inicio exacto) sobre la dirección
+//     del LEA, que casi nunca coincidirá; FindContaining sería lo esperable.
+// EN: Emergency (phase 8): searches the string byte by byte in .rdata, then a RIP-relative
+//     LEA (48 8D / 4C 8D) in .text referencing it, and walks back to the prologue. As an
+//     alternative it uses .pdata, but with FindFunction (exact start) on the LEA address,
+//     which will almost never match; FindContaining would be the expected call.
 bool PatternOrchestrator::TryDirectStringSearch(PatternEntry& entry) {
     if (!entry.stringAnchor || entry.stringAnchorLen <= 0) return false;
 
     uintptr_t moduleBase = m_scanner.GetBase();
     size_t moduleSize = m_scanner.GetSize();
 
+    // ES: Paso 1: localizar el string en .rdata.
     // Step 1: Find the string in .rdata by scanning for its bytes
     const auto* rdata = m_scanner.FindSection(".rdata");
     if (!rdata) return false;
@@ -877,6 +1090,7 @@ bool PatternOrchestrator::TryDirectStringSearch(PatternEntry& entry) {
 
     spdlog::info("  DirectStringSearch '{}': string found at 0x{:X}", entry.id, stringAddr);
 
+    // ES: Paso 2: buscar en .text un LEA que lo referencie.
     // Step 2: Scan .text for LEA instructions that reference this string
     // LEA reg, [rip+disp32] = 48 8D xx yy yy yy yy (7 bytes)
     // or without REX: 8D xx yy yy yy yy (6 bytes)
@@ -943,10 +1157,19 @@ bool PatternOrchestrator::TryDirectStringSearch(PatternEntry& entry) {
     return false;
 }
 
+// ES: RVA validada por prólogo (respaldo de emergencia para funciones críticas).
 // ═══════════════════════════════════════════════════════════════════════════
 //  PROLOGUE-VALIDATED RVA (emergency fallback for critical functions)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Emergencia (fase 8): acepta la RVA fija si los 4 primeros bytes parecen un prólogo
+//     (confianza 0.55). Ojo: a diferencia de TryHardcodedOffset, NO comprueba si existe un
+//     patrón que haya fallado, así que en un binario distinto podría aceptar una función
+//     equivocada que empiece por un prólogo típico.
+// EN: Emergency (phase 8): accepts the fixed RVA if the first 4 bytes look like a
+//     prologue (confidence 0.55). Note: unlike TryHardcodedOffset it does NOT check whether
+//     a pattern exists and failed, so on a different binary it could accept a wrong
+//     function that starts with a typical prologue.
 bool PatternOrchestrator::TryPrologueValidatedRVA(PatternEntry& entry) {
     if (entry.hardcodedRVA == 0) return false;
 
@@ -982,15 +1205,20 @@ bool PatternOrchestrator::TryPrologueValidatedRVA(PatternEntry& entry) {
     return true;
 }
 
+// ES: Fases del pipeline.
 // ═══════════════════════════════════════════════════════════════════════════
 //  PIPELINE PHASES
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Milisegundos transcurridos desde 'start'.
+// EN: Milliseconds elapsed since 'start'.
 double PatternOrchestrator::ElapsedMs(TimePoint start) const {
     auto end = Clock::now();
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+// ES: Fase 1: enumerar .pdata (límites de función autoritativos).
+// EN: Phase 1: enumerate .pdata (authoritative function boundaries).
 void PatternOrchestrator::RunPhase1_PData() {
     if (!m_config.enablePData) return;
     auto start = Clock::now();
@@ -1004,6 +1232,8 @@ void PatternOrchestrator::RunPhase1_PData() {
                  m_lastReport.pdataFunctions, m_lastReport.timing.pdata);
 }
 
+// ES: Fase 2: descubrir strings, resolver sus xrefs y etiquetar funciones.
+// EN: Phase 2: discover strings, resolve their xrefs and label functions.
 void PatternOrchestrator::RunPhase2_Strings() {
     if (!m_config.enableStrings) return;
     auto start = Clock::now();
@@ -1028,6 +1258,10 @@ void PatternOrchestrator::RunPhase2_Strings() {
                  m_lastReport.labeledFunctions, m_lastReport.timing.strings);
 }
 
+// ES: Fase 3: escanear vtables/RTTI y volcar al log las clases de platoon/squad/active
+//     (diagnóstico para localizar SquadAddMember).
+// EN: Phase 3: scan vtables/RTTI and log platoon/squad/active classes (diagnostics to
+//     locate SquadAddMember).
 void PatternOrchestrator::RunPhase3_VTables() {
     if (!m_config.enableVTables) return;
     auto start = Clock::now();
@@ -1061,6 +1295,11 @@ void PatternOrchestrator::RunPhase3_VTables() {
                  m_lastReport.vtablesFound, m_lastReport.timing.vtables);
 }
 
+// ES: Fase 4: escaneo por lotes (una sola pasada por .text) de todos los patrones
+//     pendientes. Nota: el contador resolvedByPattern sube aunque ResolveEntry rechace la
+//     dirección por alineación.
+// EN: Phase 4: batch scan (single pass over .text) of all pending patterns. Note: the
+//     resolvedByPattern counter increases even if ResolveEntry rejects the address.
 void PatternOrchestrator::RunPhase4_PatternScan() {
     if (!m_config.enableBatchScan) return;
     auto start = Clock::now();
@@ -1105,6 +1344,12 @@ void PatternOrchestrator::RunPhase4_PatternScan() {
                  m_lastReport.resolvedByPattern, m_lastReport.timing.patternScan);
 }
 
+// ES: Fase 5: para lo que siga sin resolver, prueba en orden string, vtable, RVA fija y
+//     patrón compuesto. Nota: si un método devuelve true pero ResolveEntry rechazó la
+//     dirección, se pasa a la siguiente entrada sin probar los demás métodos.
+// EN: Phase 5: for anything still unresolved, tries string, vtable, fixed RVA and
+//     composite pattern in order. Note: if a method returns true but ResolveEntry rejected
+//     the address, it moves on to the next entry without trying the remaining methods.
 void PatternOrchestrator::RunPhase5_StringFallback() {
     auto start = Clock::now();
 
@@ -1145,6 +1390,10 @@ void PatternOrchestrator::RunPhase5_StringFallback() {
                  m_lastReport.timing.stringFallback);
 }
 
+// ES: Fase 6: construye el grafo (completo o solo de lo resuelto), propaga etiquetas y
+//     prueba TryCallGraphTrace con lo que quede.
+// EN: Phase 6: builds the graph (full or only resolved functions), propagates labels
+//     and tries TryCallGraphTrace on what remains.
 void PatternOrchestrator::RunPhase6_CallGraph() {
     if (!m_config.enableCallGraph) return;
     auto start = Clock::now();
@@ -1189,6 +1438,10 @@ void PatternOrchestrator::RunPhase6_CallGraph() {
                  m_lastReport.resolvedByCallGraph, m_lastReport.timing.callGraph);
 }
 
+// ES: Escáner con SEH para descubrir punteros globales (separado de RunPhase7 por el error
+//     C2712). Busca en el código de una función MOV/LEA reg,[RIP+disp32] hacia .data (o
+//     cualquier zona del módulo que no sea .text ni .rdata) y acepta el primer destino cuyo
+//     valor sea 0 (partida sin cargar) o un puntero de heap con vtable dentro del módulo.
 // SEH-safe code scanner for global pointer discovery (extracted from RunPhase7 to avoid C2712).
 // Scans function code bytes for RIP-relative MOV/LEA instructions targeting .data section.
 // Uses raw pointer validation instead of std::function to allow __try.
@@ -1259,6 +1512,16 @@ static bool SEH_ScanCodeForGlobalPtr(
     return false;
 }
 
+// ES: Fase 7: (7a) para globales sin resolver con string ancla, busca las funciones que
+//     referencian el string y escanea su código buscando el global; (7b) valida los
+//     globales ya resueltos (heap + vtable). Nota: con la instancia embebida de GameWorld
+//     (1.0.68) el valor leído es la vtable (dentro del módulo), así que 7b la marca como
+//     "sospechosa" (confianza 0.2) aunque sea correcta.
+// EN: Phase 7: (7a) for unresolved globals with an anchor string, finds the functions
+//     referencing the string and scans their code for the global; (7b) validates already
+//     resolved globals (heap + vtable). Note: with the embedded GameWorld instance (1.0.68)
+//     the value read is the vtable (inside the module), so 7b flags it as "suspicious"
+//     (confidence 0.2) even though it is correct.
 void PatternOrchestrator::RunPhase7_GlobalPointers() {
     auto start = Clock::now();
 
@@ -1267,6 +1530,8 @@ void PatternOrchestrator::RunPhase7_GlobalPointers() {
     uintptr_t moduleBase = m_scanner.GetBase();
     size_t moduleSize = m_scanner.GetSize();
 
+    // ES: ¿Parece válido el global? (valor 0 aceptado solo si allowNull; si no, puntero de
+    //     heap cuya vtable apunte al módulo). Nota: esta lambda no se usa en la función.
     // Helper: check if a .data address looks like a valid global singleton pointer.
     // During init the value may be 0 (game not loaded) — accept 0 as tentative.
     // After game load, the value should be a heap-allocated object with a vtable.
@@ -1288,6 +1553,7 @@ void PatternOrchestrator::RunPhase7_GlobalPointers() {
         return true;
     };
 
+    // ES: Fase 7a: descubrimiento de globales vía xref de strings.
     // ── Phase 7a: Discover unresolved global pointers via string xref ──
     // For global pointer entries that have a stringAnchor but weren't resolved
     // by hardcoded RVA (Phase 5), find the function referencing the string,
@@ -1359,6 +1625,7 @@ void PatternOrchestrator::RunPhase7_GlobalPointers() {
         }
     }
 
+    // ES: Fase 7b: validación de los globales ya resueltos (ajusta la confianza).
     // ── Phase 7b: Validate existing global pointers ──
     for (auto& entry : m_entries) {
         if (!entry.isGlobalPointer || !entry.isResolved) continue;
@@ -1393,6 +1660,10 @@ void PatternOrchestrator::RunPhase7_GlobalPointers() {
     m_lastReport.timing.globalPtrs = ElapsedMs(start);
 }
 
+// ES: Fase 8: emergencia solo para entradas CRÍTICAS aún sin resolver: búsqueda directa
+//     del string y, si falla, RVA fija validada por prólogo. Si tampoco, su hook no se instala.
+// EN: Phase 8: emergency only for CRITICAL entries still unresolved: direct string search
+//     and, if that fails, prologue-validated fixed RVA. Otherwise its hook is not installed.
 void PatternOrchestrator::RunPhase8_EmergencyCritical() {
     // Emergency resolution for critical patterns that survived all 7 phases unresolved.
     // Uses aggressive fallbacks that are slower but more portable:
@@ -1434,10 +1705,13 @@ void PatternOrchestrator::RunPhase8_EmergencyCritical() {
     }
 }
 
+// ES: Pipeline completo.
 // ═══════════════════════════════════════════════════════════════════════════
 //  FULL PIPELINE
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Ejecuta las 8 fases en orden, calcula el informe final (resueltas/fallidas) y lo loguea.
+// EN: Runs the 8 phases in order, builds the final report (resolved/failed) and logs it.
 OrchestratorReport PatternOrchestrator::Run() {
     if (!m_initialized) {
         spdlog::error("Orchestrator: Not initialized — call Init() first");
@@ -1477,10 +1751,15 @@ OrchestratorReport PatternOrchestrator::Run() {
     return m_lastReport;
 }
 
+// ES: Reintentos.
 // ═══════════════════════════════════════════════════════════════════════════
 //  RETRY
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Reintenta todas las entradas sin resolver (hasta maxRetries por entrada) con todos
+//     los métodos. Útil tras cargar partida.
+// EN: Retries every unresolved entry (up to maxRetries each) with all methods. Useful
+//     after a game load.
 int PatternOrchestrator::RetryFailed() {
     int resolved = 0;
     for (auto& entry : m_entries) {
@@ -1498,6 +1777,8 @@ int PatternOrchestrator::RetryFailed() {
     return resolved;
 }
 
+// ES: Reintenta una entrada concreta por id.
+// EN: Retries a single entry by id.
 bool PatternOrchestrator::RetryEntry(const std::string& id) {
     auto* entry = GetMutableEntry(id);
     if (!entry || entry->isResolved) return false;
@@ -1508,10 +1789,13 @@ bool PatternOrchestrator::RetryEntry(const std::string& id) {
            TryComplexPattern(*entry) || TryCallGraphTrace(*entry);
 }
 
+// ES: API de consultas.
 // ═══════════════════════════════════════════════════════════════════════════
 //  QUERY API
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Dirección, estado, método y confianza por id; número de entradas resueltas.
+// EN: Address, state, method and confidence by id; number of resolved entries.
 uintptr_t PatternOrchestrator::GetAddress(const std::string& id) const {
     auto* entry = GetEntry(id);
     return entry ? entry->resolvedAddress : 0;
@@ -1540,10 +1824,16 @@ int PatternOrchestrator::CountResolved() const {
     return count;
 }
 
+// ES: Funciones etiquetadas por el análisis de strings.
+// EN: Functions labeled by the string analysis.
 const std::vector<LabeledFunction>& PatternOrchestrator::GetDiscoveredFunctions() const {
     return m_strings.GetLabeledFunctions();
 }
 
+// ES: Busca una función por nombre: entradas registradas, luego etiquetas de strings y
+//     por último el slot 0 de la vtable de una clase con ese nombre.
+// EN: Finds a function by name: registered entries, then string labels and finally slot 0
+//     of the vtable of a class with that name.
 uintptr_t PatternOrchestrator::FindFunction(const std::string& name) const {
     // Check registered entries first
     auto* entry = GetEntry(name);
@@ -1560,14 +1850,19 @@ uintptr_t PatternOrchestrator::FindFunction(const std::string& name) const {
     return 0;
 }
 
+// ES: Strings que referencia una función.
+// EN: Strings referenced by a function.
 std::vector<std::string> PatternOrchestrator::GetFunctionStrings(uintptr_t addr) const {
     return m_strings.GetFunctionStrings(addr);
 }
 
+// ES: Informes.
 // ═══════════════════════════════════════════════════════════════════════════
 //  REPORTING
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Último informe generado / volcado del informe al log.
+// EN: Last generated report / report dump to the log.
 OrchestratorReport PatternOrchestrator::GenerateReport() const {
     return m_lastReport;
 }

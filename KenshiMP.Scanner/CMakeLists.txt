@@ -1,3 +1,9 @@
+# ES: KenshiMP.Scanner: librería estática que analiza kenshi_x64.exe en memoria (patrones AOB,
+#     cadenas, vtables, .pdata, grafo de llamadas) para resolver direcciones de funciones del
+#     juego, y gestiona los hooks con MinHook. dbghelp se usa para símbolos/volcados.
+# EN: KenshiMP.Scanner: static library that analyzes kenshi_x64.exe in memory (AOB patterns,
+#     strings, vtables, .pdata, call graph) to resolve game function addresses, and manages
+#     hooks with MinHook. dbghelp is used for symbols/dumps.
 add_library(KenshiMP.Scanner STATIC
     src/scanner.cpp
     src/scanner_engine.cpp

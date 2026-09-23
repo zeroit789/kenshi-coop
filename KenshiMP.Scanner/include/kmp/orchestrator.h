@@ -1,4 +1,21 @@
+// ES: orchestrator.h — PatternOrchestrator, el "camino A" para resolver en runtime las
+//     direcciones de funciones y globales de kenshi_x64.exe. Mantiene un registro de
+//     entradas (una por función/puntero a descubrir) y ejecuta un pipeline de fases:
+//     1 .pdata, 2 strings+xrefs, 3 vtables/RTTI, 4 escaneo AOB por lotes, 5 fallbacks
+//     (string, vtable, RVA fija, patrón complejo), 6 grafo de llamadas, 7 punteros globales
+//     y 8 emergencia para entradas críticas. Cada entrada guarda método y confianza, y al
+//     resolverse escribe la dirección en el campo correspondiente de GameFunctions.
+//     (El comentario en inglés de abajo solo enumera 7 fases; existe también la fase 8.)
+// EN: orchestrator.h — PatternOrchestrator, "path A" to resolve at runtime the addresses
+//     of kenshi_x64.exe functions and globals. It keeps a registry of entries (one per
+//     function/pointer to discover) and runs a phase pipeline: 1 .pdata, 2 strings+xrefs,
+//     3 vtables/RTTI, 4 batch AOB scan, 5 fallbacks (string, vtable, fixed RVA, complex
+//     pattern), 6 call graph, 7 global pointers and 8 emergency for critical entries. Each
+//     entry stores method and confidence and, once resolved, writes the address into the
+//     matching GameFunctions field. (The English comment below only lists 7 phases;
+//     phase 8 also exists.)
 #pragma once
+// ES: Orquestador de patrones (descripción original en inglés abajo).
 // Pattern Orchestrator — Central Intelligence for Game Reverse Engineering
 //
 // Manages all discovery phases in a pipeline:
@@ -33,10 +50,13 @@
 
 namespace kmp {
 
+// ES: Entrada de patrón: una función o puntero a descubrir.
 // ═══════════════════════════════════════════════════════════════════════════
 //  PATTERN ENTRY — A single function/pointer to discover
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Método con el que se resolvió una entrada: patrón AOB, xref de string, slot de
+//     vtable, grafo de llamadas, RVA fija (depende de versión), .pdata, patrón complejo o manual.
 enum class ResolutionMethod {
     None,
     PatternScan,        // IDA-style byte pattern match
@@ -49,14 +69,24 @@ enum class ResolutionMethod {
     Manual,             // Manually set by user code
 };
 
+// ES: Nombre legible del método (para logs).
+// EN: Human-readable method name (for logs).
 const char* ResolutionMethodName(ResolutionMethod method);
 
+// ES: Una entrada del registro: identidad, cómo intentar resolverla (patrón AOB, string
+//     ancla, RVA fija, clase+slot de vtable, patrón complejo), estado de la resolución y
+//     dónde escribir el resultado (puntero en GameFunctions).
+// EN: A registry entry: identity, how to try to resolve it (AOB pattern, anchor string,
+//     fixed RVA, vtable class+slot, complex pattern), resolution state and where to write
+//     the result (pointer inside GameFunctions).
 struct PatternEntry {
     // ── Identity ──
     std::string id;                 // Unique identifier (e.g., "CharacterSpawn")
     std::string category;           // Category (e.g., "entity", "combat", "ai")
     std::string description;        // Human-readable description
 
+    // ES: Configuración de resolución. hardcodedRVA = dirección relativa a la base del módulo
+    //     para la versión conocida (0 = desconocida); solo se usa como último recurso.
     // ── Resolution Config ──
     const char* pattern         = nullptr;  // IDA byte pattern (can be nullptr)
     const char* stringAnchor    = nullptr;  // Fallback string to search for
@@ -68,6 +98,8 @@ struct PatternEntry {
     // ── Complex pattern support ──
     ComplexPattern complexPattern;
 
+    // ES: Estado: dirección resuelta, método, confianza, si es puntero global, si es crítica
+    //     (activa fallbacks agresivos) y reintentos.
     // ── Resolution State ──
     uintptr_t       resolvedAddress = 0;
     ResolutionMethod resolvedMethod  = ResolutionMethod::None;
@@ -77,13 +109,18 @@ struct PatternEntry {
     bool            critical        = false; // Must-resolve: enables aggressive fallbacks
     int             retryCount      = 0;
 
+    // ES: Destino donde escribir la dirección resuelta (función o puntero global).
     // ── Target pointer (for GameFunctions integration) ──
     void**          targetPtr       = nullptr;    // If set, writes resolved address here
     uintptr_t*      targetUintptr   = nullptr;    // For global pointers
 
+    // ES: ¿Falta por resolver?
+    // EN: Still unresolved?
     bool NeedsResolution() const { return !isResolved; }
 };
 
+// ES: Configuración del orquestador: qué fases activar, longitud mínima de string,
+//     profundidad de propagación, reintentos y opciones de rendimiento.
 // ═══════════════════════════════════════════════════════════════════════════
 //  ORCHESTRATOR CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -105,6 +142,8 @@ struct OrchestratorConfig {
     bool fullCallGraph      = false; // Full graph vs targeted graph
 };
 
+// ES: Informe: tiempos por fase, recuento por método de resolución, estadísticas de
+//     descubrimiento y lista de entradas fallidas.
 // ═══════════════════════════════════════════════════════════════════════════
 //  ORCHESTRATOR REPORT
 // ═══════════════════════════════════════════════════════════════════════════
@@ -146,19 +185,27 @@ struct OrchestratorReport {
     std::vector<std::string> failedEntries;
 };
 
+// ES: El orquestador.
 // ═══════════════════════════════════════════════════════════════════════════
 //  THE ORCHESTRATOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Coordina todos los analizadores (escáner, .pdata, strings, vtables, grafo).
+// EN: Coordinates all the analyzers (scanner, .pdata, strings, vtables, graph).
 class PatternOrchestrator {
 public:
     PatternOrchestrator() = default;
 
+    // ES: Inicializa el motor de escaneo para el módulo y guarda la configuración.
     // ── Initialization ──
     bool Init(const char* moduleName = nullptr, const OrchestratorConfig& config = {});
 
     // ── Pattern Registry ──
 
+    // ES: Registro de patrones: añadir entrada, registrar todas las de Kenshi (enlazadas a
+    //     los campos de GameFunctions), quitar, consultar y filtrar por categoría.
+    // EN: Pattern registry: add entry, register all Kenshi built-ins (bound to GameFunctions
+    //     fields), remove, query and filter by category.
     // Register a pattern entry for discovery
     void Register(PatternEntry entry);
 
@@ -180,6 +227,8 @@ public:
 
     // ── Execution ──
 
+    // ES: Ejecución: pipeline completo (Run) o fases sueltas, y reintentos de las fallidas.
+    // EN: Execution: full pipeline (Run) or single phases, and retries of failed entries.
     // Run the full discovery pipeline
     OrchestratorReport Run();
 
@@ -201,6 +250,8 @@ public:
 
     // ── Query API ──
 
+    // ES: Consultas por id: dirección, si está resuelta, método, confianza y recuentos.
+    // EN: Queries by id: address, resolved flag, method, confidence and counts.
     // Resolve a single address by ID
     uintptr_t GetAddress(const std::string& id) const;
 
@@ -217,6 +268,8 @@ public:
     int CountResolved() const;
     int CountTotal() const { return static_cast<int>(m_entries.size()); }
 
+    // ES: Acceso a los componentes internos (solo lectura y mutable).
+    // EN: Access to the internal components (read-only and mutable).
     // ── Component Access ──
     const ScannerEngine&     GetScanner()       const { return m_scanner; }
     const PDataEnumerator&   GetPData()         const { return m_pdata; }
@@ -231,6 +284,10 @@ public:
     VTableScanner&     GetMutableVTables()  { return m_vtables; }
     CallGraphAnalyzer& GetMutableCallGraph() { return m_callGraph; }
 
+    // ES: Informe y funciones descubiertas más allá del registro (por strings), búsqueda de
+    //     funciones por nombre y strings de una función.
+    // EN: Report and functions discovered beyond the registry (via strings), function lookup
+    //     by name and strings of a function.
     // ── Reporting ──
     OrchestratorReport GenerateReport() const;
     void LogReport(const OrchestratorReport& report) const;
@@ -246,6 +303,8 @@ public:
     std::vector<std::string> GetFunctionStrings(uintptr_t addr) const;
 
 private:
+    // ES: Componentes, entradas con índice id -> posición, último informe y estado.
+    // EN: Components, entries with id -> index map, last report and state.
     OrchestratorConfig  m_config;
     ScannerEngine       m_scanner;
     PDataEnumerator     m_pdata;
@@ -259,11 +318,17 @@ private:
     OrchestratorReport m_lastReport;
     bool m_initialized = false;
 
+    // ES: Medición de tiempos.
+    // EN: Timing helper.
     // Timing helper
     using Clock = std::chrono::high_resolution_clock;
     using TimePoint = Clock::time_point;
     double ElapsedMs(TimePoint start) const;
 
+    // ES: Métodos internos de resolución (uno por estrategia) y ResolveEntry, que aplica el
+    //     filtro de alineación y escribe el resultado en el destino.
+    // EN: Internal resolution methods (one per strategy) and ResolveEntry, which applies the
+    //     alignment filter and writes the result to the target.
     // Internal resolution methods
     bool TryPatternScan(PatternEntry& entry);
     bool TryStringXref(PatternEntry& entry);
@@ -276,6 +341,8 @@ private:
     void ResolveEntry(PatternEntry& entry, uintptr_t address,
                       ResolutionMethod method, float confidence);
 
+    // ES: Retrocede desde una dirección de código hasta el inicio de la función (padding CC
+    //     y prólogos MSVC conocidos).
     // Walk backwards from a code address to find the function start
     uintptr_t WalkBackToPrologue(uintptr_t codeAddr, int maxDistance = 4096) const;
 };

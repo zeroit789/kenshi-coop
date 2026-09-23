@@ -1,4 +1,17 @@
+// ES: safe_hook.h — envoltorios SEH para llamar al trampolín (función original) desde
+//     los hooks. Cada llamada va dentro de __try/__except: si la firma que suponemos es
+//     incorrecta (número o tipo de parámetros) o la original revienta, se captura la
+//     excepción, se marca el hook como fallido (HookHealth) y se devuelve un valor seguro
+//     en vez de tumbar el juego. Restricción de MSVC: __try no puede convivir con objetos
+//     C++ con destructor, por eso estas funciones solo usan tipos C.
+// EN: safe_hook.h — SEH wrappers to call the trampoline (original function) from hooks.
+//     Each call runs inside __try/__except: if our assumed signature is wrong (parameter
+//     count or types) or the original crashes, the exception is caught, the hook is marked
+//     as failed (HookHealth) and a safe value is returned instead of crashing the game.
+//     MSVC restriction: __try cannot coexist with C++ objects with destructors, so these
+//     functions only use C types.
 #pragma once
+// ES: Envoltorios de llamada al trampolín protegidos con SEH (descripción en inglés abajo).
 // SEH-protected trampoline call wrappers.
 //
 // Each hook's trampoline (original function) call is wrapped in __try/__except
@@ -16,6 +29,8 @@
 
 namespace kmp {
 
+// ES: Estado de salud por hook: si el trampolín de un hook revienta, se marca como
+//     fallido y el hook deja de llamar al trampolín.
 // Per-hook health status. If a hook's trampoline crashes, it gets marked
 // as failed and the hook stops calling the trampoline.
 //
@@ -26,6 +41,13 @@ namespace kmp {
 // y los guards de SafeCall_* cortaban SIEMPRE sin llamar jamás al original del
 // juego (confirmado en vivo: failCount=0, name=""). El constructor elimina la
 // propiedad de agregado (a propósito) y enruta el string a `name`.
+// EN: [FIX-AGGREGATE 2026-07] An explicit constructor is MANDATORY: without it this was
+//     an AGGREGATE in C++17 and `static HookHealth h{"Name"};` initialized the FIRST member
+//     (trampolineFailed) with the string pointer (pointer -> bool = true), leaving name
+//     empty. Result: all 12 hooks were born with trampolineFailed=true and the SafeCall_*
+//     guards ALWAYS cut without ever calling the game's original (confirmed live:
+//     failCount=0, name=""). The constructor removes the aggregate property (on purpose)
+//     and routes the string to `name`.
 struct HookHealth {
     std::atomic<bool> trampolineFailed{false};
     std::atomic<int>  failCount{0};
@@ -41,6 +63,11 @@ struct HookHealth {
 // sola vez por hook la primera vez que corta — antes cortaba en silencio total,
 // lo que mantuvo invisible el bug del agregado durante 3+ semanas. Sin heap ni
 // objetos C++ con destructor (seguro de llamar desde funciones con SEH).
+// EN: [HARDENING 2026-07] Guard for SafeCall_*: returns true if the hook is marked as
+//     failed (the guard cuts and the original is NOT called). Logs ONLY ONCE per hook the
+//     first time it cuts; before, it cut in total silence, which kept the aggregate bug
+//     invisible for 3+ weeks. No heap and no C++ objects with destructors (safe to call
+//     from functions with SEH).
 inline bool HookGuardTripped(HookHealth* health) {
     if (!health || !health->trampolineFailed.load()) return false;
     bool expected = false;
@@ -56,10 +83,19 @@ inline bool HookGuardTripped(HookHealth* health) {
     return true;
 }
 
+// ES: Envoltorios para las distintas firmas. Son funciones estilo C con noinline que
+//     envuelven la llamada en SEH; NO pueden contener objetos C++ con destructor.
+//     Patrón común: si fn es nulo o el guard está cortado devuelven false/nullptr; si la
+//     original lanza una excepción marcan trampolineFailed, suman failCount y devuelven
+//     false/nullptr. El comentario de cada una indica la firma y qué hook la usa.
+// EN: Common pattern: if fn is null or the guard is tripped they return false/nullptr;
+//     if the original throws they set trampolineFailed, bump failCount and return
+//     false/nullptr. Each one's comment gives the signature and which hook uses it.
 // ── Safe call wrappers for different function signatures ──
 // These are __declspec(noinline) C-style functions that wrap trampoline calls
 // in SEH. They must NOT contain any C++ objects with destructors.
 
+// ES: void fn(void*).
 // void fn(void*)
 __declspec(noinline)
 inline bool SafeCall_Void_Ptr(void* fn, void* a1, HookHealth* health) {
@@ -77,6 +113,7 @@ inline bool SafeCall_Void_Ptr(void* fn, void* a1, HookHealth* health) {
     }
 }
 
+// ES: void* fn(void*, void*) — creación de personaje (CharacterCreate); devuelve el puntero de la original.
 // void* fn(void*, void*) — CharacterCreate
 __declspec(noinline)
 inline void* SafeCall_Ptr_PtrPtr(void* fn, void* a1, void* a2, HookHealth* health) {
@@ -97,6 +134,10 @@ inline void* SafeCall_Ptr_PtrPtr(void* fn, void* a1, void* a2, HookHealth* healt
 // (guard del retorno de BuyItem / FIX-UAF-BUYITEM). Si el original revienta DENTRO (p.ej.
 // al desreferenciar la vtable de un objeto reciclado antes de devolverlo), el except
 // devuelve nullptr — un retorno seguro que el caller del juego ya sabe tratar.
+// EN: void* fn(void*, void*, void*) — 3-pointer resolvers that RETURN a pointer (return
+//     guard of BuyItem / FIX-UAF-BUYITEM). If the original crashes INSIDE (e.g. when
+//     dereferencing the vtable of a recycled object before returning it), the except
+//     returns nullptr, a safe return value the game caller already knows how to handle.
 __declspec(noinline)
 inline void* SafeCall_Ptr_PtrPtrPtr(void* fn, void* a1, void* a2, void* a3, HookHealth* health) {
     if (!fn || HookGuardTripped(health)) return nullptr;
@@ -112,6 +153,7 @@ inline void* SafeCall_Ptr_PtrPtrPtr(void* fn, void* a1, void* a2, void* a3, Hook
     }
 }
 
+// ES: void fn(void*, float, float, float) — fijar posición (SetPosition): this + x, y, z.
 // void fn(void*, float, float, float) — SetPosition
 __declspec(noinline)
 inline bool SafeCall_Void_PtrFFF(void* fn, void* a1, float a2, float a3, float a4, HookHealth* health) {
@@ -132,6 +174,9 @@ inline bool SafeCall_Void_PtrFFF(void* fn, void* a1, float a2, float a3, float a
 // void fn(void*, float) — CombatClass::update(float) (DIAG-COMBATSEED)
 // El this va en rcx (a1) y el dt (float) en xmm1 (a2); el trampolín estándar de MinHook
 // preserva xmm1 (la función 0x60D650 tiene prólogo limpio, sin el fix MovRaxRsp).
+// EN: void fn(void*, float) — CombatClass::update(float) (DIAG-COMBATSEED). `this` goes in
+//     rcx (a1) and dt (float) in xmm1 (a2); the standard MinHook trampoline preserves xmm1
+//     (function 0x60D650 has a clean prologue, no MovRaxRsp fix).
 __declspec(noinline)
 inline bool SafeCall_Void_PtrF(void* fn, void* a1, float a2, HookHealth* health) {
     if (!fn || HookGuardTripped(health)) return false;
@@ -148,6 +193,7 @@ inline bool SafeCall_Void_PtrF(void* fn, void* a1, float a2, HookHealth* health)
     }
 }
 
+// ES: void fn(void*, float, float, float, int) — mover a (MoveTo): this + destino + int.
 // void fn(void*, float, float, float, int) — MoveTo
 __declspec(noinline)
 inline bool SafeCall_Void_PtrFFFI(void* fn, void* a1, float a2, float a3, float a4, int a5, HookHealth* health) {
@@ -165,6 +211,7 @@ inline bool SafeCall_Void_PtrFFFI(void* fn, void* a1, float a2, float a3, float 
     }
 }
 
+// ES: void fn(void*, void*, int, float, float, float) — aplicar daño (ApplyDamage).
 // void fn(void*, void*, int, float, float, float) — ApplyDamage
 __declspec(noinline)
 inline bool SafeCall_Void_PtrPtrIFFF(void* fn, void* a1, void* a2, int a3,
@@ -183,6 +230,7 @@ inline bool SafeCall_Void_PtrPtrIFFF(void* fn, void* a1, void* a2, int a3,
     }
 }
 
+// ES: void fn(void*, void*) — muerte de personaje (CharacterDeath).
 // void fn(void*, void*) — CharacterDeath
 __declspec(noinline)
 inline bool SafeCall_Void_PtrPtr(void* fn, void* a1, void* a2, HookHealth* health) {
@@ -200,6 +248,7 @@ inline bool SafeCall_Void_PtrPtr(void* fn, void* a1, void* a2, HookHealth* healt
     }
 }
 
+// ES: void fn(void*, void*, void*) — inicio de ataque (StartAttack: atacante, objetivo, arma).
 // void fn(void*, void*, void*) — StartAttack(attacker, target, weapon)
 __declspec(noinline)
 inline bool SafeCall_Void_PtrPtrPtr(void* fn, void* a1, void* a2, void* a3, HookHealth* health) {
@@ -217,6 +266,7 @@ inline bool SafeCall_Void_PtrPtrPtr(void* fn, void* a1, void* a2, void* a3, Hook
     }
 }
 
+// ES: void fn(void*, int, int) — carga/descarga de zona (ZoneLoad/ZoneUnload), coordenadas de zona.
 // void fn(void*, int, int) — ZoneLoad/ZoneUnload
 __declspec(noinline)
 inline bool SafeCall_Void_PtrII(void* fn, void* a1, int a2, int a3, HookHealth* health) {
@@ -234,6 +284,7 @@ inline bool SafeCall_Void_PtrII(void* fn, void* a1, int a2, int a3, HookHealth* 
     }
 }
 
+// ES: void fn(void*, void*, float, float, float) — colocar edificio (BuildingPlace) con posición.
 // void fn(void*, void*, float, float, float) — BuildingPlace
 __declspec(noinline)
 inline bool SafeCall_Void_PtrPtrFFF(void* fn, void* a1, void* a2,
@@ -252,6 +303,7 @@ inline bool SafeCall_Void_PtrPtrFFF(void* fn, void* a1, void* a2,
     }
 }
 
+// ES: void fn(void*, const char*) — guardar/cargar partida (SaveGame/LoadGame) con nombre.
 // void fn(void*, const char*) — SaveGame/LoadGame
 __declspec(noinline)
 inline bool SafeCall_Void_PtrStr(void* fn, void* a1, const char* a2, HookHealth* health) {
@@ -274,6 +326,10 @@ inline bool SafeCall_Void_PtrStr(void* fn, void* a1, const char* a2, HookHealth*
 // false = orden continúa). Si el trampoline falla, deja *outRet = false para que
 // el caller del juego siga el pipeline normal (degradación segura: sin validación,
 // pero sin tragar la orden ni crashear).
+// EN: bool fn(void*, int, void*) — AddOrderBackend (order validator 0x5D1940). Returns the
+//     original's bool in *outRet (true = order ABORTED/swallowed, false = order goes on).
+//     If the trampoline fails, it leaves *outRet = false so the game caller follows the
+//     normal pipeline (safe degradation: no validation, but no swallowed order or crash).
 __declspec(noinline)
 inline bool SafeCall_Bool_PtrIPtr(void* fn, void* a1, int a2, void* a3,
                                     bool* outRet, HookHealth* health) {
@@ -293,6 +349,7 @@ inline bool SafeCall_Bool_PtrIPtr(void* fn, void* a1, int a2, void* a3,
     }
 }
 
+// ES: void fn(void*, void*, int) — noqueo de personaje (CharacterKO).
 // void fn(void*, void*, int) — CharacterKO
 __declspec(noinline)
 inline bool SafeCall_Void_PtrPtrI(void* fn, void* a1, void* a2, int a3, HookHealth* health) {

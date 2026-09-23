@@ -1,3 +1,9 @@
+// ES: vtable_scanner.cpp — implementación del escáner de vtables por RTTI de MSVC
+//     (ver vtable_scanner.h). Toda lectura de estructuras RTTI se hace en helpers SEH
+//     sin objetos C++ con destructor; luego se construyen los VTableInfo.
+// EN: vtable_scanner.cpp — MSVC RTTI vtable scanner implementation
+//     (see vtable_scanner.h). Every RTTI structure read is done in SEH helpers with no
+//     C++ objects with destructors; VTableInfo objects are built afterwards.
 #include "kmp/vtable_scanner.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -5,14 +11,18 @@
 #include <algorithm>
 #include <cstring>
 
+// ES: Enlaza dbghelp para UnDecorateSymbolName (desmangleado de nombres MSVC).
+// EN: Links dbghelp for UnDecorateSymbolName (MSVC name demangling).
 #pragma comment(lib, "dbghelp.lib")
 
 namespace kmp {
 
+// ES: Helpers SEH (sin objetos C++ con destructor).
 // ═══════════════════════════════════════════════════════════════════════════
 //  SEH HELPER FUNCTIONS — No C++ objects with destructors allowed
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Datos crudos del CompleteObjectLocator leídos dentro del SEH.
 // Raw COL data extracted inside SEH
 struct RawCOLData {
     bool        valid           = false;
@@ -24,6 +34,10 @@ struct RawCOLData {
     char        mangledName[256] = {};
 };
 
+// ES: Lee un COL: exige signature == 1 (x64), sigue la RVA al TypeDescriptor, comprueba
+//     que todo cae dentro del módulo y copia el nombre mangleado (".?AVClase@@").
+// EN: Reads a COL: requires signature == 1 (x64), follows the RVA to the TypeDescriptor,
+//     checks everything is inside the module and copies the mangled name (".?AVClass@@").
 static bool SEH_ReadCOL(uintptr_t colAddr, uintptr_t moduleBase, size_t moduleSize,
                          RawCOLData* out) {
     __try {
@@ -59,12 +73,17 @@ static bool SEH_ReadCOL(uintptr_t colAddr, uintptr_t moduleBase, size_t moduleSi
     }
 }
 
+// ES: Datos crudos de una clase base leídos dentro del SEH.
 // Raw base class data extracted inside SEH
 struct RawBaseClassEntry {
     char mangledName[256];
     bool valid;
 };
 
+// ES: Lee el ClassHierarchyDescriptor y copia los nombres mangleados de las clases base
+//     (saltando el índice 0, que es la propia clase). Máximo 32 bases.
+// EN: Reads the ClassHierarchyDescriptor and copies the mangled names of the base
+//     classes (skipping index 0, which is the class itself). At most 32 bases.
 static int SEH_ReadBaseClasses(uintptr_t moduleBase, size_t moduleSize,
                                 int32_t classDescRVA,
                                 RawBaseClassEntry* outBases, int maxBases) {
@@ -106,6 +125,10 @@ static int SEH_ReadBaseClasses(uintptr_t moduleBase, size_t moduleSize,
     }
 }
 
+// ES: Cuenta slots consecutivos de la vtable que apuntan a .text (para en nulo o en
+//     el primer puntero fuera de código; máximo 512).
+// EN: Counts consecutive vtable slots pointing into .text (stops at null or at the
+//     first non-code pointer; at most 512).
 static size_t SEH_CountVTableSlots(uintptr_t vtableAddr, uintptr_t textBase, size_t textSize) {
     __try {
         auto* slots = reinterpret_cast<const uintptr_t*>(vtableAddr);
@@ -122,6 +145,7 @@ static size_t SEH_CountVTableSlots(uintptr_t vtableAddr, uintptr_t textBase, siz
     }
 }
 
+// ES: Copia los punteros de los slots a un array plano.
 // Read vtable slot pointers into a plain array
 static size_t SEH_ReadVTableSlots(uintptr_t vtableAddr, uintptr_t* outSlots,
                                    size_t maxSlots) {
@@ -138,6 +162,7 @@ static size_t SEH_ReadVTableSlots(uintptr_t vtableAddr, uintptr_t* outSlots,
     }
 }
 
+// ES: Candidato a vtable encontrado en .rdata: (posible COL en vtable[-1], dirección de vtable[0]).
 // Scan .rdata for vtable candidates: returns pairs of (possibleCOL, firstSlot)
 struct VTableCandidate {
     uintptr_t colPtr;
@@ -145,6 +170,10 @@ struct VTableCandidate {
     size_t    rdataIndex;
 };
 
+// ES: Recorre .rdata de 8 en 8 bytes: un candidato es una posición cuyo slot[0] apunta a
+//     .text y cuyo slot[-1] apunta a .rdata (donde vive el COL). Máximo maxCandidates.
+// EN: Walks .rdata 8 bytes at a time: a candidate is a position whose slot[0] points to
+//     .text and whose slot[-1] points to .rdata (where the COL lives). At most maxCandidates.
 static size_t SEH_ScanRdataForCandidates(uintptr_t rdataBase, size_t rdataSize,
                                            uintptr_t textBase, size_t textSize,
                                            VTableCandidate* outCandidates, size_t maxCandidates) {
@@ -174,10 +203,13 @@ static size_t SEH_ScanRdataForCandidates(uintptr_t rdataBase, size_t rdataSize,
     }
 }
 
+// ES: Implementación de VTableScanner.
 // ═══════════════════════════════════════════════════════════════════════════
 //  VTABLE SCANNER IMPLEMENTATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Guarda módulo y .pdata y localiza secciones. False si falta .text o .rdata.
+// EN: Stores module and .pdata and locates sections. False if .text or .rdata is missing.
 bool VTableScanner::Init(uintptr_t moduleBase, size_t moduleSize,
                           const PDataEnumerator* pdata) {
     m_moduleBase = moduleBase;
@@ -187,6 +219,8 @@ bool VTableScanner::Init(uintptr_t moduleBase, size_t moduleSize,
     return m_textBase != 0 && m_rdataBase != 0;
 }
 
+// ES: Localiza .text, .rdata y .data en la tabla de secciones PE.
+// EN: Locates .text, .rdata and .data in the PE section table.
 void VTableScanner::FindSections() {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(m_moduleBase);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -211,6 +245,8 @@ void VTableScanner::FindSections() {
     }
 }
 
+// ES: ¿Apunta a .text? / ¿Está dentro del módulo?
+// EN: Points into .text? / Is it inside the module?
 bool VTableScanner::IsCodePointer(uintptr_t addr) const {
     return addr >= m_textBase && addr < m_textBase + m_textSize;
 }
@@ -219,6 +255,10 @@ bool VTableScanner::IsInModule(uintptr_t addr) const {
     return addr >= m_moduleBase && addr < m_moduleBase + m_moduleSize;
 }
 
+// ES: Desmanglea: para ".?AVClase@@" / ".?AUStruct@@" extrae el nombre directamente;
+//     para lo demás prueba UnDecorateSymbolName y, si falla, quita el '.' inicial.
+// EN: Demangles: for ".?AVClass@@" / ".?AUStruct@@" extracts the name directly;
+//     otherwise tries UnDecorateSymbolName and, if that fails, strips the leading '.'.
 std::string VTableScanner::DemangleName(const char* mangledName) const {
     if (!mangledName || mangledName[0] == '\0') return "";
 
@@ -243,6 +283,8 @@ std::string VTableScanner::DemangleName(const char* mangledName) const {
     return mangled;
 }
 
+// ES: Lee el COL de una vtable y rellena nombre de clase y clases base en 'info'.
+// EN: Reads a vtable's COL and fills class name and base classes in 'info'.
 bool VTableScanner::ReadCOL(uintptr_t colAddr, VTableInfo& info) {
     RawCOLData raw;
     if (!SEH_ReadCOL(colAddr, m_moduleBase, m_moduleSize, &raw)) return false;
@@ -262,6 +304,8 @@ bool VTableScanner::ReadCOL(uintptr_t colAddr, VTableInfo& info) {
     return true;
 }
 
+// ES: Lee y desmanglea las clases base de un ClassHierarchyDescriptor.
+// EN: Reads and demangles the base classes of a ClassHierarchyDescriptor.
 std::vector<std::string> VTableScanner::ReadBaseClasses(int32_t classDescRVA) {
     std::vector<std::string> bases;
 
@@ -280,14 +324,23 @@ std::vector<std::string> VTableScanner::ReadBaseClasses(int32_t classDescRVA) {
     return bases;
 }
 
+// ES: Número de slots de código de una vtable.
+// EN: Number of code slots of a vtable.
 size_t VTableScanner::CountVTableSlots(uintptr_t vtableAddr) const {
     return SEH_CountVTableSlots(vtableAddr, m_textBase, m_textSize);
 }
 
+// ES: Escaneo principal de vtables.
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN VTABLE SCAN
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Fase 1: busca candidatos en .rdata (hasta 65536). Fase 2: por cada uno lee el COL,
+//     cuenta y lee sus slots y etiqueta cada slot con .pdata. Nota: si una clase tiene
+//     varias vtables (herencia múltiple) el índice por nombre se queda con la última.
+// EN: Phase 1: finds candidates in .rdata (up to 65536). Phase 2: for each one reads the
+//     COL, counts and reads its slots and labels each slot via .pdata. Note: if a class
+//     has several vtables (multiple inheritance) the name index keeps the last one.
 size_t VTableScanner::ScanVTables() {
     if (!m_rdataBase || !m_rdataSize) return 0;
 
@@ -345,10 +398,13 @@ size_t VTableScanner::ScanVTables() {
     return found;
 }
 
+// ES: API de consultas.
 // ═══════════════════════════════════════════════════════════════════════════
 //  QUERY API
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Busca por nombre exacto en el índice y, si no, por subcadena.
+// EN: Looks up by exact name in the index, then by substring.
 const VTableInfo* VTableScanner::FindByClassName(const std::string& name) const {
     auto it = m_classNameIndex.find(name);
     if (it != m_classNameIndex.end()) return &m_vtables[it->second];
@@ -359,6 +415,8 @@ const VTableInfo* VTableScanner::FindByClassName(const std::string& name) const 
     return nullptr;
 }
 
+// ES: Clases cuya lista de bases contiene 'baseName' (subcadena).
+// EN: Classes whose base list contains 'baseName' (substring).
 std::vector<const VTableInfo*> VTableScanner::FindDerivedClasses(
     const std::string& baseName) const {
     std::vector<const VTableInfo*> result;
@@ -373,22 +431,32 @@ std::vector<const VTableInfo*> VTableScanner::FindDerivedClasses(
     return result;
 }
 
+// ES: Dirección de la función virtual del slot indicado (0 si no hay). Es lo que usa
+//     el método VTableSlot del orquestador (p.ej. SquadAddMember).
+// EN: Address of the virtual function in the given slot (0 if none). This is what the
+//     orchestrator VTableSlot method uses (e.g. SquadAddMember).
 uintptr_t VTableScanner::GetVirtualFunction(const std::string& className, int slotIndex) const {
     auto* vt = FindByClassName(className);
     if (!vt || slotIndex < 0 || slotIndex >= static_cast<int>(vt->slotCount)) return 0;
     return vt->slots[slotIndex].funcAddress;
 }
 
+// ES: Todos los slots de una clase (nullptr si no existe).
+// EN: All slots of a class (nullptr if missing).
 const std::vector<VTableSlot>* VTableScanner::GetVirtualFunctions(
     const std::string& className) const {
     auto* vt = FindByClassName(className);
     return vt ? &vt->slots : nullptr;
 }
 
+// ES: Itera todas las vtables.
+// EN: Iterates all vtables.
 void VTableScanner::ForEach(const std::function<void(const VTableInfo&)>& callback) const {
     for (const auto& vt : m_vtables) callback(vt);
 }
 
+// ES: Estadísticas de vtables, slots, clases y profundidad de herencia.
+// EN: Statistics of vtables, slots, classes and inheritance depth.
 VTableScanner::Stats VTableScanner::GetStats() const {
     Stats stats;
     stats.totalVTables = m_vtables.size();

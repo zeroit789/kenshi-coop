@@ -1,3 +1,9 @@
+// ES: scanner_engine.cpp — implementación del motor de escaneo avanzado (ver
+//     scanner_engine.h): enumeración de secciones PE, parseo de patrones AOB estilo IDA,
+//     escaneo SSE2, patrones compuestos, escaneo por lotes y caché de resultados.
+// EN: scanner_engine.cpp — advanced scanning engine implementation (see
+//     scanner_engine.h): PE section enumeration, IDA-style AOB pattern parsing,
+//     SSE2 scanning, composite patterns, batch scanning and result caching.
 #include "kmp/scanner_engine.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -8,10 +14,15 @@
 
 namespace kmp {
 
+// ES: Inicialización.
 // ═══════════════════════════════════════════════════════════════════════════
 //  INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Obtiene el HMODULE, valida cabeceras DOS/NT, guarda SizeOfImage, enumera las
+//     secciones y las loguea con sus permisos (X/R/W).
+// EN: Gets the HMODULE, validates DOS/NT headers, stores SizeOfImage, enumerates the
+//     sections and logs them with their permissions (X/R/W).
 bool ScannerEngine::Init(const char* moduleName) {
     HMODULE hModule = moduleName ? GetModuleHandleA(moduleName) : GetModuleHandleA(nullptr);
     if (!hModule) {
@@ -47,6 +58,8 @@ bool ScannerEngine::Init(const char* moduleName) {
     return true;
 }
 
+// ES: Copia la tabla de secciones del PE a m_sections (nombre, base, tamaño, flags).
+// EN: Copies the PE section table into m_sections (name, base, size, flags).
 bool ScannerEngine::EnumerateSections() {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(m_moduleBase);
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(m_moduleBase + dos->e_lfanew);
@@ -68,6 +81,8 @@ bool ScannerEngine::EnumerateSections() {
     return !m_sections.empty();
 }
 
+// ES: Busca una sección por nombre exacto (".text", ".rdata"...).
+// EN: Finds a section by exact name (".text", ".rdata"...).
 const PESection* ScannerEngine::FindSection(const char* name) const {
     for (const auto& sec : m_sections) {
         if (std::strcmp(sec.name, name) == 0) return &sec;
@@ -75,10 +90,13 @@ const PESection* ScannerEngine::FindSection(const char* name) const {
     return nullptr;
 }
 
+// ES: Parseo de patrones.
 // ═══════════════════════════════════════════════════════════════════════════
 //  PATTERN PARSING
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Convierte "48 8B ? C4" en bytes + máscara ('?'/'??' = comodín). Guarda el texto original.
+// EN: Turns "48 8B ? C4" into bytes + mask ('?'/'??' = wildcard). Keeps the original text.
 std::optional<ParsedPattern> ScannerEngine::Parse(const char* pattern) {
     ParsedPattern result;
     result.original = pattern;
@@ -100,10 +118,15 @@ std::optional<ParsedPattern> ScannerEngine::Parse(const char* pattern) {
     return result;
 }
 
+// ES: Regiones de escaneo.
 // ═══════════════════════════════════════════════════════════════════════════
 //  SCAN REGIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Devuelve las regiones a escanear: las secciones restringidas si las hay; si no,
+//     solo .text (o el módulo entero si no existe .text).
+// EN: Returns the regions to scan: the restricted sections if any; otherwise only
+//     .text (or the whole module if .text is missing).
 std::vector<ScannerEngine::ScanRegion> ScannerEngine::GetScanRegions() const {
     std::vector<ScanRegion> regions;
 
@@ -126,14 +149,25 @@ std::vector<ScannerEngine::ScanRegion> ScannerEngine::GetScanRegions() const {
     return regions;
 }
 
+// ES: Restringe el escaneo a las secciones indicadas.
+// EN: Restricts scanning to the given sections.
 void ScannerEngine::SetScanSections(const std::vector<std::string>& sectionNames) {
     m_restrictSections = sectionNames;
 }
 
+// ES: Escaneo acelerado con SSE2.
 // ═══════════════════════════════════════════════════════════════════════════
 //  SSE2-ACCELERATED SCANNING
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Busca el primer byte fijo del patrón 16 bytes a la vez: _mm_cmpeq_epi8 compara
+//     16 bytes con el byte buscado y _mm_movemask_epi8 da una máscara de bits con las
+//     posiciones candidatas; cada candidata se verifica con el patrón completo.
+//     El resto final se recorre de forma lineal. Devuelve la primera coincidencia o 0.
+// EN: Searches the first fixed byte of the pattern 16 bytes at a time: _mm_cmpeq_epi8
+//     compares 16 bytes with the needle and _mm_movemask_epi8 gives a bitmask of
+//     candidate positions; each candidate is verified against the full pattern.
+//     The tail is scanned linearly. Returns the first match or 0.
 uintptr_t ScannerEngine::ScanRegionSSE2(uintptr_t start, size_t size,
                                          const ParsedPattern& pattern) const {
     if (pattern.bytes.empty() || size < pattern.bytes.size()) return 0;
@@ -142,6 +176,7 @@ uintptr_t ScannerEngine::ScanRegionSSE2(uintptr_t start, size_t size,
     const size_t patLen = pattern.bytes.size();
     const size_t scanEnd = size - patLen;
 
+    // ES: Primer byte no comodín (el que se acelera con SSE2).
     // Find first non-wildcard byte for SSE2 acceleration
     int firstFixed = -1;
     for (size_t i = 0; i < patLen; i++) {
@@ -155,11 +190,13 @@ uintptr_t ScannerEngine::ScanRegionSSE2(uintptr_t start, size_t size,
 
     const uint8_t needle = pattern.bytes[firstFixed];
 
+    // ES: Replica el byte buscado en los 16 carriles del registro SSE.
     // SSE2: broadcast the first fixed byte to all 16 lanes
     __m128i needleVec = _mm_set1_epi8(static_cast<char>(needle));
 
     size_t i = 0;
 
+    // ES: Pasada SSE2 de 16 en 16 bytes.
     // SSE2 pass: scan 16 bytes at a time looking for the first fixed byte
     const size_t simdEnd = (scanEnd > 16) ? scanEnd - 16 : 0;
     while (i <= simdEnd) {
@@ -199,6 +236,7 @@ uintptr_t ScannerEngine::ScanRegionSSE2(uintptr_t start, size_t size,
         i += 16;
     }
 
+    // ES: Recorrido lineal de los bytes restantes.
     // Linear fallback for remaining bytes
     for (; i <= scanEnd; i++) {
         if (data[i + firstFixed] != needle) continue;
@@ -216,6 +254,8 @@ uintptr_t ScannerEngine::ScanRegionSSE2(uintptr_t start, size_t size,
     return 0;
 }
 
+// ES: Escaneo lineal simple (sin SIMD), comparando primero el byte 0 si no es comodín.
+// EN: Plain linear scan (no SIMD), checking byte 0 first when it is not a wildcard.
 uintptr_t ScannerEngine::ScanRegionLinear(uintptr_t start, size_t size,
                                            const ParsedPattern& pattern) const {
     if (pattern.bytes.empty() || size < pattern.bytes.size()) return 0;
@@ -243,6 +283,8 @@ uintptr_t ScannerEngine::ScanRegionLinear(uintptr_t start, size_t size,
     return 0;
 }
 
+// ES: Todas las coincidencias de una región (SSE2 repetido avanzando 1 byte tras cada hallazgo).
+// EN: All matches in a region (repeated SSE2 scan advancing 1 byte after each hit).
 std::vector<uintptr_t> ScannerEngine::ScanRegionAll(uintptr_t start, size_t size,
                                                       const ParsedPattern& pattern) const {
     std::vector<uintptr_t> results;
@@ -265,14 +307,21 @@ std::vector<uintptr_t> ScannerEngine::ScanRegionAll(uintptr_t start, size_t size
     return results;
 }
 
+// ES: API de un solo patrón.
 // ═══════════════════════════════════════════════════════════════════════════
 //  SINGLE-PATTERN API
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Find sin offset.
+// EN: Find without offset.
 ScanResult ScannerEngine::Find(const char* pattern) const {
     return Find(pattern, 0);
 }
 
+// ES: Find con caché: la clave es "patrón@offset". Si no está cacheado, parsea,
+//     escanea y guarda el resultado (también los fallos).
+// EN: Cached Find: the key is "pattern@offset". If not cached, parses, scans and
+//     stores the result (misses too).
 ScanResult ScannerEngine::Find(const char* pattern, int offset) const {
     // Check cache
     std::string cacheKey = std::string(pattern) + "@" + std::to_string(offset);
@@ -300,6 +349,10 @@ ScanResult ScannerEngine::Find(const char* pattern, int offset) const {
     return result;
 }
 
+// ES: Escanea las regiones configuradas y devuelve la primera coincidencia + offset
+//     (confianza 1.0). No comprueba que el patrón sea único.
+// EN: Scans the configured regions and returns the first match + offset
+//     (confidence 1.0). Does not check that the pattern is unique.
 ScanResult ScannerEngine::Find(const ParsedPattern& pattern) const {
     auto regions = GetScanRegions();
 
@@ -318,6 +371,8 @@ ScanResult ScannerEngine::Find(const ParsedPattern& pattern) const {
     return {};
 }
 
+// ES: Todas las coincidencias en las regiones configuradas (útil para verificar unicidad).
+// EN: All matches in the configured regions (useful to verify uniqueness).
 std::vector<uintptr_t> ScannerEngine::FindAll(const char* pattern) const {
     auto parsed = Parse(pattern);
     if (!parsed) return {};
@@ -336,10 +391,13 @@ std::vector<uintptr_t> ScannerEngine::FindAll(const ParsedPattern& pattern) cons
     return allResults;
 }
 
+// ES: Escaneo en una sección concreta.
 // ═══════════════════════════════════════════════════════════════════════════
 //  SECTION-SPECIFIC SCANNING
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Primera coincidencia dentro de la sección indicada (+ offset del patrón).
+// EN: First match inside the given section (+ pattern offset).
 ScanResult ScannerEngine::FindInSection(const char* sectionName, const char* pattern) const {
     auto parsed = Parse(pattern);
     if (!parsed) return {};
@@ -362,6 +420,8 @@ ScanResult ScannerEngine::FindInSection(const char* sectionName,
     return result;
 }
 
+// ES: Todas las coincidencias dentro de la sección indicada.
+// EN: All matches inside the given section.
 std::vector<uintptr_t> ScannerEngine::FindAllInSection(const char* sectionName,
                                                          const char* pattern) const {
     auto parsed = Parse(pattern);
@@ -373,10 +433,19 @@ std::vector<uintptr_t> ScannerEngine::FindAllInSection(const char* sectionName,
     return ScanRegionAll(sec->base, sec->size, *parsed);
 }
 
+// ES: Escaneo de patrones compuestos.
 // ═══════════════════════════════════════════════════════════════════════════
 //  COMPLEX PATTERN SCANNING
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Busca el ancla (primer componente), comprueba cada componente adicional en su
+//     offset relativo (si un componente obligatorio falla, no hay resultado), aplica
+//     resultOffset y el post-proceso (seguir CALL/JMP, resolver RIP o retroceder al
+//     prólogo). Confianza 0.9.
+// EN: Finds the anchor (first component), checks each extra component at its relative
+//     offset (if a required component fails, there is no result), applies resultOffset
+//     and the post-processing (follow CALL/JMP, resolve RIP or walk back to the
+//     prologue). Confidence 0.9.
 ScanResult ScannerEngine::FindComplex(const ComplexPattern& pattern) const {
     if (pattern.components.empty()) return {};
 
@@ -387,6 +456,7 @@ ScanResult ScannerEngine::FindComplex(const ComplexPattern& pattern) const {
 
     uintptr_t anchorAddr = anchorResult.address;
 
+    // ES: Valida los componentes adicionales en sus offsets (lectura protegida con SEH).
     // Validate all additional components at their relative offsets
     for (size_t i = 1; i < pattern.components.size(); i++) {
         const auto& comp = pattern.components[i];
@@ -409,6 +479,8 @@ ScanResult ScannerEngine::FindComplex(const ComplexPattern& pattern) const {
 
         if (!match) {
             if (comp.required) return {};
+            // ES: Nota: el componente opcional fallido no reduce la confianza en realidad (el
+            //     comentario de abajo describe una intención no implementada).
             // Non-required component failed — reduce confidence
         }
     }
@@ -429,6 +501,9 @@ ScanResult ScannerEngine::FindComplex(const ComplexPattern& pattern) const {
         case ComplexPattern::PostProcess::ResolveRIP:
             resultAddr = ResolveRIP(resultAddr, pattern.ripOperandOffset, pattern.ripInstructionLen);
             break;
+        // ES: Retrocede hasta 4 KB buscando un byte CC (padding int3) o C3 (ret) y toma como
+        //     inicio el primer byte no-CC que le sigue. Heurístico: puede cortarse en un C3/CC
+        //     que forme parte de otra instrucción.
         case ComplexPattern::PostProcess::FindPrologue: {
             // Walk backwards to function start
             __try {
@@ -459,15 +534,27 @@ ScanResult ScannerEngine::FindComplex(const ComplexPattern& pattern) const {
     return result;
 }
 
+// ES: Escaneo por lotes (una sola pasada).
 // ═══════════════════════════════════════════════════════════════════════════
 //  BATCH SCANNING (single pass)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Resuelve muchos patrones recorriendo .text UNA sola vez: indexa cada patrón pendiente
+//     por su primer byte fijo y, en cada posición, solo prueba los patrones cuyo primer
+//     byte fijo coincide. Se queda con la primera coincidencia de cada patrón (no verifica
+//     unicidad). Es la fase 4 del orquestador. Ojo: si pos < fixedByteOffset, patStart
+//     da la vuelta (size_t); el control de límites no siempre lo evita.
+// EN: Resolves many patterns walking .text ONCE: indexes each pending pattern by its
+//     first fixed byte and, at each position, only tries the patterns whose first fixed
+//     byte matches. Keeps the first match of each pattern (no uniqueness check). It is
+//     orchestrator phase 4. Note: if pos < fixedByteOffset, patStart wraps around
+//     (size_t); the bounds check does not always catch it.
 void ScannerEngine::BatchScan(std::vector<BatchEntry>& entries) const {
     if (entries.empty()) return;
 
     auto regions = GetScanRegions();
 
+    // ES: Índice primer byte fijo -> patrones que lo usan.
     // Build a first-byte index for fast dispatch
     // Map: first non-wildcard byte → list of entry indices
     struct FirstByteEntry { size_t entryIdx; int fixedByteOffset; };
@@ -486,6 +573,7 @@ void ScannerEngine::BatchScan(std::vector<BatchEntry>& entries) const {
         }
     }
 
+    // ES: Cuántos patrones siguen sin resolver.
     // Count how many patterns remain unresolved
     auto unresolvedCount = [&]() {
         size_t count = 0;
@@ -500,6 +588,7 @@ void ScannerEngine::BatchScan(std::vector<BatchEntry>& entries) const {
         const uint8_t* data = reinterpret_cast<const uint8_t*>(region.start);
         const size_t size = region.size;
 
+        // ES: Recorre byte a byte consultando el índice.
         // Scan byte by byte, checking the first-byte index
         for (size_t pos = 0; pos < size; pos++) {
             uint8_t b = data[pos];
@@ -548,28 +637,37 @@ void ScannerEngine::BatchScan(std::vector<BatchEntry>& entries) const {
                  found, entries.size(), missed);
 }
 
+// ES: Utilidades de resolución de direcciones.
 // ═══════════════════════════════════════════════════════════════════════════
 //  ADDRESS RESOLUTION UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: destino = instrucción + longitud + rel32 leído en operandOffset.
+// EN: target = instruction + length + rel32 read at operandOffset.
 uintptr_t ScannerEngine::ResolveRIP(uintptr_t instrAddr, int operandOffset, int instrLen) {
     int32_t relative;
     std::memcpy(&relative, reinterpret_cast<void*>(instrAddr + operandOffset), sizeof(int32_t));
     return instrAddr + instrLen + relative;
 }
 
+// ES: Destino de un CALL rel32 (E8); 0 si no es E8.
+// EN: Target of a CALL rel32 (E8); 0 if not E8.
 uintptr_t ScannerEngine::FollowCall(uintptr_t callAddr) {
     uint8_t opcode = *reinterpret_cast<uint8_t*>(callAddr);
     if (opcode != 0xE8) return 0;
     return ResolveRIP(callAddr, 1, 5);
 }
 
+// ES: Destino de un JMP rel32 (E9); 0 si no es E9.
+// EN: Target of a JMP rel32 (E9); 0 if not E9.
 uintptr_t ScannerEngine::FollowJmp(uintptr_t jmpAddr) {
     uint8_t opcode = *reinterpret_cast<uint8_t*>(jmpAddr);
     if (opcode != 0xE9) return 0;
     return ResolveRIP(jmpAddr, 1, 5);
 }
 
+// ES: Destino de un salto condicional corto (7x rel8) o cercano (0F 8x rel32); 0 si no lo es.
+// EN: Target of a short (7x rel8) or near (0F 8x rel32) conditional jump; 0 otherwise.
 uintptr_t ScannerEngine::FollowConditionalJmp(uintptr_t jmpAddr) {
     uint8_t b0 = *reinterpret_cast<uint8_t*>(jmpAddr);
     uint8_t b1 = *reinterpret_cast<uint8_t*>(jmpAddr + 1);
@@ -589,10 +687,13 @@ uintptr_t ScannerEngine::FollowConditionalJmp(uintptr_t jmpAddr) {
     return 0;
 }
 
+// ES: Caché.
 // ═══════════════════════════════════════════════════════════════════════════
 //  CACHE
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Vacía la caché / devuelve su tamaño (con mutex).
+// EN: Clears the cache / returns its size (under mutex).
 void ScannerEngine::ClearCache() {
     std::lock_guard<std::mutex> lock(m_cacheMutex);
     m_cache.clear();

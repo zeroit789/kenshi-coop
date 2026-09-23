@@ -1,3 +1,9 @@
+// ES: mov_rax_rsp_fix.cpp — generador en runtime de los dos stubs ASM del fix
+//     MovRaxRsp (ver mov_rax_rsp_fix.h y docs/reverse-engineering/mov-rax-rsp-fix.md).
+//     Escribe código máquina x64 byte a byte en una página RWX propia por hook.
+// EN: mov_rax_rsp_fix.cpp — runtime generator of the two ASM stubs of the MovRaxRsp
+//     fix (see mov_rax_rsp_fix.h and docs/reverse-engineering/mov-rax-rsp-fix.md).
+//     Writes x64 machine code byte by byte into a dedicated RWX page per hook.
 #include "kmp/mov_rax_rsp_fix.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -5,6 +11,14 @@
 
 namespace kmp {
 
+// ES: Arquitectura (resumen): el detour desnudo guarda RSP y la dirección de retorno,
+//     resta 0x1008 a RSP, hace CALL (no JMP) al hook C++ para que vuelva aquí, suma
+//     0x1008, restaura la dirección de retorno en [RSP] y hace ret. Se usa CALL porque el
+//     wrapper parchea [captured_rsp] con return_point; con JMP el ret del hook C++ saltaría
+//     a return_point otra vez. El hueco de 4 KB evita que los push de la función original
+//     pisen el marco de pila del hook C++. El wrapper cambia RSP a captured_rsp, pone
+//     return_point en [RSP], hace RAX = RSP y salta a trampolín+3; en return_point
+//     recupera el RSP del hook C++ y hace ret. RAX (valor de retorno) se conserva.
 // ═══════════════════════════════════════════════════════════════════════════
 //  ARCHITECTURE — Return-Address Patching with Stack Gap
 // ═══════════════════════════════════════════════════════════════════════════
@@ -71,6 +85,7 @@ namespace kmp {
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Layout de la página reservada: slots de datos al principio y los dos stubs después.
 // Memory layout of allocated page:
 //   +0x00: captured_rsp    (uint64_t) - game caller's RSP at hook entry
 //   +0x08: stub_rsp        (uint64_t) - C++ hook's RSP before stack swap
@@ -80,6 +95,14 @@ namespace kmp {
 //   +0x40: NAKED DETOUR stub (machine code, ~90 bytes)
 //   +0xC0: TRAMPOLINE WRAPPER stub (machine code, ~50 bytes)
 
+// ES: Offsets dentro de la página: RSP capturado, RSP del hook C++, retorno del juego,
+//     contador de reentrancia, trampolín crudo, flag de bypass, detour desnudo (+0x40),
+//     wrapper (+0xC0), tamaño total (0x200) y hueco de pila (0x1008 = 4 KB + 8 para
+//     alineación a 16; se queda dentro de una guard page: saltar 64 KB provocaba crash).
+// EN: In-page offsets: captured RSP, C++ hook RSP, game return address, reentrancy
+//     counter, raw trampoline, bypass flag, naked detour (+0x40), wrapper (+0xC0), total
+//     size (0x200) and stack gap (0x1008 = 4 KB + 8 for 16-byte alignment; it stays within
+//     one guard page: jumping 64 KB caused a crash).
 static constexpr int OFF_CAPTURED_RSP   = 0x00;
 static constexpr int OFF_STUB_RSP       = 0x08;
 static constexpr int OFF_SAVED_GAME_RET = 0x10;
@@ -91,6 +114,10 @@ static constexpr int OFF_TRAMP_WRAP     = 0xC0;
 static constexpr int ALLOC_SIZE         = 0x200;
 static constexpr int STACK_GAP          = 0x1008;   // 4KB+8 gap — stays within one guard page (64KB jumped past guard → crash)
 
+// ES: Helpers de emisión: cada uno escribe los bytes de una instrucción x64 concreta
+//     (codificación indicada en el comentario) y avanza 'off'.
+// EN: Emit helpers: each one writes the bytes of a specific x64 instruction
+//     (encoding shown in the comment) and advances 'off'.
 // ─── Emit Helpers ──────────────────────────────────────────────────────────
 
 static void EmitByte(uint8_t* buf, int& off, uint8_t b) { buf[off++] = b; }
@@ -103,6 +130,7 @@ static void EmitU64(uint8_t* buf, int& off, uint64_t v) {
     memcpy(&buf[off], &v, 8); off += 8;
 }
 
+// ES: Desplazamiento RIP-relativo: destino - fin de la instrucción (ambos dentro de la página).
 // RIP-relative displacement: target - (base + instrEnd)
 static int32_t RipDisp(uintptr_t base, int instrEnd, int dataOff) {
     return (int32_t)((base + dataOff) - (base + instrEnd));
@@ -171,12 +199,15 @@ static void EmitCallR11(uint8_t* buf, int& off) {
     EmitByte(buf, off, 0x41); EmitByte(buf, off, 0xFF); EmitByte(buf, off, 0xD3);
 }
 
+// ES: mov rax, rsp con la codificación alternativa 48 89 E0 para no confundirla con el
+//     48 8B C4 del juego.
 // mov rax, rsp = 48 89 E0 (3 bytes)
 // Using opcode 89 (MOV r/m64, r64) to avoid confusion with the game's 48 8B C4
 static void EmitMovRaxRsp(uint8_t* buf, int& off) {
     EmitByte(buf, off, 0x48); EmitByte(buf, off, 0x89); EmitByte(buf, off, 0xE0);
 }
 
+// ES: LEA r11 con desplazamiento provisional; devuelve dónde parchearlo después.
 // lea r11, [rip+disp32] = 4C 8D 1D disp32 (7 bytes)
 // Returns the offset of the disp32 field for later patching
 static int EmitLeaR11Rip(uint8_t* buf, int& off) {
@@ -186,6 +217,7 @@ static int EmitLeaR11Rip(uint8_t* buf, int& off) {
     return dispOff;
 }
 
+// ES: Salto absoluto de 14 bytes: jmp [rip+0] seguido de la dirección de 64 bits.
 // jmp [rip+0]; dq target (14 bytes)
 static void EmitJmpAbs(uint8_t* buf, int& off, uintptr_t target) {
     EmitByte(buf, off, 0xFF); EmitByte(buf, off, 0x25);
@@ -196,6 +228,7 @@ static void EmitJmpAbs(uint8_t* buf, int& off, uintptr_t target) {
 // ret = C3 (1 byte)
 static void EmitRet(uint8_t* buf, int& off) { EmitByte(buf, off, 0xC3); }
 
+// ES: inc/dec/cmp sobre un dword de la página (contador de reentrancia y flag de bypass).
 // inc dword ptr [rip+disp32] = FF 05 disp32 (6 bytes)
 static void EmitIncMemDword(uint8_t* buf, int& off, uintptr_t base, int dataOff) {
     int end = off + 6;
@@ -218,6 +251,7 @@ static void EmitCmpMemDwordImm8(uint8_t* buf, int& off, uintptr_t base, int data
     EmitByte(buf, off, imm);
 }
 
+// ES: jne corto con rel8 provisional; devuelve su posición para parchearlo.
 // jne rel8 = 75 rel8 (2 bytes) — returns offset of rel8 for patching
 static int EmitJneShort(uint8_t* buf, int& off) {
     EmitByte(buf, off, 0x75);
@@ -226,6 +260,7 @@ static int EmitJneShort(uint8_t* buf, int& off) {
     return rel8Off;
 }
 
+// ES: Salto indirecto a la dirección guardada en un slot de la página (trampolín crudo).
 // jmp qword ptr [rip+disp32] = FF 25 disp32 (6 bytes)
 static void EmitJmpMemAbs(uint8_t* buf, int& off, uintptr_t base, int dataOff) {
     int end = off + 6;
@@ -233,14 +268,21 @@ static void EmitJmpMemAbs(uint8_t* buf, int& off, uintptr_t base, int dataOff) {
     EmitU32(buf, off, (uint32_t)RipDisp(base, end, dataOff));
 }
 
+// ES: API pública.
 // ─── Public API ────────────────────────────────────────────────────────────
 
+// ES: Comprueba que el trampolín empieza por 48 8B C4.
+// EN: Checks that the trampoline starts with 48 8B C4.
 bool TrampolineHasMovRaxRsp(void* trampoline) {
     if (!trampoline) return false;
     auto* p = static_cast<const uint8_t*>(trampoline);
     return (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0xC4);
 }
 
+// ES: Reserva la página de 0x200 bytes RWX, la llena de INT3 (0xCC) y pone a cero los
+//     slots de datos (así el flag de bypass empieza en 0; HookManager lo pone a 1 después).
+// EN: Allocates the 0x200-byte RWX page, fills it with INT3 (0xCC) and zeroes the data
+//     slots (so the bypass flag starts at 0; HookManager sets it to 1 afterwards).
 void* AllocMovRaxRspPage() {
     void* mem = VirtualAlloc(nullptr, ALLOC_SIZE, MEM_COMMIT | MEM_RESERVE,
                              PAGE_EXECUTE_READWRITE);
@@ -253,6 +295,9 @@ void* AllocMovRaxRspPage() {
     return mem;
 }
 
+// ES: Interno: genera ambos stubs en una página ya reservada (lo comparten
+//     BuildMovRaxRspHookAt y BuildMovRaxRspHook). Devuelve el resultado vacío si la página
+//     es nula o el trampolín no empieza por 48 8B C4.
 // Internal: emit both stubs into a pre-allocated page.
 // Shared by BuildMovRaxRspHookAt (pre-allocated) and BuildMovRaxRspHook (legacy).
 static MovRaxRspHook EmitStubs(
@@ -280,6 +325,9 @@ static MovRaxRspHook EmitStubs(
     uintptr_t cppDetourAddr = reinterpret_cast<uintptr_t>(cppDetour);
     uintptr_t trampPlus3 = reinterpret_cast<uintptr_t>(trampoline) + trampolineOffset;
 
+    // ES: DETOUR DESNUDO en +0x40. Al entrar RSP = RSP del llamador - 8 y [RSP] = retorno
+    //     del juego. Guard de reentrancia: si el hook se dispara estando ya activo, se salta
+    //     todo y se va al trampolín crudo sin tocar los slots globales.
     // ═══════════════════════════════════════════════════════════════════
     //  NAKED DETOUR at OFF_NAKED_STUB
     // ═══════════════════════════════════════════════════════════════════
@@ -296,17 +344,21 @@ static MovRaxRspHook EmitStubs(
 
     int off = OFF_NAKED_STUB;
 
+    // ES: Comprobación de bypass por software: si el flag != 0 salta directo al trampolín
+    //     crudo (sirve para "desactivar" el hook sin tocar MinHook, p.ej. durante la carga).
     // ── Software bypass check (avoids MH_DisableHook/MH_EnableHook) ──
     // If bypass flag is set, skip everything and JMP to raw trampoline (pure passthrough).
     // This is used to disable the hook during loading without touching MinHook state.
     EmitCmpMemDwordImm8(buf, off, base, OFF_BYPASS, 0);       // 7 bytes: bypass == 0?
     int jneBypassOff = EmitJneShort(buf, off);                 // 2 bytes: jne .bypass
 
+    // ES: Comprobación de reentrancia (depth++ y ¿depth == 1?).
     // ── Reentrancy check (game logic is single-threaded) ──
     EmitIncMemDword(buf, off, base, OFF_DEPTH);                // 6 bytes: depth++
     EmitCmpMemDwordImm8(buf, off, base, OFF_DEPTH, 1);        // 7 bytes: depth == 1?
     int jneOff = EmitJneShort(buf, off);                       // 2 bytes: jne .reentrant
 
+    // ES: Camino normal (primera llamada): pasos 1-7.
     // ── Normal path (depth == 1, first call) ──
 
     // 1. Save game's RSP
@@ -347,6 +399,7 @@ static MovRaxRspHook EmitStubs(
     EmitDecMemDword(buf, off, base, OFF_DEPTH);                // 6 bytes: depth--
     EmitRet(buf, off);                                         // 1 byte
 
+    // ES: Camino reentrante: depth-- y salto al trampolín crudo.
     // ── Reentrant path (depth > 1, nested call) ──
     int reentrantOff = off;
     // Patch the JNE rel8 to jump here
@@ -355,6 +408,7 @@ static MovRaxRspHook EmitStubs(
     EmitDecMemDword(buf, off, base, OFF_DEPTH);                // 6 bytes: depth--
     EmitJmpMemAbs(buf, off, base, OFF_RAW_TRAMP);             // 6 bytes: jmp [raw_tramp]
 
+    // ES: Camino de bypass: salto al trampolín crudo.
     // ── Bypass path (bypass flag != 0) ──
     int bypassOff = off;
     buf[jneBypassOff] = (uint8_t)(bypassOff - (jneBypassOff + 1));
@@ -364,6 +418,7 @@ static MovRaxRspHook EmitStubs(
     spdlog::info("MovRaxRspFix: '{}' naked detour at 0x{:X}, {} bytes",
                  name, base + OFF_NAKED_STUB, nakedSize);
 
+    // ES: WRAPPER DE TRAMPOLÍN en +0xC0: lo llama el hook C++ como "función original".
     // ═══════════════════════════════════════════════════════════════════
     //  TRAMPOLINE WRAPPER at OFF_TRAMP_WRAP
     // ═══════════════════════════════════════════════════════════════════
@@ -394,11 +449,13 @@ static MovRaxRspHook EmitStubs(
     // 5. Enter original function body (skip `mov rax, rsp`)
     EmitJmpAbs(buf, off, trampPlus3);                          // 14 bytes
 
+    // ES: return_point: aquí vuelve la función original con su ret. RAX = valor de retorno.
     // ─── return_point ────────────────────────────────────────────────
     // Original function RET'd here.  RSP = captured_rsp + 8.
     // RAX = return value from original function (preserved — we don't touch it).
     int returnPointOff = off;
 
+    // ES: Ahora que se conoce la posición de return_point, se parchea el desplazamiento del LEA.
     // Patch the LEA R11 displacement now that we know return_point's offset
     {
         int leaEnd = leaDispOff + 4;  // RIP after the LEA instruction
@@ -417,10 +474,12 @@ static MovRaxRspHook EmitStubs(
                  "return_point at +0x{:X}",
                  name, base + OFF_TRAMP_WRAP, wrapSize, returnPointOff);
 
+    // ES: Guarda el trampolín crudo en su slot para los saltos reentrante y de bypass.
     // Store raw trampoline pointer in data page for the reentrant JMP
     uintptr_t rawTrampAddr = reinterpret_cast<uintptr_t>(trampoline);
     memcpy(buf + OFF_RAW_TRAMP, &rawTrampAddr, 8);
 
+    // ES: Rellena el resultado.
     // Populate result
     result.nakedDetour = buf + OFF_NAKED_STUB;
     result.trampolineWrapper = buf + OFF_TRAMP_WRAP;
@@ -439,6 +498,8 @@ static MovRaxRspHook EmitStubs(
     return result;
 }
 
+// ES: Construye los stubs en una página ya reservada (ver header).
+// EN: Builds the stubs into a pre-allocated page (see header).
 MovRaxRspHook BuildMovRaxRspHookAt(
     void* page,
     const std::string& name,
@@ -449,6 +510,8 @@ MovRaxRspHook BuildMovRaxRspHookAt(
     return EmitStubs(page, name, cppDetour, trampoline, trampolineOffset);
 }
 
+// ES: API antigua: reserva la página, genera los stubs y la libera si falla.
+// EN: Legacy API: allocates the page, emits the stubs and frees it on failure.
 MovRaxRspHook BuildMovRaxRspHook(
     const std::string& name,
     void* cppDetour,
@@ -468,6 +531,8 @@ MovRaxRspHook BuildMovRaxRspHook(
     return result;
 }
 
+// ES: Libera la página del hook y deja la estructura vacía.
+// EN: Frees the hook page and resets the struct.
 void FreeMovRaxRspHook(MovRaxRspHook& hook) {
     if (hook.allocBase) {
         VirtualFree(hook.allocBase, 0, MEM_RELEASE);

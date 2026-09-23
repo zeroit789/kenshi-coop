@@ -1,3 +1,9 @@
+// ES: pdata_enumerator.cpp — implementación del enumerador .pdata (ver pdata_enumerator.h).
+//     Las lecturas de memoria del PE se hacen en helpers estilo C con SEH porque MSVC
+//     no permite __try en funciones con objetos C++ que tienen destructor (error C2712).
+// EN: pdata_enumerator.cpp — .pdata enumerator implementation (see pdata_enumerator.h).
+//     PE memory reads are done in C-style SEH helpers because MSVC does not allow
+//     __try in functions with C++ objects that have destructors (error C2712).
 #include "kmp/pdata_enumerator.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -7,12 +13,16 @@
 
 namespace kmp {
 
+// ES: Helper SEH para Enumerate(): solo usa punteros crudos y POD, hace las lecturas
+//     protegidas y escribe en un buffer que reserva quien llama.
 // ---------------------------------------------------------------------------
 // SEH helper for Enumerate()
 // MSVC C2712: __try cannot be in a function that has C++ objects with dtors.
 // This static C-style helper takes only raw pointers / POD and does the
 // SEH-protected memory reads, writing results into a caller-supplied buffer.
 // ---------------------------------------------------------------------------
+// ES: Versión POD (sin destructores) de FunctionEntry para rellenar dentro del __try.
+// EN: POD version (no destructors) of FunctionEntry to fill inside the __try.
 struct EnumerateEntryPOD {
     uint32_t startRVA;
     uint32_t endRVA;
@@ -26,6 +36,10 @@ struct EnumerateEntryPOD {
     uint8_t  frameOffset;
 };
 
+// ES: Recorre las entradas RUNTIME_FUNCTION y copia inicio/fin/unwind a outBuf.
+//     Salta entradas con BeginAddress 0. Devuelve false si salta una excepción.
+// EN: Walks the RUNTIME_FUNCTION entries and copies start/end/unwind into outBuf.
+//     Skips entries with BeginAddress 0. Returns false if an exception is raised.
 static bool SehEnumeratePData(
     uintptr_t moduleBase,
     size_t moduleSize,
@@ -52,6 +66,8 @@ static bool SehEnumeratePData(
             e.frameRegister = 0;
             e.frameOffset   = 0;
 
+            // ES: Lee lo mínimo de UNWIND_INFO: byte 1 = tamaño de prólogo, byte 2 = número de
+            //     códigos, byte 3 = registro de marco (4 bits bajos) y offset (4 bits altos).
             // Parse minimal unwind info for prologue size
             auto* unwindPtr = reinterpret_cast<const uint8_t*>(
                 moduleBase + (rf.UnwindInfoAddress & ~1u)); // Mask off chain bit
@@ -72,11 +88,15 @@ static bool SehEnumeratePData(
     return true;
 }
 
+// ES: Helper SEH para ParseUnwindInfo(): vuelca UNWIND_INFO en una estructura POD
+//     plana; los códigos de longitud variable van a un buffer de tamaño fijo.
 // ---------------------------------------------------------------------------
 // SEH helper for ParseUnwindInfo()
 // Reads UNWIND_INFO into a flat POD structure. The variable-length unwind
 // codes are written into a caller-supplied fixed-size buffer.
 // ---------------------------------------------------------------------------
+// ES: Código de unwind en formato POD.
+// EN: Unwind code in POD form.
 struct UnwindCodePOD {
     uint8_t  codeOffset;
     uint8_t  opCode;
@@ -84,6 +104,8 @@ struct UnwindCodePOD {
     uint16_t extraData;
 };
 
+// ES: UNWIND_INFO completo en formato POD (hasta 256 códigos).
+// EN: Full UNWIND_INFO in POD form (up to 256 codes).
 struct ParsedUnwindPOD {
     uint8_t  version;
     uint8_t  flags;
@@ -97,6 +119,8 @@ struct ParsedUnwindPOD {
     bool     valid;
 };
 
+// ES: Decodifica UNWIND_INFO en 'out'. Si algo falla, out->valid queda en false.
+// EN: Decodes UNWIND_INFO into 'out'. On failure out->valid stays false.
 static void SehParseUnwindInfo(
     uintptr_t moduleBase,
     uint32_t unwindRVA,
@@ -110,6 +134,10 @@ static void SehParseUnwindInfo(
     auto* data = reinterpret_cast<const uint8_t*>(
         moduleBase + (unwindRVA & ~1u));
 
+    // ES: Cabecera de 4 bytes: versión (3 bits) + flags (5 bits), tamaño de prólogo,
+    //     número de códigos, registro/offset de marco.
+    // EN: 4-byte header: version (3 bits) + flags (5 bits), prologue size,
+    //     code count, frame register/offset.
     __try {
         out->version       = data[0] & 0x07;
         out->flags         = (data[0] >> 3) & 0x1F;
@@ -118,6 +146,12 @@ static void SehParseUnwindInfo(
         out->frameRegister = data[3] & 0x0F;
         out->frameOffset   = (data[3] >> 4) & 0x0F;
 
+        // ES: Cada código ocupa 2 bytes; algunos (ALLOC_LARGE, SAVE_*) usan 1-2 slots extra.
+        //     OJO: extraData es uint16_t, así que los valores de 32 bits (ALLOC_LARGE con
+        //     opInfo=1, *_FAR) se truncan. Solo afecta a información de diagnóstico.
+        // EN: Each code takes 2 bytes; some (ALLOC_LARGE, SAVE_*) use 1-2 extra slots.
+        //     NOTE: extraData is uint16_t, so 32-bit values (ALLOC_LARGE with opInfo=1,
+        //     *_FAR) get truncated. Only affects diagnostic info.
         // Parse unwind codes (each is 2 bytes)
         const uint16_t* codes = reinterpret_cast<const uint16_t*>(data + 4);
         size_t outIdx = 0;
@@ -162,6 +196,7 @@ static void SehParseUnwindInfo(
         }
         out->codeCount = outIdx;
 
+        // ES: Tras los códigos (alineados a 4 bytes) va la RVA del manejador o de la entrada encadenada.
         // Handler/chain info follows the codes (aligned to 4 bytes)
         size_t codeBytes = 4 + codeCount * 2;
         if (codeCount & 1) codeBytes += 2; // Align
@@ -183,16 +218,25 @@ static void SehParseUnwindInfo(
     }
 }
 
+// ES: Implementación de PDataEnumerator.
 // ---------------------------------------------------------------------------
 // PDataEnumerator implementation
 // ---------------------------------------------------------------------------
 
+// ES: Guarda base/tamaño; devuelve false si no son válidos.
+// EN: Stores base/size; returns false if invalid.
 bool PDataEnumerator::Init(uintptr_t moduleBase, size_t moduleSize) {
     m_moduleBase = moduleBase;
     m_moduleSize = moduleSize;
     return moduleBase != 0 && moduleSize > 0;
 }
 
+// ES: Valida cabeceras PE, localiza IMAGE_DIRECTORY_ENTRY_EXCEPTION (.pdata),
+//     copia las entradas mediante el helper SEH, las convierte a FunctionEntry,
+//     las ordena y loguea estadísticas.
+// EN: Validates PE headers, finds IMAGE_DIRECTORY_ENTRY_EXCEPTION (.pdata),
+//     copies the entries via the SEH helper, converts them to FunctionEntry,
+//     sorts them and logs statistics.
 bool PDataEnumerator::Enumerate() {
     if (!m_moduleBase) return false;
 
@@ -202,6 +246,7 @@ bool PDataEnumerator::Enumerate() {
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(m_moduleBase + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
 
+    // ES: Directorio de excepciones (.pdata).
     // Get exception directory (.pdata)
     auto& exceptDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (exceptDir.VirtualAddress == 0 || exceptDir.Size == 0) {
@@ -215,6 +260,7 @@ bool PDataEnumerator::Enumerate() {
 
     spdlog::info("PDataEnumerator: Found {} RUNTIME_FUNCTION entries", numEntries);
 
+    // ES: Buffer POD que rellena el helper SEH.
     // Allocate a POD buffer for the SEH helper to fill
     auto* podBuf = new (std::nothrow) EnumerateEntryPOD[numEntries];
     if (!podBuf) {
@@ -226,6 +272,7 @@ bool PDataEnumerator::Enumerate() {
     bool ok = SehEnumeratePData(m_moduleBase, m_moduleSize, runtimeFuncs,
                                 numEntries, podBuf, &podCount);
 
+    // ES: Convierte los resultados POD al vector real de FunctionEntry.
     // Convert POD results into the real FunctionEntry vector (C++ objects are fine here)
     m_functions.clear();
     m_functions.reserve(podCount);
@@ -263,6 +310,8 @@ bool PDataEnumerator::Enumerate() {
     return true;
 }
 
+// ES: Ordena por dirección de inicio para las búsquedas binarias.
+// EN: Sorts by start address for binary searches.
 void PDataEnumerator::BuildIndex() {
     // Sort by start address for binary search
     std::sort(m_functions.begin(), m_functions.end(),
@@ -271,6 +320,8 @@ void PDataEnumerator::BuildIndex() {
               });
 }
 
+// ES: Búsqueda binaria de una función que empieza exactamente en 'address'.
+// EN: Binary search for a function starting exactly at 'address'.
 const FunctionEntry* PDataEnumerator::FindFunction(uintptr_t address) const {
     // Binary search for exact start address match
     auto it = std::lower_bound(m_functions.begin(), m_functions.end(), address,
@@ -284,9 +335,14 @@ const FunctionEntry* PDataEnumerator::FindFunction(uintptr_t address) const {
     return nullptr;
 }
 
+// ES: Devuelve la función que contiene 'address' (o nullptr). Es la base de
+//     StringXref: xref dentro de una función -> inicio de esa función.
+// EN: Returns the function containing 'address' (or nullptr). This is the basis
+//     of StringXref: xref inside a function -> start of that function.
 const FunctionEntry* PDataEnumerator::FindContaining(uintptr_t address) const {
     if (m_functions.empty()) return nullptr;
 
+    // ES: Primera función con inicio > address y retrocede una.
     // Find first function with startVA > address, then go back one
     auto it = std::upper_bound(m_functions.begin(), m_functions.end(), address,
                                 [](uintptr_t addr, const FunctionEntry& f) {
@@ -302,6 +358,8 @@ const FunctionEntry* PDataEnumerator::FindContaining(uintptr_t address) const {
     return nullptr;
 }
 
+// ES: Filtro lineal por tamaño.
+// EN: Linear filter by size.
 std::vector<const FunctionEntry*> PDataEnumerator::GetFunctionsBySize(
     size_t minSize, size_t maxSize) const {
     std::vector<const FunctionEntry*> result;
@@ -313,6 +371,8 @@ std::vector<const FunctionEntry*> PDataEnumerator::GetFunctionsBySize(
     return result;
 }
 
+// ES: Funciones que empiezan en [start, end), usando lower_bound.
+// EN: Functions starting in [start, end), using lower_bound.
 std::vector<const FunctionEntry*> PDataEnumerator::GetFunctionsInRange(
     uintptr_t start, uintptr_t end) const {
     std::vector<const FunctionEntry*> result;
@@ -329,10 +389,13 @@ std::vector<const FunctionEntry*> PDataEnumerator::GetFunctionsInRange(
     return result;
 }
 
+// ES: Parsea UNWIND_INFO vía el helper SEH y lo convierte a la estructura C++.
+// EN: Parses UNWIND_INFO via the SEH helper and converts it to the C++ struct.
 UnwindInfo PDataEnumerator::ParseUnwindInfo(const FunctionEntry& func) const {
     UnwindInfo info;
     if (!func.unwindRVA) return info;
 
+    // ES: Llama al helper SEH que solo usa tipos POD.
     // Call the SEH helper that uses only POD types
     ParsedUnwindPOD pod;
     pod.version = 0;
@@ -366,12 +429,16 @@ UnwindInfo PDataEnumerator::ParseUnwindInfo(const FunctionEntry& func) const {
     return info;
 }
 
+// ES: Itera todas las funciones.
+// EN: Iterates all functions.
 void PDataEnumerator::ForEach(const std::function<void(const FunctionEntry&)>& callback) const {
     for (const auto& f : m_functions) {
         callback(f);
     }
 }
 
+// ES: Calcula estadísticas de tamaños y funciones etiquetadas.
+// EN: Computes size statistics and labeled function count.
 PDataEnumerator::Stats PDataEnumerator::GetStats() const {
     Stats stats;
     stats.totalFunctions = m_functions.size();

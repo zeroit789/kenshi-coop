@@ -1,3 +1,9 @@
+// ES: hook_manager.cpp — implementación del gestor de hooks (ver hook_manager.h).
+//     Envuelve MinHook (MH_CreateHook/MH_EnableHook...), valida destinos con .pdata
+//     (RtlLookupFunctionEntry) y aplica el fix MovRaxRsp cuando hace falta.
+// EN: hook_manager.cpp — hook manager implementation (see hook_manager.h).
+//     Wraps MinHook (MH_CreateHook/MH_EnableHook...), validates targets with .pdata
+//     (RtlLookupFunctionEntry) and applies the MovRaxRsp fix when needed.
 #include "kmp/hook_manager.h"
 #include "kmp/mov_rax_rsp_fix.h"
 #include <spdlog/spdlog.h>
@@ -7,11 +13,15 @@
 
 namespace kmp {
 
+// ES: Singleton estático (se crea en el primer uso).
+// EN: Static singleton (created on first use).
 HookManager& HookManager::Get() {
     static HookManager instance;
     return instance;
 }
 
+// ES: Inicializa MinHook una sola vez.
+// EN: Initializes MinHook only once.
 bool HookManager::Initialize() {
     std::lock_guard lock(m_mutex);
     if (m_initialized) return true;
@@ -27,6 +37,12 @@ bool HookManager::Initialize() {
     return true;
 }
 
+// ES: Apagado: SOLO desactiva hooks (MH_DisableHook) sin MH_RemoveHook ni MH_Uninitialize,
+//     porque los handlers atexit de Kenshi podrían llamar por punteros a trampolines ya
+//     liberados. Restaura a mano los hooks de vtable y libera los stubs propios.
+// EN: Shutdown: ONLY disables hooks (MH_DisableHook) without MH_RemoveHook or
+//     MH_Uninitialize, because Kenshi's atexit handlers might call through pointers to
+//     freed trampolines. Restores vtable hooks by hand and frees our own stubs.
 void HookManager::Shutdown() {
     std::lock_guard lock(m_mutex);
     if (!m_initialized) return;
@@ -71,6 +87,9 @@ void HookManager::Shutdown() {
     spdlog::info("HookManager: Shutdown complete (hooks disabled, trampolines preserved)");
 }
 
+// ES: OBSOLETO: constructor de relay thunks. Se eliminó porque 'add rax, 8' desplazaba
+//     todos los guardados [rax+XX]. Siempre devuelve nullptr. (El comentario dice que lo
+//     sustituyó BuildCustomCaller, que a su vez también quedó obsoleto por el fix MovRaxRsp.)
 // ═══════════════════════════════════════════════════════════════════════════
 // RELAY THUNK BUILDER (DEPRECATED — superseded by BuildCustomCaller)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -94,6 +113,9 @@ void* HookManager::BuildRelayThunk(const std::string& name, void* trampoline) {
     return nullptr; // Deprecated — use BuildCustomCaller instead
 }
 
+// ES: OBSOLETO: "custom caller" de 17 bytes (mov rax,rsp; jmp [original+3]).
+//     Sustituido por el fix MovRaxRsp porque capturaba RSP a la profundidad de llamada
+//     equivocada. Ya no se llama desde InstallRaw.
 // ═══════════════════════════════════════════════════════════════════════════
 // CUSTOM CALLER BUILDER (for `mov rax, rsp` functions)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -150,6 +172,14 @@ void* HookManager::BuildCustomCaller(const std::string& name, uintptr_t original
     return mem;
 }
 
+// ES: Instala un hook. Pasos: validación .pdata (rechaza destinos a mitad de función),
+//     aviso si no está alineado a 16, análisis de prólogo y, si empieza por 48 8B C4,
+//     camino MovRaxRsp (empieza en BYPASS, hay que llamar a Enable); si no, MinHook
+//     estándar (queda activo). Registra la entrada en m_hooks.
+// EN: Installs a hook. Steps: .pdata validation (refuses mid-function targets), warning
+//     if not 16-byte aligned, prologue analysis and, if it starts with 48 8B C4, the
+//     MovRaxRsp path (starts BYPASSED, Enable must be called); otherwise standard MinHook
+//     (left active). Records the entry in m_hooks.
 bool HookManager::InstallRaw(const std::string& name, void* target, void* detour, void** original) {
     std::lock_guard lock(m_mutex);
 
@@ -163,6 +193,9 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
         return false;
     }
 
+    // ES: Validación .pdata: el destino debe ser el inicio real de una función. Un escáner
+    //     defectuoso puede dar direcciones a mitad de función, y hookear ahí corrompe la
+    //     función que la contiene.
     // ═══ .PDATA VALIDATION ═══
     // Verify the target is a real function entry point, not a mid-function address.
     // A flawed pattern scanner can give us mid-function addresses (e.g., IsPrologue
@@ -171,6 +204,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
     {
         uintptr_t addr = reinterpret_cast<uintptr_t>(target);
 
+        // ES: Comprobación 1: ¿es el destino el BeginAddress de una RUNTIME_FUNCTION?
         // Check 1: .pdata — is the target a RUNTIME_FUNCTION entry point?
         DWORD64 imageBase = 0;
         auto* rtFunc = RtlLookupFunctionEntry(
@@ -186,6 +220,8 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
             }
         }
 
+        // ES: Comprobación 2: alineación a 16 bytes. Solo avisa (las funciones sacadas de
+        //     vtables pueden no estar alineadas y ser válidas).
         // Check 2: Alignment — MSVC often 16-byte aligns function entry points,
         // but NOT always (small functions, COMDAT folding, vtable entries).
         // VTable-discovered functions are definitively valid even if not 16-byte aligned.
@@ -197,6 +233,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
         }
     }
 
+    // ES: Análisis de prólogo: ¿empieza por 48 8B C4 (mov rax, rsp)?
     // ═══ PROLOGUE ANALYSIS ═══
     auto* bytes = reinterpret_cast<const uint8_t*>(target);
     bool hasMovRaxRsp = (bytes[0] == 0x48 && bytes[1] == 0x8B && bytes[2] == 0xC4);
@@ -207,6 +244,8 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
                  bytes[4], bytes[5], bytes[6], bytes[7],
                  hasMovRaxRsp ? " [mov rax,rsp detected — MovRaxRsp fix will be applied]" : "");
 
+    // ES: Camino MovRaxRsp: detour desnudo + wrapper de trampolín (explicación en inglés abajo
+    //     y en mov_rax_rsp_fix.h). Sustituye al antiguo "custom caller".
     // ═══ MOV RAX, RSP — NAKED DETOUR + TRAMPOLINE WRAPPER FIX ═══
     //
     // For functions starting with `mov rax, rsp` (48 8B C4), the function
@@ -230,6 +269,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
     // every [rbp+XX] access in the original function.
 
     if (hasMovRaxRsp) {
+        // ES: Fase 1: reservar la página del fix (el detour desnudo está en un offset conocido).
         // Phase 1: Pre-allocate fix page (naked detour address is at known offset)
         void* fixPage = AllocMovRaxRspPage();
         if (!fixPage) {
@@ -244,6 +284,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
                      name, reinterpret_cast<uintptr_t>(fixPage),
                      reinterpret_cast<uintptr_t>(nakedDetourAddr));
 
+        // ES: Fase 2: crear el hook de MinHook con el detour desnudo como destino.
         // Phase 2: Create MinHook hook — naked detour is the detour target
         // MinHook will JMP to nakedDetourAddr, which captures RSP and CALLs the real C++ hook.
         void* rawTrampoline = nullptr;
@@ -255,6 +296,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
             return false;
         }
 
+        // ES: Comprobar que el trampolín de MinHook empieza por 48 8B C4 (requisito del fix).
         // Verify trampoline starts with 48 8B C4
         auto* tp = static_cast<const uint8_t*>(rawTrampoline);
         bool trampolineOk = (tp[0] == 0x48 && tp[1] == 0x8B && tp[2] == 0xC4);
@@ -272,6 +314,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
             return false;
         }
 
+        // ES: Fase 3: generar los stubs en la página.
         // Phase 3: Build naked detour + trampoline wrapper into the pre-allocated page
         MovRaxRspHook fix = BuildMovRaxRspHookAt(fixPage, name, detour, rawTrampoline, 3);
         fix.rawTrampoline = rawTrampoline;  // Preserve for reentrant bypass
@@ -282,11 +325,13 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
             return false;
         }
 
+        // ES: Fase 4: *original = wrapper de trampolín.
         // Phase 4: Set *original to trampoline wrapper
         // When the C++ hook calls *original, it enters the wrapper which swaps
         // to the game's stack, sets RAX correctly, and calls the real original.
         if (original) *original = fix.trampolineWrapper;
 
+        // ES: Fase 5: activar el hook en MinHook.
         // Phase 5: Enable hook
         MH_STATUS enableStatus = MH_EnableHook(target);
         if (enableStatus != MH_OK) {
@@ -297,6 +342,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
             return false;
         }
 
+        // ES: Fase 6: arranca con bypass = 1 (pasa directo a la original) hasta que se llame a Enable().
         // Phase 6: Start with bypass=1 (passthrough) — hook is installed but disabled.
         // Caller must explicitly Enable() to activate the hook. This prevents
         // the hook from intercepting calls during loading/startup.
@@ -304,6 +350,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
             InterlockedExchange(reinterpret_cast<volatile LONG*>(fix.bypassFlag), 1);
         }
 
+        // ES: Fase 7: registrar la entrada.
         // Phase 7: Record
         HookEntry entry;
         entry.name = name;
@@ -323,6 +370,7 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
         return true;
     }
 
+    // ES: Hook estándar (sin mov rax, rsp): crear, activar y registrar.
     // ═══ STANDARD HOOK (no mov rax, rsp) ═══
     MH_STATUS status = MH_CreateHook(target, detour, original);
     if (status != MH_OK) {
@@ -356,6 +404,8 @@ bool HookManager::InstallRaw(const std::string& name, void* target, void* detour
     return true;
 }
 
+// ES: Quita un hook: restaura la vtable o desactiva+elimina en MinHook, y libera stubs.
+// EN: Removes a hook: restores the vtable or disables+removes it in MinHook, and frees stubs.
 bool HookManager::Remove(const std::string& name) {
     std::lock_guard lock(m_mutex);
 
@@ -393,6 +443,10 @@ bool HookManager::Remove(const std::string& name) {
     return true;
 }
 
+// ES: Quita todos los hooks. Asume que el llamador ya tiene el mutex (el comentario dice
+//     que la llama Shutdown, pero en realidad Shutdown no la usa).
+// EN: Removes all hooks. Assumes the caller already holds the mutex (the comment says
+//     Shutdown calls it, but Shutdown actually does not use it).
 void HookManager::RemoveAll() {
     // NOTE: Caller must already hold m_mutex (called from Shutdown).
     std::vector<std::string> names;
@@ -430,6 +484,12 @@ void HookManager::RemoveAll() {
     }
 }
 
+// ES: Activa un hook. En hooks MovRaxRsp solo pone el flag de bypass a 0 (no usa
+//     MH_EnableHook, que re-parchea bytes y suspende hilos y corrompía la cadena del
+//     detour tras un ciclo desactivar/activar). Escribe trazas con OutputDebugString.
+// EN: Enables a hook. For MovRaxRsp hooks it only sets the bypass flag to 0 (no
+//     MH_EnableHook, which re-patches bytes and suspends threads and corrupted the detour
+//     chain after a disable/enable cycle). Writes traces with OutputDebugString.
 bool HookManager::Enable(const std::string& name) {
     static int s_enableCount = 0;
     int callNum = ++s_enableCount;
@@ -470,6 +530,10 @@ bool HookManager::Enable(const std::string& name) {
     return true;
 }
 
+// ES: Desactiva un hook. En hooks MovRaxRsp pone el flag de bypass a 1 (paso directo al
+//     trampolín crudo); en los demás usa MH_DisableHook.
+// EN: Disables a hook. For MovRaxRsp hooks it sets the bypass flag to 1 (straight pass to
+//     the raw trampoline); otherwise uses MH_DisableHook.
 bool HookManager::Disable(const std::string& name) {
     spdlog::info("HookManager::Disable('{}') called", name);
 
@@ -510,6 +574,8 @@ bool HookManager::Disable(const std::string& name) {
     return true;
 }
 
+// ES: Dirección original de la función hookeada.
+// EN: Original address of the hooked function.
 void* HookManager::GetTarget(const std::string& name) const {
     std::lock_guard lock(m_mutex);
     auto it = m_hooks.find(name);
@@ -517,6 +583,8 @@ void* HookManager::GetTarget(const std::string& name) const {
     return it->second.target;
 }
 
+// ES: Devuelve customCaller, que ya siempre es nullptr (obsoleto).
+// EN: Returns customCaller, which is now always nullptr (deprecated).
 void* HookManager::GetCustomCaller(const std::string& name) const {
     std::lock_guard lock(m_mutex);
     auto it = m_hooks.find(name);
@@ -524,6 +592,8 @@ void* HookManager::GetCustomCaller(const std::string& name) const {
     return it->second.customCaller;
 }
 
+// ES: Trampolín crudo de MinHook (solo hooks MovRaxRsp).
+// EN: Raw MinHook trampoline (MovRaxRsp hooks only).
 void* HookManager::GetRawTrampoline(const std::string& name) const {
     std::lock_guard lock(m_mutex);
     auto it = m_hooks.find(name);
@@ -532,6 +602,8 @@ void* HookManager::GetRawTrampoline(const std::string& name) const {
     return it->second.movRaxRspHook.rawTrampoline;
 }
 
+// ES: ¿Instalado? / número de hooks.
+// EN: Installed? / hook count.
 bool HookManager::IsInstalled(const std::string& name) const {
     std::lock_guard lock(m_mutex);
     return m_hooks.count(name) > 0;
@@ -542,8 +614,11 @@ size_t HookManager::GetHookCount() const {
     return m_hooks.size();
 }
 
+// ES: Diagnósticos.
 // ── Diagnostics ──
 
+// ES: Copia el estado de todos los hooks bajo el mutex.
+// EN: Copies the state of all hooks under the mutex.
 std::vector<HookDiag> HookManager::GetDiagnostics() const {
     std::lock_guard lock(m_mutex);
     std::vector<HookDiag> diags;
@@ -567,6 +642,8 @@ std::vector<HookDiag> HookManager::GetDiagnostics() const {
     return diags;
 }
 
+// ES: Incrementan los contadores de llamadas/crashes de un hook.
+// EN: Increment a hook's call/crash counters.
 void HookManager::IncrementCallCount(const std::string& name) {
     std::lock_guard lock(m_mutex);
     auto it = m_hooks.find(name);
@@ -583,6 +660,12 @@ void HookManager::IncrementCrashCount(const std::string& name) {
     }
 }
 
+// ES: Hook de vtable: guarda el puntero original del slot, lo sustituye por el detour
+//     (cambiando la protección de memoria) y lo registra. Nota: entry.target se lee
+//     DESPUÉS de sobrescribir, así que guarda el detour y no la función original.
+// EN: Vtable hook: saves the slot's original pointer, replaces it with the detour
+//     (changing memory protection) and records it. Note: entry.target is read AFTER the
+//     overwrite, so it stores the detour instead of the original function.
 bool HookManager::InstallVTableHook(const std::string& name, void** vtable, int index,
                                     void* detour, void** original) {
     std::lock_guard lock(m_mutex);

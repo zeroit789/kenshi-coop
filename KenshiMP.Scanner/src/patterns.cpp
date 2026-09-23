@@ -1,3 +1,19 @@
+// ES: patterns.cpp — "camino B" de resolución de direcciones (ResolveGameFunctions) y
+//     reintento de globales (RetryGlobalDiscovery). Para cada función de GameFunctions:
+//     1) escanea su patrón AOB y lo valida con .pdata (RtlLookupFunctionEntry): si cae
+//     a más de 0x10 bytes del inicio real de la función, es la función EQUIVOCADA y se
+//     descarta; 2) si no hay patrón o falla, usa RuntimeStringScanner (string en .rdata ->
+//     LEA que lo referencia -> inicio de función); 3) descubre los globales PlayerBase y
+//     GameWorld desensamblando funciones ya resueltas (MOV/LEA reg,[RIP+disp32] hacia
+//     .data/.rdata) o por string, con RVAs fijas de la v1.0.68 como último recurso.
+// EN: patterns.cpp — address resolution "path B" (ResolveGameFunctions) and global
+//     retry (RetryGlobalDiscovery). For each GameFunctions entry: 1) scans its AOB pattern
+//     and validates it with .pdata (RtlLookupFunctionEntry): if it lands more than 0x10
+//     bytes past the real function start it is the WRONG function and is dropped; 2) if
+//     there is no pattern or it fails, uses RuntimeStringScanner (string in .rdata -> LEA
+//     referencing it -> function start); 3) discovers the PlayerBase and GameWorld globals
+//     by disassembling already resolved functions (MOV/LEA reg,[RIP+disp32] into
+//     .data/.rdata) or via strings, with fixed v1.0.68 RVAs as last resort.
 #include "kmp/patterns.h"
 #include "kmp/scanner.h"
 #include "kmp/memory.h"
@@ -7,17 +23,24 @@
 
 namespace kmp {
 
+// ES: Escáner de strings en runtime: respaldo cuando el patrón es nullptr o no casa.
+//     Busca strings conocidos en kenshi_x64.exe cargado en memoria y sigue sus xrefs hasta
+//     la función (misma lógica que el script re_scanner.py).
 // ── Runtime String Scanner ──
 // Fallback for when static patterns are nullptr or fail to match.
 // Scans the loaded kenshi_x64.exe in memory for known strings,
 // follows xrefs to find function addresses (same logic as re_scanner.py).
 class RuntimeStringScanner {
 public:
+    // ES: Guarda la base/tamaño del módulo y localiza .text, .rdata y .data.
+    // EN: Stores module base/size and locates .text, .rdata and .data.
     RuntimeStringScanner(uintptr_t moduleBase, size_t moduleSize)
         : m_base(moduleBase), m_size(moduleSize) {
         FindSections();
     }
 
+    // ES: Función que referencia un string: string -> LEA RIP-relativo -> inicio de función.
+    //     Devuelve 0 si falla algún paso.
     // Find a function that references the given string.
     // Returns the function start address, or 0 on failure.
     uintptr_t FindFunctionByString(const char* searchStr, int searchLen) const {
@@ -36,6 +59,10 @@ public:
         return funcStart;
     }
 
+    // ES: Busca un global (puntero en .data, o también .rdata si includeReadOnly) cargado en la
+    //     función que referencia un string: escanea desde el inicio de la función hasta 512
+    //     bytes después del xref buscando MOV/LEA reg,[RIP+disp32]. 'nth' elige la n-ésima
+    //     coincidencia. Devuelve la DIRECCIÓN del global, no su valor.
     // Find a global .data pointer that is loaded near code referencing a string.
     // Scans the function containing the string xref for MOV reg, [RIP+disp32]
     // instructions that point into the .data section. Returns the address of
@@ -62,6 +89,7 @@ public:
             return 0;
         }
 
+        // ES: Rango de escaneo: inicio de la función hasta xref+512 (acotado al final de .text).
         // Scan the entire function (from func start through 512 past the xref)
         // for MOV/LEA reg, [RIP+disp32] pointing to data sections
         uintptr_t scanStart = funcStart;
@@ -74,6 +102,8 @@ public:
         return result;
     }
 
+    // ES: Accesores y envoltorios públicos (usados también para diagnóstico).
+    // EN: Accessors and public wrappers (also used for diagnostics).
     // Getters for section info
     uintptr_t GetDataBase() const { return m_dataBase; }
     size_t GetDataSize() const { return m_dataSize; }
@@ -95,6 +125,8 @@ public:
     }
 
 private:
+    // ES: Base/tamaño del módulo y de las secciones .text/.rdata/.data.
+    // EN: Module and .text/.rdata/.data section base/size.
     uintptr_t m_base = 0;
     size_t    m_size = 0;
     uintptr_t m_textBase = 0;
@@ -104,6 +136,8 @@ private:
     uintptr_t m_dataBase = 0;
     size_t    m_dataSize = 0;
 
+    // ES: Recorre la tabla de secciones PE y guarda .text, .rdata y .data.
+    // EN: Walks the PE section table and stores .text, .rdata and .data.
     void FindSections() {
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(m_base);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -128,6 +162,7 @@ private:
         }
     }
 
+    // ES: ¿Está en una sección escribible del módulo (ni .text ni .rdata; p.ej. .data/.bss)?
     // Check if an address is in a writable module section (not .text, not .rdata)
     bool IsInWritableSection(uintptr_t addr) const {
         if (addr < m_base || addr >= m_base + m_size) return false;
@@ -138,6 +173,8 @@ private:
         return true;
     }
 
+    // ES: ¿Está en cualquier sección de datos (todo menos .text, incluida .rdata)? MSVC puede
+    //     poner globales como PlayerBase en .rdata (punteros const inicializados al arrancar).
     // Check if an address is in ANY data section (including .rdata)
     // Used for finding globals like PlayerBase which MSVC can place in .rdata
     // (static const pointers initialized at startup, read-only after that)
@@ -148,6 +185,10 @@ private:
         return true;
     }
 
+    // ES: Búsqueda por fuerza bruta (memcmp) del string: primero en .rdata y luego en todo el
+    //     módulo; cada pasada protegida con SEH. Devuelve la primera coincidencia.
+    // EN: Brute-force (memcmp) search of the string: first in .rdata, then the whole module;
+    //     each pass SEH-protected. Returns the first match.
     uintptr_t FindStringInMemoryImpl(const char* searchStr, int len) const {
         // Search .rdata first, then full module
         uintptr_t sections[] = { m_rdataBase, m_base };
@@ -171,6 +212,10 @@ private:
         return 0;
     }
 
+    // ES: Primer LEA RIP-relativo de .text (48/4C 8D con mod=0 rm=5) cuyo destino es el string.
+    //     Solo devuelve el PRIMER xref aunque haya varios.
+    // EN: First RIP-relative LEA in .text (48/4C 8D with mod=0 rm=5) targeting the string.
+    //     Only returns the FIRST xref even if there are several.
     uintptr_t FindStringXrefImpl(uintptr_t stringAddr) const {
         if (!m_textBase || !m_textSize) return 0;
 
@@ -202,6 +247,14 @@ private:
         return 0;
     }
 
+    // ES: Inicio de la función que contiene 'codeAddr'. Método 1: .pdata vía
+    //     RtlLookupFunctionEntry (autoritativo, sirve para funciones grandes). Método 2:
+    //     retroceder hasta 16 KB buscando padding CC/C3 seguido de un prólogo reconocido
+    //     (IsPrologue). El método 2 puede fallar en funciones muy grandes (p.ej. CharacterSpawn).
+    // EN: Start of the function containing 'codeAddr'. Method 1: .pdata via
+    //     RtlLookupFunctionEntry (authoritative, works for large functions). Method 2: walk back
+    //     up to 16 KB looking for CC/C3 padding followed by a recognized prologue (IsPrologue).
+    //     Method 2 can fail on very large functions (e.g. CharacterSpawn).
     uintptr_t FindFunctionStart(uintptr_t codeAddr) const {
         // Method 1: Use .pdata (RtlLookupFunctionEntry) — authoritative and works
         // for large functions (ApplyDamage=6925B, StartAttack=9253B) where the
@@ -242,6 +295,12 @@ private:
         return 0;
     }
 
+    // ES: Busca en [start, end) la n-ésima instrucción MOV/LEA reg,[RIP+disp32] (48/4C 8B/8D)
+    //     cuyo destino cae en una sección de datos escribible (o también .rdata si
+    //     includeReadOnly). Devuelve la dirección destino (el global) o 0.
+    // EN: Searches [start, end) for the nth MOV/LEA reg,[RIP+disp32] (48/4C 8B/8D) whose
+    //     target lies in a writable data section (or .rdata too if includeReadOnly).
+    //     Returns the target address (the global) or 0.
     uintptr_t ScanForGlobalLoadImpl(uintptr_t start, uintptr_t end, int nth,
                                     bool includeReadOnly = false) const {
         // Look for MOV reg, [RIP+disp32] (REX.W prefix: 48 8B/4C 8B)
@@ -284,6 +343,12 @@ private:
         return 0;
     }
 
+    // ES: ¿Parecen los bytes en 'addr' un prólogo MSVC? Acepta guardados en shadow space,
+    //     push (con/sin REX), sub rsp y también mov rax, rsp (48 8B C4). Nota: docs/03-scanner.md
+    //     dice que no reconoce 48 8B C4, pero el código actual sí lo hace (última comprobación).
+    // EN: Do the bytes at 'addr' look like an MSVC prologue? Accepts shadow space saves,
+    //     pushes (with/without REX), sub rsp and also mov rax, rsp (48 8B C4). Note:
+    //     docs/03-scanner.md says it does not recognize 48 8B C4, but current code does (last check).
     bool IsPrologue(uintptr_t addr) const {
         __try {
             auto* p = reinterpret_cast<const uint8_t*>(addr);
@@ -326,14 +391,29 @@ private:
     }
 };
 
+// ES: Resolución de las funciones del juego (camino B).
 // ── Resolve Game Functions ──
 
+// ES: Rellena 'funcs' con patrones AOB, respaldo por strings y descubrimiento de globales.
+//     Devuelve funcs.IsMinimallyResolved(). No sobrescribe entradas ya resueltas (p.ej. por
+//     el orquestador vía vtable).
+// EN: Fills 'funcs' with AOB patterns, string fallback and global discovery.
+//     Returns funcs.IsMinimallyResolved(). Does not overwrite already resolved entries
+//     (e.g. by the orchestrator via vtable).
 bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
     uintptr_t base = scanner.GetBase();
     size_t moduleSize = scanner.GetSize();
     int resolved = 0;
     int total = 0;
 
+    // ES: tryPattern: si el campo ya tiene valor lo respeta; si no hay patrón no hace nada;
+    //     si el patrón casa, valida con .pdata: desfase <= 0x10 se autocorrige al inicio de la
+    //     función, desfase mayor = función equivocada (se deja a nullptr). Además rechaza
+    //     direcciones no alineadas a 16 salvo que .pdata confirme que son inicio de función.
+    // EN: tryPattern: keeps the field if already set; does nothing without a pattern; if
+    //     the pattern matches, validates with .pdata: offset <= 0x10 is auto-corrected to the
+    //     function start, larger offset = wrong function (left nullptr). It also rejects
+    //     addresses not 16-byte aligned unless .pdata confirms they are a function start.
     auto tryPattern = [&](const char* name, const char* pattern, void*& target) {
         total++;
         if (target != nullptr) {
@@ -351,6 +431,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         if (result) {
             uintptr_t addr = result.address;
 
+            // ES: Validación .pdata: algunos patrones caen dentro de OTRA función en Steam;
+            //     autocorregir a esa función hookearía la equivocada -> crash. Solo se corrige <= 16 bytes.
             // Validate pattern match is a real function entry using .pdata
             // Some patterns match inside a DIFFERENT function on Steam.
             // Auto-correcting to that function's start would hook the WRONG function → crash.
@@ -380,6 +462,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
                 }
             }
 
+            // ES: Comprobación de alineación (solo se acepta sin alinear si .pdata lo confirma, caso
+            //     SquadAddMember @0x928423).
             // Alignment check: MSVC usually aligns functions to 16 bytes, but NOT always.
             // .pdata is the authoritative source for function boundaries.
             // SquadAddMember at 0x928423 is a valid .pdata function entry despite not being
@@ -407,6 +491,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         }
     };
 
+    // ES: Primero se intenta por patrón, en el mismo orden que las secciones de patterns.h.
     // Try pattern-based resolution first
 
     // Entity lifecycle
@@ -477,6 +562,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
     tryPattern("BuildingConstruct",    patterns::BUILDING_CONSTRUCT,     funcs.BuildingConstruct);
     tryPattern("BuildingRepair",       patterns::BUILDING_REPAIR,        funcs.BuildingRepair);
 
+    // ES: Respaldo por strings en runtime: para cada función que siga a nullptr se busca su
+    //     string ancla -> xref -> inicio de función, y se valida con .pdata igual que el patrón.
     // ── Runtime String Scanner Fallback ──
     // If patterns failed, try runtime string-xref scanning
     int fallbackResolved = 0;
@@ -489,6 +576,9 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         void**      target;
     };
 
+    // ES: Strings de respaldo verificados en kenshi_x64.exe v1.0.68 (id, texto, longitud,
+    //     campo destino). CharacterMoveTo y SquadAddMember están comentados porque sus strings
+    //     llevan a la función equivocada en Steam.
     // Fallback strings verified to exist in kenshi_x64.exe v1.0.68
     FallbackEntry fallbacks[] = {
         // Entity lifecycle
@@ -499,6 +589,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         {"CharacterKO",          "knockout",                                             8, &funcs.CharacterKO},
         // Movement
         {"CharacterSetPosition", "HavokCharacter::setPosition moved someone off the world", 55, &funcs.CharacterSetPosition},
+        // ES: "pathfind" es demasiado genérico (cae en otra función en Steam); se queda a null
+        //     y la sincronización de movimiento se hace por sondeo de posición.
         // CharacterMoveTo: "pathfind" is too generic — finds wrong function on Steam.
         // Resolved via vtable discovery or remains null (position polling handles sync).
         // {"CharacterMoveTo",   "pathfind",                                             8, &funcs.CharacterMoveTo},
@@ -523,6 +615,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         {"CharacterStats",       "CharacterStats_Attributes",                            25, &funcs.CharacterStats},
         // Squad / Platoon
         {"SquadCreate",          "Reset squad positions",                                21, &funcs.SquadCreate},
+        // ES: "delayedSpawningChecks" cae en otra función en Steam; se resuelve por vtable
+        //     (el comentario dice core.cpp; en este módulo lo hace el orquestador por RTTI).
         // SquadAddMember: "delayedSpawningChecks" finds wrong function on Steam.
         // Resolved via vtable discovery (Squad vtable+0x10) in core.cpp instead.
         // {"SquadAddMember",    "delayedSpawningChecks",                               21, &funcs.SquadAddMember},
@@ -542,6 +636,9 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         {"BuildingConstruct",    "construction progress",                                21, &funcs.BuildingConstruct},
     };
 
+    // ES: Para cada entrada no resuelta: buscar por string, validar con .pdata (corrige
+    //     desfases <= 0x10, descarta mayores) y, si falla, loguear el motivo (string no
+    //     encontrado, sin xref o sin prólogo).
     for (auto& fb : fallbacks) {
         if (*fb.target != nullptr) continue; // Already resolved by pattern or orchestrator
 
@@ -571,6 +668,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             fallbackResolved++;
             spdlog::info("ResolveGameFunctions: '{}' = 0x{:X} (string fallback)", fb.label, addr);
         } else {
+            // ES: Diagnóstico de POR QUÉ falló el respaldo.
             // Diagnose WHY the string fallback failed
             uintptr_t strAddr = rss.FindStringInMemory(fb.searchStr, fb.searchLen);
             if (strAddr) {
@@ -590,10 +688,14 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         }
     }
 
+    // ES: Descubrimiento automático de punteros globales: en vez de fijar offsets por versión,
+    //     se buscan referencias a .data cerca de strings conocidos o en funciones ya resueltas.
     // ── Auto-discover global pointers ──
     // Instead of hardcoding version-specific offsets, we find globals by
     // scanning for .data section references near known strings.
 
+    // ES: ¿Parece un puntero de usuario válido? (> 0x10000, < 0x7FFFFFFFFFFF y distinto de los
+    //     valores centinela 0xFF.., 0xCC.., 0xCD..).
     // Helper: validate that a pointer value looks like a real user-mode address.
     // On x64 Windows, user-mode addresses are below 0x00007FFFFFFFFFFF.
     // We also exclude very low addresses (< 0x10000) and uninitialized sentinels.
@@ -604,6 +706,9 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
                val != 0xCDCDCDCDCDCDCDCD;
     };
 
+    // ES: Descubrimiento de globales desensamblando funciones ya resueltas: busca la n-ésima
+    //     MOV/LEA reg,[RIP+disp32] hacia .data/.rdata dentro de la función (fin según .pdata,
+    //     o 4 KB si no hay entrada). Funciona igual en GOG y Steam.
     // ── Function-disassembly global discovery ──
     // The pattern scanner already resolved exact function addresses. We can scan
     // their code for MOV/LEA reg,[RIP+disp32] pointing into .data to find globals
@@ -626,6 +731,10 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         return rss.ScanForGlobalLoad(funcAddr, scanEnd, nth, true);
     };
 
+    // ES: Validación semántica de PlayerBase: es puntero-a-puntero (*PlayerBase -> objeto con
+    //     vtable). El valor debe ser un puntero de heap (FUERA de la imagen del módulo) cuyo
+    //     primer qword (vtable) apunte dentro del módulo. Valor 0 = partida sin cargar: no se
+    //     acepta todavía. Nota: el rango "texto" usado es base+0x1000 .. fin del módulo, no solo .text.
     // ── Semantic validation: does this look like a real PlayerBase? ──
     // PlayerBase is a pointer-to-pointer: *PlayerBase -> object with vtable.
     // After game loads, the object should have a valid faction list at known offsets.
@@ -652,6 +761,10 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         return true;
     };
 
+    // ES: PlayerBase: prioridad 1) desensamblado de funciones, 2) xref de strings, 3) RVA fija.
+    //     ARREGLO STEAM: al principio la partida no está cargada y los globales valen 0, así
+    //     que se hace en dos pasadas: estricta (puntero de heap válido) y tentativa (acepta
+    //     valor 0 si la dirección está en .data), que RetryGlobalDiscovery revalida después.
     // PlayerBase: Find the global pointer that the squad/player code loads.
     // Priority: 1) function disassembly, 2) string-xref, 3) hardcoded (GOG only)
     //
@@ -680,7 +793,10 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         return true;
     };
 
+    // ES: Búsqueda de PlayerBase (solo si aún no está fijado).
     if (funcs.PlayerBase == 0) {
+        // ES: Método 1: desensamblar CharacterSpawn, CharacterStats, SaveGame y LoadGame buscando
+        //     globales en .data (las 16 primeras referencias de cada una).
         // Method 1: Scan resolved functions for .data globals (most reliable)
         // CharacterSpawn (RootObjectFactory::process) loads the factory singleton
         // which is often near or is PlayerBase.
@@ -692,6 +808,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         };
         const char* funcNames[] = { "CharacterSpawn", "CharacterStats", "SaveGame", "LoadGame" };
 
+        // ES: Pasada 1: validación estricta.
         // Pass 1: Strict validation (non-null heap pointer with vtable)
         for (int fi = 0; fi < 4 && funcs.PlayerBase == 0; fi++) {
             if (!funcCandidates[fi]) continue;
@@ -714,6 +831,9 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
+        // ES: Método 2: xref de strings (sirve en cualquier versión). Ojo: aquí la longitud de
+        //     "[Character::serialise] Character '" es 33 (sin la comilla final) y en la tabla de
+        //     respaldo es 34; ambas funcionan porque es una búsqueda de prefijo.
         // Method 2: Runtime string-xref discovery (works on any version)
         if (funcs.PlayerBase == 0) {
             const char* playerAnchors[] = {
@@ -739,6 +859,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
+        // ES: Método 3: RVA fija de PlayerBase (0x01AC8A90, GOG/1.0.68), último recurso.
         // Method 3: Hardcoded GOG offset (last resort)
         if (funcs.PlayerBase == 0) {
             uintptr_t hardcoded = base + 0x01AC8A90;
@@ -751,6 +872,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
+        // ES: Pasada 2 (Steam antes de cargar): acepta globales de .data con valor nulo de forma
+        //     provisional; RetryGlobalDiscovery los revalidará.
         // Pass 2 (Steam pre-load): Accept null-valued .data globals tentatively.
         // These will be re-validated by RetryGlobalDiscovery after the game loads.
         if (funcs.PlayerBase == 0) {
@@ -770,6 +893,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
                 }
             }
 
+            // ES: Pasada tentativa por xref de strings.
             // Tentative string-xref pass
             if (funcs.PlayerBase == 0) {
                 const char* playerAnchors[] = {
@@ -801,11 +925,16 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         }
     }
 
+    // ES: Singleton GameWorld: lo referencian las funciones de tiempo/velocidad/mundo.
+    //     Prioridad: 1) desensamblado, 2) xref de strings, 3) RVA fija.
     // GameWorld singleton: referenced by time/speed/world management functions.
     // Priority: 1) function disassembly, 2) string-xref, 3) hardcoded (GOG only)
     // ── Helper: ¿es 'p' un puntero de heap válido del juego? ──
     // Mismo criterio que isValidUserPtr + alineado a 8 + FUERA de la imagen del módulo.
     // (Equivale a isValidHeapPtr de game_character.cpp, replicado aquí para el scanner.)
+    // EN: Helper: is 'p' a valid game heap pointer? Same criteria as isValidUserPtr + 8-byte
+    //     aligned + OUTSIDE the module image (equivalent to isValidHeapPtr in
+    //     game_character.cpp, replicated here for the scanner).
     auto isHeapPtr = [&](uintptr_t p) -> bool {
         if (!isValidUserPtr(p)) return false;
         if ((p & 0x7) != 0) return false;              // objetos del juego alineados a 8
@@ -821,6 +950,14 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
     //   (a) puntero clasico : *candidateAddr es un heap-ptr -> el OBJETO es *candidateAddr
     //   (b) instancia directa: *candidateAddr es la vtable (.text) -> el OBJETO es candidateAddr
     // Devuelve la direccion del OBJETO GameWorld resuelto, o 0 si no encaja ninguno.
+    // EN: resolveGwObject (1.0.68: embedded instance vs classic pointer). CRITICAL on Steam
+    //     1.0.68: GameWorld is NOT a global pointer (GameWorld* ou); it is the static INSTANCE
+    //     embedded in .data. So the candidate base+0x2134110 IS the GameWorld object itself
+    //     (its first qword is the vtable in .text), NOT a pointer to it. To be robust across
+    //     versions/platforms both layouts are accepted:
+    //       (a) classic pointer: *candidateAddr is a heap ptr -> the OBJECT is *candidateAddr
+    //       (b) direct instance: *candidateAddr is the vtable (.text) -> the OBJECT is candidateAddr
+    //     Returns the address of the resolved GameWorld OBJECT, or 0 if neither fits.
     uintptr_t textStart = base + 0x1000;
     uintptr_t textEnd   = base + moduleSize;
     auto resolveGwObject = [&](uintptr_t candidateAddr) -> uintptr_t {
@@ -856,6 +993,18 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
     // cachea nada. Si en una carga temprana el player aún no existe, devuelve false sin
     // marcar el candidato como inválido permanente; RetryGlobalDiscovery lo reintenta más
     // tarde y entonces sí lo aceptará. No invalida para siempre.
+    // EN: validateGameWorld (Fix 3: version-robust CHAIN validator). The old validator only
+    //     checked "heap object with a vtable in .text", which gave FALSE POSITIVES (it accepted
+    //     any game object). Now the candidate must really be the GameWorld by validating the
+    //     2-3 hop chain used by GetPlayerFactionDirect (KenshiLib offsets, Kenshi 1.0.68):
+    //       player (PlayerInterface*) = *(gwObj + 0x580)   (GameWorld.h:137)
+    //       faction (Faction*)        = *(player + 0x2A0)  (PlayerInterface.h:248)
+    //       name (ASCII std::string)  =   faction + 0x1A8  (Faction.h:147) [optional check]
+    //     If the chain does not resolve, it is NOT the GameWorld and the candidate is dropped,
+    //     so the scanner can find the REAL GameWorld even if the hardcoded RVA is off.
+    //     Retryable: evaluated per candidate on every pass and caches nothing; if the player
+    //     does not exist yet during early load it returns false without permanently
+    //     invalidating the candidate, and RetryGlobalDiscovery accepts it later.
     auto validateGameWorld = [&](uintptr_t candidateAddr) -> bool {
         // gwObj = objeto GameWorld real (instancia directa o *puntero). 0 = no encaja/aún null.
         uintptr_t gwObj = resolveGwObject(candidateAddr);
@@ -878,6 +1027,10 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         // lectura falla (carga muy temprana), NO invalidamos por ello: la cadena de 2
         // saltos ya es muy específica del GameWorld real. Solo rechazamos si leemos
         // basura binaria clara.
+        // EN: Optional check: the name at faction + 0x1A8 must be readable ASCII. MSVC x64
+        //     std::string: if capacity <= 15 the text is inline at +0x00, otherwise the first
+        //     qword points to the heap buffer. Reads up to 8 bytes and rejects only clear binary
+        //     garbage (< 60% printable); a failed read (very early load) does not invalidate.
         uintptr_t strField = faction + 0x1A8;
         uintptr_t cap = 0;
         Memory::Read(strField + 0x18, cap);            // capacity (uint64)
@@ -905,7 +1058,10 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         return true;
     };
 
+    // ES: Búsqueda de GameWorld (solo si aún no está fijado).
     if (funcs.GameWorldSingleton == 0) {
+        // ES: Método 1: desensamblar TimeUpdate, ZoneLoad, GameFrameUpdate y SaveGame buscando
+        //     globales y validando cada candidato con la cadena player/faction.
         // Method 1: Scan resolved functions for .data globals
         uintptr_t gwFuncCandidates[] = {
             reinterpret_cast<uintptr_t>(funcs.TimeUpdate),
@@ -936,6 +1092,8 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
+        // ES: Método 2: xref de strings. Ojo: "dayTime" NO existe en la v1.0.68 (según
+        //     docs/03-scanner.md), así que en esa versión solo sirven los otros dos anclas.
         // Method 2: Runtime string-xref discovery
         if (funcs.GameWorldSingleton == 0) {
             const char* worldAnchors[] = { "dayTime", "zone.%d.%d.zone", "Kenshi 1.0." };
@@ -962,6 +1120,11 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         // base+0x2134110 ES el objeto (primer qword = vtable .text 0x1722608). validateGameWorld
         // ya maneja ambos casos (instancia directa / puntero clasico). Verificado RTTI/xref.
         // Historial: 0x2133040 (erroneo) -> 0x2131020 (era 1.0.65, NULL) -> 0x2134110 (1.0.68 OK).
+        // EN: Method 3 detail: RVA of the GameWorld INSTANCE embedded in .data for Kenshi Steam
+        //     1.0.68. On 1.0.68 GameWorld is NOT a pointer but the instance itself: base+0x2134110
+        //     IS the object (first qword = .text vtable 0x1722608). validateGameWorld handles both
+        //     cases. Verified via RTTI/xrefs. History: 0x2133040 (wrong) -> 0x2131020 (1.0.65 era,
+        //     NULL) -> 0x2134110 (1.0.68 OK).
         if (funcs.GameWorldSingleton == 0) {
             uintptr_t hardcoded = base + 0x2134110;
             if (validateGameWorld(hardcoded)) {
@@ -973,6 +1136,9 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
+        // ES: Pasada 2 (Steam antes de cargar): globales de .data con valor nulo, provisionales.
+        //     Nota: un candidato no nulo que sea la instancia embebida no pasa esta validación
+        //     tentativa (exige puntero de heap); ese caso lo cubre la RVA fija del método 3.
         // Pass 2 (Steam pre-load): Accept null-valued .data globals tentatively.
         if (funcs.GameWorldSingleton == 0) {
             spdlog::info("ResolveGameFunctions: GameWorld not found (strict) — trying tentative (null-allowed)...");
@@ -999,6 +1165,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
                 }
             }
 
+            // ES: Pasada tentativa por xref de strings.
             // Tentative string-xref pass
             if (funcs.GameWorldSingleton == 0) {
                 const char* worldAnchors2[] = { "dayTime", "zone.%d.%d.zone", "Kenshi 1.0." };
@@ -1025,6 +1192,7 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
         }
     }
 
+    // ES: Resumen en el log y resultado: ¿hay lo mínimo resuelto para arrancar?
     int totalResolved = resolved + fallbackResolved;
     spdlog::info("ResolveGameFunctions: Resolved {} pattern + {} fallback = {} total, PlayerBase=0x{:X}",
                  resolved, fallbackResolved, totalResolved, funcs.PlayerBase);
@@ -1032,12 +1200,21 @@ bool ResolveGameFunctions(const PatternScanner& scanner, GameFunctions& funcs) {
     return funcs.IsMinimallyResolved();
 }
 
+// ES: Reintento de descubrimiento de globales tras cargar la partida (los valores ya no
+//     son nulos). Revalida PlayerBase (heap + vtable) y GameWorld (cadena completa); si no
+//     son válidos los vuelve a buscar por desensamblado y strings (sin RVA fija).
+//     Devuelve true si hay PlayerBase (encontrar GameWorld no cambia el resultado).
+// EN: Global discovery retry after the game has loaded (values are no longer null).
+//     Re-validates PlayerBase (heap + vtable) and GameWorld (full chain); if invalid, searches
+//     them again via disassembly and strings (no fixed RVA). Returns true if PlayerBase
+//     exists (finding GameWorld does not change the result).
 bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
     uintptr_t base = scanner.GetBase();
     size_t moduleSize = scanner.GetSize();
     RuntimeStringScanner rss(base, moduleSize);
     bool found = false;
 
+    // ES: Mismo filtro de puntero de usuario válido que en ResolveGameFunctions.
     auto isValidUserPtr = [](uintptr_t val) -> bool {
         return val > 0x10000 && val < 0x00007FFFFFFFFFFF &&
                val != 0xFFFFFFFFFFFFFFFF &&
@@ -1045,6 +1222,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
                val != 0xCDCDCDCDCDCDCDCD;
     };
 
+    // ES: Validación semántica: objeto de heap con vtable dentro del módulo.
     // Semantic validation: heap-allocated object with vtable in .text
     auto validateGlobal = [&](uintptr_t candidateAddr) -> bool {
         if (candidateAddr == 0) return false;
@@ -1065,6 +1243,11 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
     // existen: es el mejor momento para exigir la cadena completa y DESCARTAR el falso
     // positivo que el Pass 2 tentativo pudo dejar fijado. Misma cadena que
     // GetPlayerFactionDirect: gwObj -> +0x580 (player) -> +0x2A0 (faction), nombre +0x1A8.
+    // EN: isHeapPtr / validateGameWorldChain (Fix 3, also in the post-load retry).
+    //     RetryGlobalDiscovery runs AFTER the game has loaded, when player/faction exist: the
+    //     best moment to require the full chain and DROP the false positive the tentative
+    //     Pass 2 may have set. Same chain as GetPlayerFactionDirect:
+    //     gwObj -> +0x580 (player) -> +0x2A0 (faction), name at +0x1A8.
     auto isHeapPtr = [&](uintptr_t p) -> bool {
         if (!isValidUserPtr(p)) return false;
         if ((p & 0x7) != 0) return false;
@@ -1074,6 +1257,9 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
     // resolveGwObject: mismo criterio que en ResolveGameFunctions — acepta instancia
     // embebida (1.0.68: *candidateAddr ES la vtable .text) o puntero clasico (*candidateAddr
     // es heap-ptr al objeto). Devuelve la addr del OBJETO GameWorld, o 0 si no encaja.
+    // EN: resolveGwObject: same criteria as in ResolveGameFunctions — accepts the embedded
+    //     instance (1.0.68: *candidateAddr IS the .text vtable) or a classic pointer
+    //     (*candidateAddr is a heap ptr to the object). Returns the OBJECT address, or 0.
     uintptr_t textStart = base + 0x1000;
     uintptr_t textEnd   = base + moduleSize;
     auto resolveGwObject = [&](uintptr_t candidateAddr) -> uintptr_t {
@@ -1089,6 +1275,10 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
             return candidateAddr;
         return 0;
     };
+    // ES: Cadena GameWorld -> +0x580 player -> +0x2A0 facción (+ nombre en +0x1A8), igual que
+    //     validateGameWorld de ResolveGameFunctions.
+    // EN: GameWorld -> +0x580 player -> +0x2A0 faction chain (+ name at +0x1A8), same as
+    //     validateGameWorld in ResolveGameFunctions.
     auto validateGameWorldChain = [&](uintptr_t candidateAddr) -> bool {
         uintptr_t gwObj = resolveGwObject(candidateAddr);
         if (gwObj == 0) return false;
@@ -1121,6 +1311,8 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
         return true;
     };
 
+    // ES: Igual que en ResolveGameFunctions: n-ésimo global cargado dentro de una función.
+    // EN: Same as in ResolveGameFunctions: nth global loaded inside a function.
     auto findGlobalInFunction = [&](uintptr_t funcAddr, int nth) -> uintptr_t {
         if (!funcAddr) return 0;
         // Use .pdata to determine function end (accurate), fallback to 4KB scan.
@@ -1138,6 +1330,8 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
         return rss.ScanForGlobalLoad(funcAddr, scanEnd, nth, true);
     };
 
+    // ES: Reintento de PlayerBase: si el actual ya es válido se conserva; si no, se pone a 0
+    //     y se vuelve a buscar.
     // ── PlayerBase retry ──
     if (funcs.PlayerBase != 0) {
         if (validateGlobal(funcs.PlayerBase)) {
@@ -1151,6 +1345,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
     }
 
     if (funcs.PlayerBase == 0) {
+        // ES: Método 1: desensamblado de funciones.
         // Method 1: Function disassembly (most reliable after game load)
         uintptr_t funcCandidates[] = {
             reinterpret_cast<uintptr_t>(funcs.CharacterSpawn),
@@ -1175,6 +1370,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
             }
         }
 
+        // ES: Método 2: xref de strings (añade "quicksave" como quinto ancla).
         // Method 2: String-xref fallback
         if (funcs.PlayerBase == 0) {
             const char* playerAnchors[] = {
@@ -1207,6 +1403,9 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
     // Revalidamos con la CADENA (no solo vtable): si el Pass 2 tentativo fijó un falso
     // positivo, aquí (ya cargada la partida) la cadena player/faction lo descarta y se
     // vuelve a escanear para encontrar el GameWorld real.
+    // EN: GameWorld retry: re-validate with the CHAIN (not just the vtable). If the tentative
+    //     Pass 2 fixed a false positive, here (game already loaded) the player/faction chain
+    //     drops it and a rescan finds the real GameWorld.
     if (funcs.GameWorldSingleton != 0) {
         if (validateGameWorldChain(funcs.GameWorldSingleton)) {
             // Already good — cadena player/faction válida
@@ -1222,6 +1421,15 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
             // mueve y su validez de vtable es estable, CONSERVAMOS el candidato. La cadena
             // player/faction se revalida por-tick dentro de CharacterIterator y
             // GetPlayerFactionDirect cuando ya esté poblada.
+            // EN: FIX connected-then-load (entities=0 / tracked:0): the candidate is STRUCTURALLY a
+            //     GameWorld (embedded instance with a .text vtable), but the player/faction sub-chain
+            //     (GW+0x580 -> +0x2A0) does NOT resolve yet. This happens in the "connected-then-load"
+            //     flow: RetryGlobalDiscovery runs right after loading ends, BEFORE PlayerInterface/
+            //     faction are linked. Before, it was reset to 0, so the GameWorld bridge was never set,
+            //     CharacterIterator Strategy 2 never ran and entities stayed 0 forever. Since the
+            //     embedded instance (base+0x2134110) NEVER moves and its vtable validity is stable, the
+            //     candidate is KEPT. The player/faction chain is re-validated per tick inside
+            //     CharacterIterator and GetPlayerFactionDirect once populated.
             spdlog::warn("RetryGlobalDiscovery: GameWorld 0x{:X} con vtable válida pero cadena "
                          "player/faction aún sin poblar — CONSERVANDO candidato (se revalida por tick)",
                          funcs.GameWorldSingleton);
@@ -1232,6 +1440,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
         }
     }
 
+    // ES: Búsqueda de GameWorld: método 1 desensamblado, método 2 strings (sin RVA fija aquí).
     if (funcs.GameWorldSingleton == 0) {
         // Method 1: Function disassembly
         uintptr_t gwFuncCandidates[] = {
@@ -1277,6 +1486,7 @@ bool RetryGlobalDiscovery(const PatternScanner& scanner, GameFunctions& funcs) {
         }
     }
 
+    // ES: Resultado: true si se encontró un PlayerBase nuevo o ya había uno válido.
     return found || (funcs.PlayerBase != 0);
 }
 

@@ -1,3 +1,7 @@
+// ES: scanner.cpp — implementación del PatternScanner clásico (ver kmp/scanner.h).
+//     Escaneo byte a byte (sin SIMD); el motor rápido SSE2 está en scanner_engine.cpp.
+// EN: scanner.cpp — implementation of the classic PatternScanner (see kmp/scanner.h).
+//     Byte-by-byte scanning (no SIMD); the fast SSE2 engine lives in scanner_engine.cpp.
 #include "kmp/scanner.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -6,6 +10,10 @@
 
 namespace kmp {
 
+// ES: Inicializa: obtiene el HMODULE, valida las firmas DOS ("MZ") y NT ("PE"),
+//     guarda SizeOfImage y busca la sección .text.
+// EN: Init: gets the HMODULE, validates the DOS ("MZ") and NT ("PE") signatures,
+//     stores SizeOfImage and looks up the .text section.
 bool PatternScanner::Init(const char* moduleName) {
     HMODULE hModule = moduleName ? GetModuleHandleA(moduleName) : GetModuleHandleA(nullptr);
     if (!hModule) {
@@ -40,6 +48,10 @@ bool PatternScanner::Init(const char* moduleName) {
     return true;
 }
 
+// ES: Recorre la tabla de secciones del PE buscando ".text". Si no existe,
+//     usa el módulo completo como región de escaneo y devuelve false.
+// EN: Walks the PE section table looking for ".text". If missing, uses the
+//     whole module as scan region and returns false.
 bool PatternScanner::FindTextSection() {
     auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(m_moduleBase);
     auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS*>(m_moduleBase + dosHeader->e_lfanew);
@@ -59,6 +71,8 @@ bool PatternScanner::FindTextSection() {
     return false;
 }
 
+// ES: Parsea el patrón token a token: "?"/"??" = comodín, lo demás = byte hex fijo.
+// EN: Parses the pattern token by token: "?"/"??" = wildcard, anything else = fixed hex byte.
 std::optional<PatternScanner::ParsedPattern> PatternScanner::Parse(const char* pattern) {
     ParsedPattern result;
     std::istringstream stream(pattern);
@@ -79,6 +93,10 @@ std::optional<PatternScanner::ParsedPattern> PatternScanner::Parse(const char* p
     return result;
 }
 
+// ES: Búsqueda lineal: filtra rápido por el primer byte (si no es comodín) y luego
+//     compara el resto respetando la máscara. Devuelve la primera coincidencia o 0.
+// EN: Linear search: fast filter on the first byte (if not a wildcard), then
+//     compares the rest honoring the mask. Returns the first match or 0.
 uintptr_t PatternScanner::ScanRegion(uintptr_t start, size_t size,
                                      const ParsedPattern& pattern) const {
     if (pattern.bytes.empty() || size < pattern.bytes.size()) return 0;
@@ -109,10 +127,16 @@ uintptr_t PatternScanner::ScanRegion(uintptr_t start, size_t size,
     return 0;
 }
 
+// ES: Find sin offset: delega en la sobrecarga con offset 0.
+// EN: Find without offset: delegates to the overload with offset 0.
 PatternResult PatternScanner::Find(const char* pattern) const {
     return Find(pattern, 0);
 }
 
+// ES: Parsea el patrón, escanea .text (o el módulo entero) y devuelve la
+//     dirección de la coincidencia + offset. Loguea si no lo encuentra.
+// EN: Parses the pattern, scans .text (or the whole module) and returns the
+//     match address + offset. Logs when not found.
 PatternResult PatternScanner::Find(const char* pattern, int offset) const {
     auto parsed = Parse(pattern);
     if (!parsed) {
@@ -138,6 +162,8 @@ PatternResult PatternScanner::Find(const char* pattern, int offset) const {
     return result;
 }
 
+// ES: Encuentra todas las coincidencias avanzando un byte tras cada hallazgo.
+// EN: Finds all matches, advancing one byte after each hit.
 std::vector<uintptr_t> PatternScanner::FindAll(const char* pattern) const {
     auto parsed = Parse(pattern);
     if (!parsed) return {};
@@ -165,6 +191,8 @@ std::vector<uintptr_t> PatternScanner::FindAll(const char* pattern) const {
     return results;
 }
 
+// ES: destino = instrucción + longitud + rel32 (direccionamiento relativo a RIP de x64).
+// EN: target = instruction + length + rel32 (x64 RIP-relative addressing).
 uintptr_t PatternScanner::ResolveRIP(uintptr_t instructionAddr, int operandOffset,
                                      int instructionLength) {
     int32_t relative;
@@ -172,12 +200,16 @@ uintptr_t PatternScanner::ResolveRIP(uintptr_t instructionAddr, int operandOffse
     return instructionAddr + instructionLength + relative;
 }
 
+// ES: CALL rel32: opcode E8, operando en +1, longitud 5.
+// EN: CALL rel32: opcode E8, operand at +1, length 5.
 uintptr_t PatternScanner::FollowCall(uintptr_t callAddr) {
     uint8_t opcode = *reinterpret_cast<uint8_t*>(callAddr);
     if (opcode != 0xE8) return 0;
     return ResolveRIP(callAddr, 1, 5);
 }
 
+// ES: JMP rel32: opcode E9, operando en +1, longitud 5.
+// EN: JMP rel32: opcode E9, operand at +1, length 5.
 uintptr_t PatternScanner::FollowJmp(uintptr_t jmpAddr) {
     uint8_t opcode = *reinterpret_cast<uint8_t*>(jmpAddr);
     if (opcode != 0xE9) return 0;
