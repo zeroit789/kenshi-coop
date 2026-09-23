@@ -1,3 +1,10 @@
+// ES: Implementación del menú nativo de multijugador (MyGUI): carga del layout, cambio
+//     de subpaneles, detección de clics por coordenadas, entrada de teclado manual en
+//     los campos de texto y acciones (lanzar servidor local, conectar, guardar ajustes,
+//     navegador de servidores).
+// EN: Native multiplayer menu (MyGUI) implementation: layout loading, sub-panel
+//     switching, click detection by coordinates, manual keyboard input into the text
+//     fields and actions (launch local server, connect, save settings, server browser).
 #include "native_menu.h"
 #include "mygui_bridge.h"
 #include "../core.h"
@@ -11,9 +18,16 @@
 
 namespace kmp {
 
+// ES: Inicializa el menú: puente MyGUI, layout, widgets, valores iniciales desde la
+//     configuración y captions de botones. Queda oculto por defecto.
+// EN: Initializes the menu: MyGUI bridge, layout, widgets, initial values from config
+//     and button captions. Starts hidden.
 bool NativeMenu::Init() {
     if (m_initialized) return true;
 
+    // ES: Enfriamiento: si Init() falló hace poco, no reintentar en 10 s. Evita bucles
+    //     rápidos de crash-captura-reintento que corrompen el estado de MyGUI (p.ej. en
+    //     la pantalla del logo, antes de cargar los recursos).
     // Cooldown: if Init() failed recently, don't retry for 10 seconds.
     // Prevents rapid crash-catch-retry loops that corrupt MyGUI state
     // (e.g., at the logo screen before resources are loaded).
@@ -53,6 +67,7 @@ bool NativeMenu::Init() {
         return false;
     }
 
+    // ES: Rellenar los campos con los valores de la configuración.
     // Pre-populate EditBoxes with config values
     auto& config = Core::Get().GetConfig();
     bridge.SetCaption(m_serverIPEdit, config.lastServer);
@@ -61,6 +76,11 @@ bool NativeMenu::Init() {
     bridge.SetCaption(m_settingsNameEdit, config.playerName);
     m_autoConnectChecked = config.autoConnect;
 
+    // ES: Quitar el foco de teclado de MyGUI Y poner los campos en solo lectura: todo el
+    //     texto se gestiona a mano vía WndProc (OnChar/OnKeyDown). NeedKeyFocus=false evita
+    //     que pidan foco, pero la entrada OIS de Kenshi aún puede meter teclas vía
+    //     injectKeyPress de MyGUI; ReadOnly=true impide que el EditBox las procese y así
+    //     se evita la doble escritura.
     // Disable MyGUI keyboard focus AND make read-only — we handle all text input
     // manually via WndProc (OnChar/OnKeyDown). NeedKeyFocus=false prevents focus
     // requests, but Kenshi's OIS input can still deliver keystrokes via MyGUI's
@@ -75,6 +95,7 @@ bool NativeMenu::Init() {
     bridge.SetProperty(m_playerNameEdit, "ReadOnly", "true");
     bridge.SetProperty(m_settingsNameEdit, "ReadOnly", "true");
 
+    // ES: Guardar los valores puestos como respaldo fiable si GetCaption falla.
     // Store the values we set so we have reliable fallbacks if GetCaption fails
     m_storedIP = config.lastServer;
     m_storedPort = std::to_string(config.lastPort);
@@ -83,6 +104,8 @@ bool NativeMenu::Init() {
     m_initialized = true;
     OutputDebugStringA("KMP: NativeMenu — initialized, setting captions...\n");
 
+    // ES: Poner los captions de los botones por código (los del XML pueden no verse si la
+    //     fuente no es la correcta).
     // Explicitly set button captions (layout XML captions may not render if font is wrong)
     bridge.SetCaption(m_hostButton, "HOST GAME");
     bridge.SetCaption(m_joinButton, "JOIN GAME");
@@ -94,6 +117,8 @@ bool NativeMenu::Init() {
     bridge.SetCaption(m_settingsBackButton, "BACK");
     if (m_creditText) bridge.SetCaption(m_creditText, "KenshiMP by fourzerofour");
 
+    // ES: IMPORTANTE: empezar oculto. Si la raíz queda visible por defecto (así viene del
+    //     layout) bloquea todos los clics hacia el juego (pantalla de inicio, etc.).
     // IMPORTANT: Start hidden — the Root widget may be visible by default from the layout.
     // If left visible, it blocks all clicks from reaching the game (splash screen, etc.)
     bridge.SetVisible(m_root, false);
@@ -103,6 +128,9 @@ bool NativeMenu::Init() {
     return true;
 }
 
+// ES: Busca todos los widgets del layout por nombre. Solo MPRoot y MultiplayerPanel son
+//     obligatorios.
+// EN: Looks up every layout widget by name. Only MPRoot and MultiplayerPanel are required.
 bool NativeMenu::CacheWidgets() {
     auto& bridge = MyGuiBridge::Get();
 
@@ -151,6 +179,7 @@ bool NativeMenu::CacheWidgets() {
         }
     }
 
+    // ES: Cachear los widgets de las filas del navegador de servidores.
     // Cache server browser row widgets
     for (int i = 0; i < MAX_SERVER_ROWS; i++) {
         std::string nameKey = "MPServerName" + std::to_string(i);
@@ -163,10 +192,13 @@ bool NativeMenu::CacheWidgets() {
 
     spdlog::info("NativeMenu: Cached {}/{} widgets (+server rows)", found, total);
 
+    // ES: La raíz y el panel son obligatorios.
     // Root and panel are required
     return m_root != nullptr && m_multiplayerPanel != nullptr;
 }
 
+// ES: Muestra el menú (inicializándolo si hace falta) en la vista de botones principales.
+// EN: Shows the menu (initializing it if needed) on the main-buttons view.
 void NativeMenu::Show() {
     if (!m_initialized) {
         if (!Init()) return;
@@ -179,6 +211,8 @@ void NativeMenu::Show() {
     spdlog::info("NativeMenu: Shown");
 }
 
+// ES: Oculta el menú y quita el foco del campo activo.
+// EN: Hides the menu and clears the active field focus.
 void NativeMenu::Hide() {
     if (!m_initialized) return;
 
@@ -189,6 +223,10 @@ void NativeMenu::Hide() {
     spdlog::info("NativeMenu: Hidden");
 }
 
+// ES: Cambia el subpanel visible: oculta todos, muestra/oculta los botones principales y
+//     muestra el elegido.
+// EN: Switches the visible sub-panel: hides all, shows/hides the main buttons and shows
+//     the chosen one.
 void NativeMenu::ShowPanel(Panel panel) {
     if (!m_initialized) return;
 
@@ -196,11 +234,13 @@ void NativeMenu::ShowPanel(Panel panel) {
     m_currentPanel = panel;
     m_activeField = ActiveField::None;
 
+    // ES: Ocultar todos los subpaneles.
     // Hide all sub-panels
     if (m_joinPanel)     bridge.SetVisible(m_joinPanel, false);
     if (m_settingsPanel) bridge.SetVisible(m_settingsPanel, false);
     if (m_browserPanel)  bridge.SetVisible(m_browserPanel, false);
 
+    // ES: Mostrar/ocultar los botones principales.
     // Show/hide main buttons
     bool showMain = (panel == Panel::MainButtons);
     if (m_hostButton)     bridge.SetVisible(m_hostButton, showMain);
@@ -209,6 +249,7 @@ void NativeMenu::ShowPanel(Panel panel) {
     if (m_browserButton)  bridge.SetVisible(m_browserButton, showMain);
     if (m_backButton)     bridge.SetVisible(m_backButton, showMain);
 
+    // ES: Mostrar el subpanel elegido.
     // Show the selected sub-panel
     switch (panel) {
     case Panel::Join:
@@ -225,13 +266,22 @@ void NativeMenu::ShowPanel(Panel panel) {
     }
 }
 
+// ES: Ya no hace nada: la entrada se gestiona en OnClick() y el WndProc.
+// EN: Now a no-op: input is handled by OnClick() and the WndProc.
 void NativeMenu::Update() {
     // Update() is now a no-op — input is handled by OnClick() and WndProc
 }
 
+// ES: Procesa un clic (coordenadas de cliente de la ventana): convierte cada rectángulo
+//     relativo del layout a píxeles con el tamaño actual de la ventana y ejecuta la acción
+//     del botón o campo pulsado según el subpanel activo.
+// EN: Handles a click (window client coordinates): converts each relative layout rect to
+//     pixels using the current window size and runs the action of the clicked button or
+//     field for the active sub-panel.
 void NativeMenu::OnClick(int screenX, int screenY) {
     if (!m_initialized || !m_visible) return;
 
+    // ES: Tamaño de la ventana real.
     // Get screen dimensions from the actual window
     RECT clientRect;
     HWND hwnd = GetActiveWindow();
@@ -243,6 +293,7 @@ void NativeMenu::OnClick(int screenX, int screenY) {
     float mx = static_cast<float>(screenX);
     float my = static_cast<float>(screenY);
 
+    // ES: Rectángulo relativo al panel -> coordenadas de pantalla, y test del clic.
     // Convert panel-relative button rect to screen coords and test click
     auto testMainButton = [&](const ButtonRect& btn) -> bool {
         float absX = (PANEL_X + btn.relX * PANEL_W) * screenW;
@@ -254,6 +305,7 @@ void NativeMenu::OnClick(int screenX, int screenY) {
 
     auto testSubPanelButton = [&](const ButtonRect& btn,
                                    float spX, float spY, float spW, float spH) -> bool {
+        // ES: El subpanel va relativo al panel y el botón relativo al subpanel.
         // Sub-panel is positioned relative to panel, button is relative to sub-panel
         float absX = (PANEL_X + (spX + btn.relX * spW) * PANEL_W) * screenW;
         float absY = (PANEL_Y + (spY + btn.relY * spH) * PANEL_H) * screenH;
@@ -267,6 +319,7 @@ void NativeMenu::OnClick(int screenX, int screenY) {
         if (testMainButton(HOST_BTN)) {
             OnHostClicked();
         } else if (testMainButton(JOIN_BTN)) {
+            // ES: Cargar los valores de configuración en los campos.
             // Load config values into EditBoxes
             auto& config = Core::Get().GetConfig();
             auto& bridge = MyGuiBridge::Get();
@@ -313,6 +366,7 @@ void NativeMenu::OnClick(int screenX, int screenY) {
             m_activeField = ActiveField::Name;
             spdlog::info("NativeMenu: Name EditBox focused");
         } else {
+            // ES: Clic fuera de cualquier campo.
             m_activeField = ActiveField::None; // Click outside any field
         }
         break;
@@ -341,11 +395,13 @@ void NativeMenu::OnClick(int screenX, int screenY) {
             ShowPanel(Panel::MainButtons);
             spdlog::info("NativeMenu: Browser BACK clicked");
         } else {
+            // ES: ¿Se ha pulsado una fila de servidor?
             // Check if a server row was clicked
             for (int i = 0; i < MAX_SERVER_ROWS; i++) {
                 ButtonRect rowRect = {0.0f, SERVER_ROW_Y_START + i * SERVER_ROW_HEIGHT, 1.0f, SERVER_ROW_HEIGHT};
                 if (testSubPanelButton(rowRect, JOIN_PANEL_X, JOIN_PANEL_Y, JOIN_PANEL_W, JOIN_PANEL_H)) {
                     m_selectedServerRow = i;
+                    // ES: Si la fila tiene un servidor (de favoritos), rellenar IP/puerto.
                     // If this row has a valid server, fill in IP/Port
                     auto& config = Core::Get().GetConfig();
                     if (i < static_cast<int>(config.favoriteServers.size())) {
@@ -366,13 +422,20 @@ void NativeMenu::OnClick(int screenX, int screenY) {
                         auto& overlay = Core::Get().GetOverlay();
 
                         if (Core::Get().IsGameLoaded()) {
+                            // ES: Partida cargada: el comentario dice "conectar ya", pero solo
+                            //     muestra el subpanel Join (hay que pulsar CONNECT).
+                            // EN: Game loaded: the comment says "connect immediately", but it only
+                            //     shows the Join sub-panel (CONNECT must still be pressed).
                             // Game loaded — connect immediately
                             ShowPanel(Panel::Join);
                             spdlog::info("NativeMenu: Server row {} selected -> {}:{} (game loaded, showing Join)",
                                          i, m_storedIP, m_storedPort);
                         } else {
+                            // ES: Partida sin cargar: dejar la auto-conexión en cola para cuando se cargue.
                             // Game not loaded — queue auto-connect for after save loads
                             overlay.SetAutoConnect(m_storedIP, port);
+                            // ES: Guardar como lastServer (solo en memoria; no se llama a config.Save aquí).
+                            // EN: (Only in memory; config.Save is not called here.)
                             // Save as lastServer so it persists
                             config.lastServer = m_storedIP;
                             config.lastPort = port;
@@ -392,6 +455,8 @@ void NativeMenu::OnClick(int screenX, int screenY) {
     }
 }
 
+// ES: Oculta el menú y descarga el layout.
+// EN: Hides the menu and unloads the layout.
 void NativeMenu::Shutdown() {
     if (!m_initialized) return;
     Hide();
@@ -399,7 +464,12 @@ void NativeMenu::Shutdown() {
     m_initialized = false;
 }
 
+// ES: Getters de los campos: intentan leer el texto del widget y, si sale vacío (p.ej.
+//     GetCaption falla), devuelven el valor guardado.
+// EN: Field getters: try to read the widget text and, if empty (e.g. GetCaption fails),
+//     return the stored value.
 std::string NativeMenu::GetServerIP() {
+    // ES: Leer primero del widget (cubre el caso de pulsar CONNECT sin teclear nada).
     // Try to read from widget first (handles case where user clicked CONNECT without typing)
     if (m_serverIPEdit) {
         std::string widgetText = MyGuiBridge::Get().GetCaption(m_serverIPEdit);
@@ -424,19 +494,30 @@ std::string NativeMenu::GetPlayerName() {
     return m_storedName;
 }
 
+// ES: Pone el texto de estado del subpanel Join.
+// EN: Sets the Join sub-panel status text.
 void NativeMenu::SetStatus(const std::string& text) {
     if (m_statusText) {
         MyGuiBridge::Get().SetCaption(m_statusText, text);
     }
 }
 
+// ES: Acciones de los botones (enganchadas a la lógica existente de Core).
 // ═══════════════════════════════════════════════════════════════
 //  Button action handlers (wired to existing Core logic)
 // ═══════════════════════════════════════════════════════════════
 
+// ES: HOST GAME: busca KenshiMP.Server.exe junto a nuestra DLL (o en build\bin\Release),
+//     lo lanza en una consola nueva, deja programada la auto-conexión a 127.0.0.1 y oculta
+//     el menú para que el usuario pulse "New Game" en Kenshi.
+// EN: HOST GAME: finds KenshiMP.Server.exe next to our DLL (or in build\bin\Release),
+//     launches it in a new console, queues auto-connect to 127.0.0.1 and hides the menu
+//     so the user can press Kenshi's "New Game".
 void NativeMenu::OnHostClicked() {
     spdlog::info("NativeMenu: HOST GAME clicked");
 
+    // ES: Ruta de nuestra DLL (usando la dirección de una variable estática como ancla).
+    // EN: Path of our DLL (using a static variable's address as the anchor).
     // Launch KenshiMP.Server.exe
     static const char s_anchor = 0;
     char dllPath[MAX_PATH] = {};
@@ -481,6 +562,7 @@ void NativeMenu::OnHostClicked() {
 
             spdlog::info("NativeMenu: Launched server: {}", serverExe);
 
+            // ES: OCULTAR el panel para que el usuario pueda pulsar New Game en Kenshi.
             // HIDE the panel so user can click Kenshi's New Game button
             Hide();
         } else {
@@ -493,6 +575,10 @@ void NativeMenu::OnHostClicked() {
     }
 }
 
+// ES: CONNECT: lee IP/puerto/nombre (con valores por defecto), resetea conexiones viejas y
+//     lanza la conexión asíncrona; si la partida no está cargada, la sync empieza al cargar.
+// EN: CONNECT: reads IP/port/name (with defaults), resets stale connections and starts the
+//     asynchronous connect; if no save is loaded, sync starts once one is loaded.
 void NativeMenu::OnConnectClicked() {
     spdlog::info("NativeMenu: CONNECT clicked");
 
@@ -512,9 +598,11 @@ void NativeMenu::OnConnectClicked() {
 
     auto& overlay = core.GetOverlay();
 
+    // ES: Actualizar el estado de conexión del overlay para que gestione el resultado asíncrono.
     // Update overlay's connection state so it can handle the async result
     overlay.SetConnectionInfo(ip, port, name);
 
+    // ES: Avisar en el NativeHud (visible al momento).
     // Log to NativeHud (visible immediately)
     std::string statusMsg = core.IsGameLoaded()
         ? "Connecting to " + ip + ":" + portStr + " as '" + name + "'..."
@@ -524,6 +612,7 @@ void NativeMenu::OnConnectClicked() {
 
     auto& client = core.GetClient();
 
+    // ES: Resetear una conexión anterior colgada.
     // Reset stale connection state
     if (client.IsConnected() || client.IsConnecting()) {
         client.Disconnect();
@@ -542,6 +631,8 @@ void NativeMenu::OnConnectClicked() {
     }
 }
 
+// ES: Guarda los ajustes (nombre y auto-conexión) en el fichero de configuración de la instancia.
+// EN: Saves the settings (name and auto-connect) to the instance config file.
 void NativeMenu::OnSettingsSaved() {
     std::string name = m_storedName;
     if (name.empty()) name = "Player";
@@ -556,10 +647,13 @@ void NativeMenu::OnSettingsSaved() {
     spdlog::info("NativeMenu: Settings saved (name='{}', autoConnect={})", name, m_autoConnectChecked);
 }
 
+// ES: SERVER BROWSER: muestra el subpanel y rellena las filas con los servidores favoritos.
+// EN: SERVER BROWSER: shows the sub-panel and fills the rows with the favorite servers.
 void NativeMenu::OnServerBrowserClicked() {
     spdlog::info("NativeMenu: SERVER BROWSER clicked");
     ShowPanel(Panel::ServerBrowser);
 
+    // ES: Rellenar la lista con los favoritos.
     // Populate server list from favorites
     auto& bridge = MyGuiBridge::Get();
     auto& config = Core::Get().GetConfig();
@@ -576,6 +670,8 @@ void NativeMenu::OnServerBrowserClicked() {
     if (m_browserStatusText) bridge.SetCaption(m_browserStatusText, "Click REFRESH to query servers");
 }
 
+// ES: REFRESH: consulta el servidor maestro (lista global) y cada favorito directamente.
+// EN: REFRESH: queries the master server (global list) and each favorite directly.
 void NativeMenu::OnRefreshServersClicked() {
     spdlog::info("NativeMenu: REFRESH clicked");
 
@@ -586,6 +682,7 @@ void NativeMenu::OnRefreshServersClicked() {
         queryClient.Clear();
     }
 
+    // ES: Consultar al servidor maestro la lista global de servidores.
     // Query the master server for the global server list
     if (!config.masterServer.empty()) {
         queryClient.QueryMasterServer(config.masterServer, config.masterPort);
@@ -593,6 +690,7 @@ void NativeMenu::OnRefreshServersClicked() {
                      config.masterServer, config.masterPort);
     }
 
+    // ES: Y consultar todos los favoritos directamente (por si no están en el maestro).
     // Also query all favorites directly (for servers not on master)
     for (const auto& addr : config.favoriteServers) {
         size_t colon = addr.find(':');
@@ -613,14 +711,20 @@ void NativeMenu::OnRefreshServersClicked() {
     }
 }
 
+// ES: Entrada de teclado para los campos de texto (desde el WndProc).
 // ═══════════════════════════════════════════════════════════════
 //  Keyboard input for EditBox fields (WndProc-driven)
 // ═══════════════════════════════════════════════════════════════
 
+// ES: Añade un carácter ASCII imprimible al campo activo (con longitud máxima por campo).
+//     Nota: Name y SettingsName comparten m_storedName.
+// EN: Appends a printable ASCII character to the active field (with a per-field max
+//     length). Note: Name and SettingsName share m_storedName.
 void NativeMenu::OnChar(wchar_t ch) {
     if (!m_initialized || !m_visible) return;
     if (m_activeField == ActiveField::None) return;
 
+    // ES: Referencia al texto guardado del campo activo.
     // Get reference to the active stored string
     std::string* target = nullptr;
     void* editWidget = nullptr;
@@ -651,6 +755,7 @@ void NativeMenu::OnChar(wchar_t ch) {
         return;
     }
 
+    // ES: Filtro: solo ASCII imprimible.
     // Filter: only printable ASCII
     if (ch >= 32 && ch < 127 && target->size() < maxLen) {
         *target += static_cast<char>(ch);
@@ -658,6 +763,10 @@ void NativeMenu::OnChar(wchar_t ch) {
     }
 }
 
+// ES: Teclas especiales: Retroceso borra, Enter quita el foco (y conecta en Join), Tab
+//     pasa al siguiente campo de Join, Escape quita el foco.
+// EN: Special keys: Backspace deletes, Enter unfocuses (and connects in Join), Tab moves
+//     to the next Join field, Escape unfocuses.
 void NativeMenu::OnKeyDown(int vk) {
     if (!m_initialized || !m_visible) return;
     if (m_activeField == ActiveField::None) return;
@@ -687,18 +796,21 @@ void NativeMenu::OnKeyDown(int vk) {
     }
 
     if (vk == VK_BACK) {
+        // ES: Retroceso: borrar el último carácter.
         // Backspace: remove last character
         if (!target->empty()) {
             target->pop_back();
             MyGuiBridge::Get().SetCaption(editWidget, *target);
         }
     } else if (vk == VK_RETURN) {
+        // ES: Enter: quitar el foco y conectar si estamos en Join.
         // Enter: deactivate field, trigger connect if in Join panel
         m_activeField = ActiveField::None;
         if (m_currentPanel == Panel::Join) {
             OnConnectClicked();
         }
     } else if (vk == VK_TAB) {
+        // ES: Tab: pasar al siguiente campo.
         // Tab: cycle to next field
         if (m_currentPanel == Panel::Join) {
             if (m_activeField == ActiveField::IP) m_activeField = ActiveField::Port;
@@ -706,6 +818,7 @@ void NativeMenu::OnKeyDown(int vk) {
             else if (m_activeField == ActiveField::Name) m_activeField = ActiveField::IP;
         }
     } else if (vk == VK_ESCAPE) {
+        // ES: Escape: quitar el foco.
         // Escape: deactivate field
         m_activeField = ActiveField::None;
     }
