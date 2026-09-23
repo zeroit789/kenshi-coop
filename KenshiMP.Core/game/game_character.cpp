@@ -1,3 +1,25 @@
+// ES: game_character.cpp — acceso a los personajes (Character) de Kenshi desde el mod.
+//     Contiene: la tabla global de offsets (GetOffsets), las sondas en tiempo de ejecución
+//     que descubren offsets desconocidos (AnimClass, equipo, squad, isPlayerControlled),
+//     CharacterAccessor (leer/escribir posición, rotación, salud, nombre, facción, dinero...),
+//     CharacterIterator (recorrer la lista de personajes del jugador), atajos directos a la
+//     facción y al personaje primario del jugador, las sondas de diagnóstico [DIAG], el arreglo
+//     de facción del host (FixCharacterFactionTo) y los "puentes" (bridges) que Core rellena con
+//     direcciones resueltas (PlayerBase, GameWorld, setPosition, setPaused, estado de carga).
+//     Un offset (p.ej. char+0x48) es la posición de un campo dentro de la estructura del juego;
+//     un RVA es una dirección relativa a la base del módulo kenshi_x64.exe.
+//     Este fichero se compila también dentro de KenshiMP.UnitTest.
+// EN: game_character.cpp — access to Kenshi characters (Character) from the mod.
+//     Contains: the global offset table (GetOffsets), runtime probes that discover unknown
+//     offsets (AnimClass, equipment, squad, isPlayerControlled), CharacterAccessor
+//     (read/write position, rotation, health, name, faction, money...), CharacterIterator
+//     (walk the player's character list), direct shortcuts to the player's faction and
+//     primary character, the [DIAG] diagnostic probes, the host faction fix
+//     (FixCharacterFactionTo) and the "bridges" that Core fills with resolved addresses
+//     (PlayerBase, GameWorld, setPosition, setPaused, loading state).
+//     An offset (e.g. char+0x48) is a field's position inside a game structure;
+//     an RVA is an address relative to the kenshi_x64.exe module base.
+//     This file is also compiled into KenshiMP.UnitTest.
 #include "game_types.h"
 #include "game_offset_prober.h"
 #include "spawn_manager.h"     // SpawnManager::ReadKenshiString (estática) para el volcado [DIAG]
@@ -12,12 +34,24 @@
 
 namespace kmp::game {
 
+// ES: Tabla global única de offsets del juego (valores por defecto en game_types.h) y
+//     bandera de "ya inicializada". Las sondas de este fichero la modifican en caliente.
+// EN: Single global table of game offsets (defaults live in game_types.h) plus an
+//     "already initialized" flag. The probes in this file patch it at runtime.
 static GameOffsets s_offsets;
 static bool s_offsetsInitialized = false;
 
+// ES: Devuelve la tabla global de offsets (por referencia, modificable). La primera vez solo
+//     registra en el log que se usan los valores verificados; no lee memoria del juego.
+// EN: Returns the global offset table (by reference, mutable). On first call it only logs
+//     that the verified defaults are in use; it does not read game memory.
 GameOffsets& GetOffsets() {
     if (!s_offsetsInitialized) {
-        // All verified offsets are now set as struct defaults in game_types.h.
+        // ES: Todos los offsets verificados están como valores por defecto en game_types.h.
+        //     Fuentes: structs.h de KServerMod, GameWorld.h de KenshiLib, cadenas de punteros de CE.
+        //     La leyenda de abajo está parcialmente desfasada: aiPackage ya vale 0x20 en
+        //     game_types.h y health se lee por la cadena 0x5F8 -> [parte] -> +0x40.
+        // EN: All verified offsets are now set as struct defaults in game_types.h.
         // Sources: KServerMod structs.h, KenshiLib GameWorld.h, CE pointer chains.
         // The scanner may override these with runtime-discovered values later.
         //
@@ -36,6 +70,10 @@ GameOffsets& GetOffsets() {
     return s_offsets;
 }
 
+// ES: Punto de enganche previsto para cargar offsets descubiertos por un escáner externo
+//     (re_scanner.py / JSON). Hoy no hace nada salvo marcar discoveredByScanner=false.
+// EN: Intended hook to load offsets discovered by an external scanner (re_scanner.py / JSON).
+//     Currently does nothing except set discoveredByScanner=false.
 void InitOffsetsFromScanner() {
     // This would be called with values from the re_scanner.py output
     // or from the runtime string scanner's offset discovery.
@@ -46,14 +84,34 @@ void InitOffsetsFromScanner() {
 }
 
 // ── Runtime Offset Discovery ──
+// ES: Descubrimiento de offsets en tiempo de ejecución.
+// EN: Runtime offset discovery.
 
+// ES: Sonda de animClassOffset: busca dentro del Character un puntero a AnimationClassHuman
+//     tal que siguiendo AnimClass+0xC0 (CharMovement*) -> +0x320 +0x20 (Vec3 escribible) se
+//     llegue a una posición igual (±1 unidad) a la posición cacheada de char+0x48.
+//     Ese Vec3 escribible es la posición real del motor de física; escribir ahí mueve al
+//     personaje (Método 2 de WritePosition). Se ejecuta perezosamente una sola vez.
+// EN: animClassOffset probe: looks inside the Character for a pointer to AnimationClassHuman
+//     such that following AnimClass+0xC0 (CharMovement*) -> +0x320 +0x20 (writable Vec3)
+//     reaches a position equal (±1 unit) to the cached position at char+0x48.
+//     That writable Vec3 is the physics engine's real position; writing it moves the
+//     character (WritePosition Method 2). Runs lazily, only once.
 // Probe the character struct to find animClassOffset by searching for
 // a pointer chain that leads to a position matching the character's cached position.
 // Chain: character+X → AnimClass → +charMovementOffset → +writablePosOffset+writablePosVecOffset → Vec3
 // This is called lazily on the first WritePosition attempt for a character.
+// ES: Estado de la sonda: si ya se intentó y el offset hallado (-1 = no encontrado).
+//     s_discoveredAnimClassOffset solo se escribe; el valor útil vive en GetOffsets().
+// EN: Probe state: whether it already ran and the offset found (-1 = not found).
+//     s_discoveredAnimClassOffset is write-only; the useful value lives in GetOffsets().
 static bool s_animClassProbed = false;
 static int  s_discoveredAnimClassOffset = -1;
 
+// ES: Ejecuta la sonda sobre un Character concreto. Si la posición cacheada es (0,0,0) no
+//     marca como probado para que otro personaje lo intente. Rango probado: +0x60..+0x200.
+// EN: Runs the probe on a given Character. If the cached position is (0,0,0) it does not
+//     mark as probed so another character can try. Probed range: +0x60..+0x200.
 static void ProbeAnimClassOffset(uintptr_t charPtr) {
     if (s_animClassProbed) return;
 
@@ -107,7 +165,10 @@ static void ProbeAnimClassOffset(uintptr_t charPtr) {
     spdlog::debug("GameOffsets: animClassOffset probe failed — Method 2 unavailable");
 }
 
-// SEH wrapper for ProbeAnimClassOffset — character pointers in the deferred queue
+// ES: Envoltorio SEH (__try/__except de Windows) de ProbeAnimClassOffset: los punteros de la
+//     cola diferida pueden haber sido liberados por el motor al cambiar de zona; sin SEH un
+//     acceso inválido tumbaría el juego. Devuelve false si hubo excepción.
+// EN: SEH wrapper for ProbeAnimClassOffset — character pointers in the deferred queue
 // may have been freed by the game engine during zone transitions.  Without SEH,
 // an access violation here causes a silent crash.
 static bool SEH_ProbeAnimClassOffset(uintptr_t charPtr) {
@@ -119,6 +180,12 @@ static bool SEH_ProbeAnimClassOffset(uintptr_t charPtr) {
     }
 }
 
+// ES: Sonda del offset del array de equipo: 14 punteros a Item (EquipSlot::Count), buscado
+//     entre inventario (0x2E8) y stats (0x450). Acepta la primera ventana de 14 qwords donde
+//     todos son 0 o punteros de heap y al menos uno es válido. Heurística, sin verificar en RE.
+// EN: Probe for the equipment array offset: 14 Item pointers (EquipSlot::Count), searched
+//     between inventory (0x2E8) and stats (0x450). Accepts the first 14-qword window where all
+//     entries are 0 or heap pointers and at least one is valid. Heuristic, not RE-verified.
 // Probe for equipment array offset.
 // Equipment is an array of 14 item pointers (EquipSlot::Count).
 // We look for a region between inventory (0x2E8) and stats (0x450) containing
@@ -172,7 +239,15 @@ static void ProbeEquipmentOffset(uintptr_t charPtr) {
 }
 
 // ── CharacterAccessor ──
+// ES: CharacterAccessor envuelve un Character* del juego (m_ptr) y lee/escribe sus campos
+//     mediante los offsets de GetOffsets(). Offset < 0 significa "desconocido": se devuelve
+//     un valor neutro en vez de leer.
+// EN: CharacterAccessor wraps a game Character* (m_ptr) and reads/writes its fields through
+//     the offsets from GetOffsets(). Offset < 0 means "unknown": a neutral value is returned
+//     instead of reading.
 
+// ES: Posición de mundo cacheada (Vec3 en char+0x48, solo lectura: la física la reescribe).
+// EN: Cached world position (Vec3 at char+0x48, read-only: physics overwrites it).
 Vec3 CharacterAccessor::GetPosition() const {
     Vec3 pos;
     int offset = GetOffsets().character.position;
@@ -182,19 +257,27 @@ Vec3 CharacterAccessor::GetPosition() const {
     return pos;
 }
 
+// ES: Rotación del personaje (cuaternión de Ogre en char+0x58).
+// EN: Character rotation (Ogre quaternion at char+0x58).
 Quat CharacterAccessor::GetRotation() const {
     Quat rot;
     int offset = GetOffsets().character.rotation;
     if (offset >= 0) {
-        // Ogre quaternion layout: w, x, y, z (4 consecutive floats)
+        // ES: Layout del cuaternión de Ogre: w, x, y, z (4 floats seguidos).
+        // EN: Ogre quaternion layout: w, x, y, z (4 consecutive floats)
         Memory::Read(m_ptr + offset, rot);
     }
     return rot;
 }
 
+// ES: Salud ("flesh") de una parte del cuerpo. Devuelve 0 si no se puede leer.
+// EN: Health ("flesh") of one body part. Returns 0 if it cannot be read.
 float CharacterAccessor::GetHealth(BodyPart part) const {
     auto& offsets = GetOffsets().character;
 
+    // EN: The flat float array model does NOT exist in 1.0.68 (health lives in individual
+    //     HealthPartStatus*) — offsets.health is always -1, so this branch never runs.
+    //     Kept only for compatibility in case a future scanner fills it.
     // Method 1: Direct offset (if scanner found it).
     // NOTA: el modelo "array plano de floats" NO existe en 1.0.68 (la salud vive en
     // HealthPartStatus* individuales) — offsets.health es siempre -1, esta rama nunca
@@ -207,6 +290,8 @@ float CharacterAccessor::GetHealth(BodyPart part) const {
 
     // Cadena canónica MedicalSystem (inline en char+0x458):
     // [char+0x5F8] = HealthPartStatus** → [array + part*8] → flesh @ +0x40
+    // EN: Canonical MedicalSystem chain (inline at char+0x458): char+0x5F8 is an array of
+    //     HealthPartStatus* (one per body part, stride 8); the flesh value is the float at +0x40.
     if (offsets.healthPartArray >= 0 && offsets.healthBase >= 0) {
         uintptr_t partArray = 0;
         if (!Memory::Read(m_ptr + offsets.healthPartArray, partArray) || partArray == 0) return 0.f;
@@ -221,6 +306,10 @@ float CharacterAccessor::GetHealth(BodyPart part) const {
     return 0.f;
 }
 
+// ES: ¿Está vivo? Usa el flag isAlive si se conociera (hoy -1) y si no, deduce por salud:
+//     vivo si pecho y cabeza están por encima de -100 (umbral aproximado de muerte en Kenshi).
+// EN: Is it alive? Uses the isAlive flag if known (currently -1); otherwise infers from health:
+//     alive if chest and head are above -100 (approximate Kenshi death threshold).
 bool CharacterAccessor::IsAlive() const {
     // First check the alive flag if available
     int offset = GetOffsets().character.isAlive;
@@ -237,6 +326,10 @@ bool CharacterAccessor::IsAlive() const {
     return chestHealth > -100.f && headHealth > -100.f;
 }
 
+// ES: Lee el byte isPlayerControlled si su offset fue descubierto (ver ProbePlayerControlledOffset);
+//     si no, devuelve false. Según game_types.h ese campo probablemente no existe en el motor.
+// EN: Reads the isPlayerControlled byte if its offset was discovered (see ProbePlayerControlledOffset);
+//     otherwise returns false. Per game_types.h this field probably does not exist in the engine.
 bool CharacterAccessor::IsPlayerControlled() const {
     int offset = GetOffsets().character.isPlayerControlled;
     if (offset >= 0) {
@@ -247,6 +340,8 @@ bool CharacterAccessor::IsPlayerControlled() const {
     return false;
 }
 
+// ES: Velocidad de movimiento (float) si el offset es conocido; si no, 0.
+// EN: Movement speed (float) if the offset is known; otherwise 0.
 float CharacterAccessor::GetMoveSpeed() const {
     int offset = GetOffsets().character.moveSpeed;
     if (offset < 0) return 0.f;
@@ -256,6 +351,8 @@ float CharacterAccessor::GetMoveSpeed() const {
     return speed;
 }
 
+// ES: Estado de animación (byte) si el offset es conocido; si no, 0.
+// EN: Animation state (byte) if the offset is known; otherwise 0.
 uint8_t CharacterAccessor::GetAnimState() const {
     int offset = GetOffsets().character.animState;
     if (offset < 0) return 0;
@@ -265,10 +362,16 @@ uint8_t CharacterAccessor::GetAnimState() const {
     return state;
 }
 
+// ES: Nombre visible del personaje: std::string de MSVC en char+0x18. Devuelve "Unknown"
+//     si no se puede leer o el tamaño es 0 o > 256.
+// EN: Character display name: MSVC std::string at char+0x18. Returns "Unknown" if it cannot
+//     be read or the size is 0 or > 256.
 std::string CharacterAccessor::GetName() const {
     int offset = GetOffsets().character.name;
     if (offset < 0) return "Unknown";
 
+    // ES: Layout de std::string de MSVC x64: +0x00 buffer SSO de 16 bytes (o puntero a heap si
+    //     capacity > 15), +0x10 size, +0x18 capacity.
     // MSVC x64 std::string layout:
     // +0x00: buf[16] (small string optimization buffer)
     // +0x10: size (uint64_t)
@@ -301,6 +404,14 @@ std::string CharacterAccessor::GetName() const {
     return std::string(buffer, size);
 }
 
+// ES: Escribe el nombre del personaje (char+0x18) sin reservar memoria en el heap del juego:
+//     <= 15 chars se escriben en el buffer SSO; si es más largo solo se sobrescribe si el
+//     buffer de heap existente cabe; si no, se trunca a 15 chars (llamada recursiva).
+//     Devuelve true si escribió algo.
+// EN: Writes the character name (char+0x18) without allocating on the game heap:
+//     <= 15 chars go into the SSO buffer; longer names only overwrite an existing heap buffer
+//     that is big enough; otherwise it truncates to 15 chars (recursive call).
+//     Returns true if something was written.
 bool CharacterAccessor::WriteName(const std::string& name) {
     int offset = GetOffsets().character.name;
     if (offset < 0 || name.empty()) return false;
@@ -355,6 +466,12 @@ bool CharacterAccessor::WriteName(const std::string& name) {
     return WriteName(truncated);
 }
 
+// ES: Escribe también el nombre en la plantilla GameData del personaje (char+0x40 -> GameData,
+//     campo name de GameData). Algunas partes de la UI leen de la plantilla. Siempre en modo
+//     SSO (máx. 15 chars). Ojo: la plantilla puede estar compartida con otros personajes.
+// EN: Also writes the name into the character's GameData template (char+0x40 -> GameData,
+//     GameData name field). Some UI parts read from the template. Always SSO mode
+//     (max 15 chars). Note: the template may be shared with other characters.
 bool CharacterAccessor::WriteNameToGameData(const std::string& name) {
     // Write the name to the GameData template's name field as well.
     // Some UI elements (tooltips, nameplates) may read from the template
@@ -387,6 +504,10 @@ bool CharacterAccessor::WriteNameToGameData(const std::string& name) {
     return true;
 }
 
+// ES: Escribe el Faction* del personaje (char+0x10). Rechaza punteros no alineados, fuera de
+//     rango de usuario o dentro de la imagen del módulo (se asume 64 MB). Devuelve true si escribió.
+// EN: Writes the character's Faction* (char+0x10). Rejects pointers that are unaligned, outside
+//     user space or inside the module image (64 MB assumed). Returns true if it wrote.
 bool CharacterAccessor::WriteFaction(uintptr_t factionPtr) {
     int offset = GetOffsets().character.faction;
     if (offset < 0) return false;
@@ -404,6 +525,8 @@ bool CharacterAccessor::WriteFaction(uintptr_t factionPtr) {
     return true;
 }
 
+// ES: Devuelve el GameData* (plantilla de datos del personaje, char+0x40) validado como heap, o 0.
+// EN: Returns the GameData* (character data template, char+0x40) validated as heap, or 0.
 uintptr_t CharacterAccessor::GetGameDataPtr() const {
     int offset = GetOffsets().character.gameDataPtr;
     if (offset < 0) return 0;
@@ -417,6 +540,8 @@ uintptr_t CharacterAccessor::GetGameDataPtr() const {
     return gdPtr;
 }
 
+// ES: Devuelve el Inventory* del personaje (char+0x2E8) validado, o 0.
+// EN: Returns the character's Inventory* (char+0x2E8) validated, or 0.
 uintptr_t CharacterAccessor::GetInventoryPtr() const {
     int offset = GetOffsets().character.inventory;
     if (offset < 0) return 0;
@@ -427,11 +552,19 @@ uintptr_t CharacterAccessor::GetInventoryPtr() const {
     return ptr;
 }
 
+// ES: Puntero a la función del juego HavokCharacter::setPosition, resuelto por patrón AOB
+//     (firma de bytes buscada en memoria) en patterns.cpp y enchufado con SetGameSetPositionFn.
+//     Firma deducida del prólogo: RCX = this (personaje), RDX = Vec3*.
+// EN: Pointer to the game function HavokCharacter::setPosition, resolved by AOB pattern
+//     (byte signature scanned in memory) in patterns.cpp and plugged in via SetGameSetPositionFn.
+//     Signature inferred from the prologue: RCX = this (character), RDX = Vec3*.
 // Function pointer for HavokCharacter::setPosition (resolved by patterns.cpp)
 // Prologue analysis confirms: params~2 (RCX=this, RDX=Vec3*), stack=288
 using SetPositionFn = void(__fastcall*)(void* character, const Vec3* pos);
 static SetPositionFn s_setPositionFn = nullptr;
 
+// ES: Bridge: Core guarda aquí la dirección resuelta de setPosition.
+// EN: Bridge: Core stores the resolved setPosition address here.
 void SetGameSetPositionFn(void* fn) {
     s_setPositionFn = reinterpret_cast<SetPositionFn>(fn);
 }
@@ -440,33 +573,57 @@ void SetGameSetPositionFn(void* fn) {
 // Firma: void __fastcall(void* gameWorld /*rcx*/, bool paused /*dl*/).
 // Lo resuelve patterns.cpp por AOB y Core lo enchufa aquí vía SetGameSetPausedFn().
 // game_world.cpp (GameWorldAccessor::SetPaused) lo consume si está disponible.
+// EN: Bridge for the OFFICIAL pause setter GameWorld::setPaused (RVA 0x787D40, 1.0.68).
+//     Signature: void __fastcall(void* gameWorld /*rcx*/, bool paused /*dl*/).
+//     Resolved by AOB in patterns.cpp and plugged in by Core via SetGameSetPausedFn().
+//     game_world.cpp (GameWorldAccessor::SetPaused) uses it when available.
 using SetPausedFn = void(__fastcall*)(void* gameWorld, bool paused);
 static SetPausedFn s_setPausedFn = nullptr;
 
+// ES: Guarda el puntero resuelto de setPaused. / EN: Stores the resolved setPaused pointer.
 void SetGameSetPausedFn(void* fn) {
     s_setPausedFn = reinterpret_cast<SetPausedFn>(fn);
     spdlog::info("game_character: SetPaused (setter oficial) bridge set to 0x{:X}",
                  reinterpret_cast<uintptr_t>(fn));
 }
 
+// ES: ¿Está disponible el setter oficial de pausa? / EN: Is the official pause setter available?
 bool HasGameSetPausedFn() {
     return s_setPausedFn != nullptr;
 }
 
 // Accessor interno usado por game_world.cpp para invocar el setter oficial bajo SEH.
 // Devuelve true si el puntero existe y la llamada no lanzó excepción.
+// (Nota: en realidad esta función solo devuelve el puntero, o nullptr; la llamada bajo SEH
+//  y el "true" los hace game_world.cpp.)
+// EN: Internal accessor used by game_world.cpp to call the official setter under SEH.
+//     Note: it actually just returns the function pointer (or nullptr); the SEH call and
+//     the true/false result live in game_world.cpp.
 SetPausedFn GetGameSetPausedFn_Internal() {
     return s_setPausedFn;
 }
 
-// Track WritePosition method transitions: log when method changes, not just first call.
+// ES: Seguimiento de qué método usó WritePosition por última vez, para loguear solo cuando
+//     cambia (y detectar caídas silenciosas a métodos peores).
+// EN: Track WritePosition method transitions: log when method changes, not just first call.
 // This ensures we see if characters silently fall back to worse methods.
 static int s_lastWritePosMethod = 0;  // 0=none, 1=setPositionFn, 2=physicsChain, 3=cached
 static int s_writePosMethodCount = 0; // Total calls since last method change
 
+// ES: Teletransporta/mueve el personaje a 'pos'. Tres métodos en orden de preferencia:
+//     1) llamar a HavokCharacter::setPosition del juego (mueve bien por la física);
+//     2) escribir el Vec3 escribible de la cadena char+animClass -> +0xC0 -> +0x320+0x20;
+//     3) escribir la posición cacheada char+0x48 (la física puede pisarla el frame siguiente).
+//     Devuelve true si se usó algún método. Debe llamarse en el hilo del juego.
+// EN: Teleports/moves the character to 'pos'. Three methods in order of preference:
+//     1) call the game's HavokCharacter::setPosition (moves properly through physics);
+//     2) write the writable Vec3 via char+animClass -> +0xC0 -> +0x320+0x20;
+//     3) write the cached position at char+0x48 (physics may overwrite it next frame).
+//     Returns true if any method was used. Should be called on the game thread.
 bool CharacterAccessor::WritePosition(const Vec3& pos) {
     auto& offsets = GetOffsets().character;
 
+    // ES: Método 1 (el mejor): función propia del juego setPosition(this, const Vec3*).
     // Method 1 (best): Call the game's own HavokCharacter::setPosition function.
     // This properly moves the character through the physics engine.
     // Signature: void __fastcall setPosition(this, const Vec3* pos)
@@ -482,6 +639,8 @@ bool CharacterAccessor::WritePosition(const Vec3& pos) {
         return true;
     }
 
+    // ES: Método 2: cadena de posición escribible de la física; sondea animClassOffset
+    //     la primera vez si aún no se conoce.
     // Method 2: Try the writable physics position chain.
     // Eagerly probe on first access for ANY character, not just this one.
     if (offsets.animClassOffset < 0 && !s_animClassProbed) {
@@ -511,6 +670,9 @@ bool CharacterAccessor::WritePosition(const Vec3& pos) {
         }
     }
 
+    // ES: Método 3 (último recurso): escribir la posición cacheada de solo lectura (char+0x48).
+    //     La física puede sobrescribirla, pero sirve para personajes remotos que se
+    //     actualizan continuamente. Si ni eso existe, se loguea el fallo total una vez.
     // Method 3 (fallback): Write to the cached read-only position.
     // This may be overwritten by the physics engine next frame, but for remote
     // characters that are continuously updated it's acceptable.
@@ -535,6 +697,7 @@ bool CharacterAccessor::WritePosition(const Vec3& pos) {
     return offsets.position >= 0;
 }
 
+// ES: Devuelve el Faction* crudo de char+0x10 (sin validar). / EN: Returns the raw Faction* at char+0x10 (unvalidated).
 uintptr_t CharacterAccessor::GetFactionPtr() const {
     int offset = GetOffsets().character.faction;
     if (offset < 0) return 0;
@@ -544,6 +707,8 @@ uintptr_t CharacterAccessor::GetFactionPtr() const {
     return ptr;
 }
 
+// ES: Tipo de tarea actual de la IA (TaskType) si el offset es conocido (hoy -1 -> NULL_TASK).
+// EN: Current AI task type (TaskType) if the offset is known (currently -1 -> NULL_TASK).
 TaskType CharacterAccessor::GetCurrentTask() const {
     int offset = GetOffsets().character.currentTask;
     if (offset < 0) return TaskType::NULL_TASK;
@@ -553,15 +718,20 @@ TaskType CharacterAccessor::GetCurrentTask() const {
     return static_cast<TaskType>(task);
 }
 
+// ES: Dirección del bloque de stats (habilidades) del personaje, inline en char+0x450.
+// EN: Address of the character's stats (skills) block, inline at char+0x450.
 uintptr_t CharacterAccessor::GetStatsPtr() const {
     int offset = GetOffsets().character.stats;
     if (offset < 0) return 0;
 
+    // ES: Los stats están embebidos en el Character (no son un puntero): se devuelve char + offset.
     // Stats are stored inline in the character (not a pointer),
     // so return character address + offset
     return m_ptr + offset;
 }
 
+// ES: Item* equipado en un hueco concreto (o 0). Lanza la sonda de equipo si el offset no se conoce.
+// EN: Item* equipped in a given slot (or 0). Runs the equipment probe if the offset is unknown.
 uintptr_t CharacterAccessor::GetEquipmentSlot(EquipSlot slot) const {
     int offset = GetOffsets().character.equipment;
     if (offset < 0) {
@@ -579,6 +749,14 @@ uintptr_t CharacterAccessor::GetEquipmentSlot(EquipSlot slot) const {
     return itemPtr;
 }
 
+// ES: Devuelve el KSquad* (escuadra) del personaje. Si el offset no se conoce, prueba
+//     heurísticamente +0x08/+0x20/+0x28/+0x30/+0x38 y acepta el primer puntero cuyo +0x10 parezca
+//     un std::string razonable; cachea ese offset. Heurística sin verificar: ojo, +0x20 es el
+//     AITaskSystem* según game_types.h y podría confundirse.
+// EN: Returns the character's KSquad* (squad). If the offset is unknown, it heuristically tries
+//     +0x08/+0x20/+0x28/+0x30/+0x38 and accepts the first pointer whose +0x10 looks like a sane
+//     std::string; caches that offset. Unverified heuristic: note +0x20 is the AITaskSystem*
+//     per game_types.h and could be mistaken for it.
 uintptr_t CharacterAccessor::GetSquadPtr() const {
     auto& offsets = GetOffsets().character;
 
@@ -626,6 +804,8 @@ uintptr_t CharacterAccessor::GetSquadPtr() const {
     return 0;
 }
 
+// ES: Puntero al sistema de tareas de IA (AITaskSystem*, char+0x20) validado, o 0.
+// EN: Pointer to the AI task system (AITaskSystem*, char+0x20) validated, or 0.
 uintptr_t CharacterAccessor::GetAIPackagePtr() const {
     int offset = GetOffsets().character.aiPackage;
     if (offset < 0) return 0;
@@ -636,6 +816,10 @@ uintptr_t CharacterAccessor::GetAIPackagePtr() const {
     return ptr;
 }
 
+// ES: Dinero (cats) asociado al personaje por la cadena de CE char+0x298 -> +0x78 -> int en +0x88.
+//     Probablemente es el dinero de la facción/inventario del jugador; 0 si falla la cadena.
+// EN: Money (cats) associated with the character via the CE chain char+0x298 -> +0x78 -> int at +0x88.
+//     Probably the player's faction/inventory money; 0 if the chain fails.
 int CharacterAccessor::GetMoney() const {
     auto& offsets = GetOffsets().character;
 
@@ -656,7 +840,14 @@ int CharacterAccessor::GetMoney() const {
 }
 
 // ── CharacterIterator ──
+// ES: Recorre la lista de Character* del jugador. Reset() localiza el array (PlayerBase o
+//     GameWorld -> PlayerInterface -> playerCharacters) y Next() devuelve cada personaje
+//     validado (alineado y con vtable dentro del módulo).
+// EN: Walks the player's Character* list. Reset() locates the array (PlayerBase or
+//     GameWorld -> PlayerInterface -> playerCharacters) and Next() returns each character
+//     validated (aligned and with a vtable inside the module).
 
+// ES: El constructor ya localiza la lista. / EN: The constructor already locates the list.
 CharacterIterator::CharacterIterator() {
     Reset();
 }
@@ -666,6 +857,8 @@ void CharacterIterator::Reset() {
     m_count = 0;
     m_listBase = 0;
 
+    // ES: Guarda: durante la carga el juego redimensiona el lektor (array dinámico); leer
+    //     tamaño/puntero a la vez que el hilo del juego lo cambia corrompe el heap. No se lee nada.
     // Safety guard: during loading, the game is actively resizing the lektor
     // (dynamic array). Reading count/pointer non-atomically while the game thread
     // modifies them corrupts the heap. Skip all game memory reads during loading.
@@ -678,6 +871,8 @@ void CharacterIterator::Reset() {
         return;
     }
 
+    // ES: Rango del módulo (base + SizeOfImage de la cabecera PE, 64 MB por defecto) para
+    //     distinguir punteros de heap de direcciones dentro del ejecutable.
     // Get module range for heap-vs-module discrimination
     uintptr_t modBase = Memory::GetModuleBase();
     size_t modSize = 0x4000000; // 64MB fallback
@@ -690,6 +885,8 @@ void CharacterIterator::Reset() {
         }
     }
 
+    // ES: ¿Parece un puntero de heap del juego? (rango de usuario, alineado a 8, fuera del módulo)
+    // EN: Does it look like a game heap pointer? (user range, 8-byte aligned, outside the module)
     auto isValidHeapPtr = [modBase, modSize](uintptr_t val) -> bool {
         if (val < 0x10000 || val >= 0x00007FFFFFFFFFFF) return false;
         // Must be 8-byte aligned (x64 heap allocations are at least 16-byte aligned)
@@ -700,6 +897,8 @@ void CharacterIterator::Reset() {
     };
 
     // ── Strategy 1: PlayerBase ──
+    // ES: Estrategia 1: leer el puntero global PlayerBase (dirección resuelta por patterns.cpp)
+    //     y, si su primera entrada es un puntero de heap, tratarlo como array de Character*.
     // Read PlayerBase from the runtime-resolved address (found by patterns.cpp).
     uintptr_t playerBaseAddr = GetResolvedPlayerBase();
     if (playerBaseAddr != 0) {
@@ -722,6 +921,10 @@ void CharacterIterator::Reset() {
     }
 
     // ── Strategy 2: GameWorld + characterList fallback ──
+    // ES: Layout verificado del contenedor "lektor" de Kenshi (24 bytes): +0x00 vtable,
+    //     +0x08 size (uint32), +0x0C capacity (uint32), +0x10 T** data. tryReadLektor lo
+    //     valida (size>0, size<=capacity, capacity<=100000, data en heap) y rellena
+    //     m_listBase/m_count. (El comentario inglés habla de GameWorld+0x888, hoy deprecado.)
     // The container at GameWorld+0x0888 is a "lektor" — verified 24-byte layout:
     //   +0x00 qword : vtable/header    (lektor is polymorphic — do NOT read as count or ptr)
     //   +0x08 dword : size             (uint32_t)
@@ -752,6 +955,10 @@ void CharacterIterator::Reset() {
     // La lista REAL del jugador es un lektor<Character*> dentro de PlayerInterface, al que
     // se llega así: GameWorld -> +0x580 (player) -> +0x2B0 (playerCharacters).
     // Reutilizamos el mismo tryReadLektor (layout de 24 bytes: size@+0x08, cap@+0x0C, data@+0x10).
+    // EN: Strategy 2: GameWorld -> player(+0x580) -> PlayerInterface.playerCharacters(+0x2B0).
+    //     The old +0x888 (removal queue) does NOT hold the player's characters. The REAL list
+    //     is a lektor<Character*> inside PlayerInterface, reached via GameWorld -> +0x580 ->
+    //     +0x2B0, read with the same tryReadLektor. Falls back to +0x888 only if that fails.
     if (m_listBase == 0) {
         uintptr_t gameWorldAddr = GetResolvedGameWorld();
         if (gameWorldAddr != 0) {
@@ -811,6 +1018,8 @@ void CharacterIterator::Reset() {
         return;
     }
 
+    // ES: Contar entradas válidas recorriendo el array hasta el primer 0/no-heap (solo en la
+    //     ruta PlayerBase, que no trae tamaño; tope de 10000).
     // Walk the pointer array to count valid entries (only needed for PlayerBase path)
     if (m_count == 0) {
         int estimatedCount = 0;
@@ -828,10 +1037,15 @@ void CharacterIterator::Reset() {
     }
 }
 
+// ES: ¿Quedan personajes por recorrer? / EN: Are there characters left to walk?
 bool CharacterIterator::HasNext() const {
     return m_index < m_count;
 }
 
+// ES: Devuelve el siguiente personaje; si la entrada no pasa la validación (alineación, rango,
+//     vtable dentro del módulo) devuelve un accessor nulo, pero el índice avanza igualmente.
+// EN: Returns the next character; if the entry fails validation (alignment, range, vtable
+//     inside the module) it returns a null accessor, but the index still advances.
 CharacterAccessor CharacterIterator::Next() {
     if (!HasNext()) return CharacterAccessor(nullptr);
 
@@ -860,6 +1074,10 @@ CharacterAccessor CharacterIterator::Next() {
 //   GameWorld -> +0x580 (player/PlayerInterface*) -> +0x2A0 (participant) = Faction*
 // Cada salto se valida como puntero de heap (mismas guardas que CharacterIterator::Reset).
 // Devuelve 0 si la cadena no es válida. Esta es la fuente PRIMARIA de facción.
+// EN: Resolves the player's faction WITHOUT walking the character list:
+//     GameWorld -> +0x580 (player/PlayerInterface*) -> +0x2A0 (participant) = Faction*.
+//     Every hop is validated as a heap pointer. Returns 0 if the chain is invalid.
+//     This is the PRIMARY faction source.
 uintptr_t GetPlayerFactionDirect() {
     uintptr_t gameWorldAddr = GetResolvedGameWorld();
     if (gameWorldAddr == 0) return 0;
@@ -912,6 +1130,12 @@ uintptr_t GetPlayerFactionDirect() {
 // Devuelve 0 si la cadena no está poblada (p.ej. justo tras la carga) — el caller reintenta.
 // Esta es la vía ROBUSTA para el flujo connected-then-load: no depende del nombre "Player N"
 // ni de que el hook CharacterCreate capturase la creación durante la carga.
+// EN: Returns the player's PRIMARY character (the controlled one) WITHOUT matching by name.
+//     Chain: GameWorld -> +0x580 (PlayerInterface*) -> +0x2B0 (playerCharacters lektor)
+//     -> data[0], validated (heap pointer with a vtable inside the module).
+//     Returns 0 if the list is not populated yet (e.g. right after loading); caller retries.
+//     Robust path for the connected-then-load flow: independent of the "Player N" name and
+//     of the CharacterCreate hook catching the creation during loading.
 uintptr_t GetPlayerPrimaryCharacterDirect() {
     uintptr_t gameWorldAddr = GetResolvedGameWorld();
     if (gameWorldAddr == 0) return 0;
@@ -973,6 +1197,12 @@ uintptr_t GetPlayerPrimaryCharacterDirect() {
 // cuyo nombre encajase con "Player N" — incluidos NPCs fantasma del mundo que solo
 // COMPARTEN el patrón de nombre. Esta función da el criterio de verdad del motor.
 // Devuelve:  1 = está;  0 = lista legible pero NO está;  -1 = lista no disponible.
+// EN: [FIX-GHOST 2026-07] Checks whether charPtr is in the player's NATIVE character list
+//     (PlayerInterface+0x2B0, lektor<Character*>), same chain and guards as
+//     GetPlayerPrimaryCharacterDirect but scanning ALL entries (capped at 64).
+//     Reason: FindAndClaimModCharacters used to claim as LOCAL any char named "Player N",
+//     including ghost world NPCs sharing the name pattern; this gives the engine's truth.
+//     Returns: 1 = present; 0 = list readable but NOT present; -1 = list unavailable.
 int IsInPlayerCharactersList(uintptr_t charPtr) {
     if (charPtr == 0) return 0;
 
@@ -1054,6 +1284,16 @@ int IsInPlayerCharactersList(uintptr_t charPtr) {
 //   YA está resuelta de forma fiable por GetPlayerFactionDirect() (GameWorld+0x580 -> +0x2A0),
 //   así que este escaneo bruto de RE ya cumplió su propósito. Para reactivarlo puntualmente en
 //   una sesión de RE, subir DIAG_MAX_DUMPS a 6 de nuevo.
+//
+// EN: DIAGNOSTIC DUMP (log only, no behavior change, no memory writes). Goal: find the REAL
+//     offset of the player's faction by range-scanning and filtering candidates whose name
+//     is READABLE ASCII. Logs with "[DIAG]". Resolves gwObj (GameWorld) and pbObj
+//     (PlayerBase/PlayerInterface), then: A) scans pbObj +0x00..+0x400 as Faction*;
+//     B) scans gwObj +0x400..+0xA00, trying each qword as PlayerInterface* (+0x2A0/+0x320)
+//     and as a direct Faction*; C) via Character: char[0].faction (char+0x10) = the certain
+//     player faction. Pumped from DiagTickPump(). DISABLED (=0) since 2026-06-18: scans A/B
+//     caused hundreds of internal AVs that polluted the crash log; GetPlayerFactionDirect()
+//     already solves the faction. Set DIAG_MAX_DUMPS back to 6 to re-enable for RE.
 static std::atomic<int> s_diagDumpCount{0};
 static constexpr int DIAG_MAX_DUMPS = 0;
 
@@ -1061,6 +1301,8 @@ static constexpr int DIAG_MAX_DUMPS = 0;
 // Valida que un qword parece un puntero de heap del juego:
 //   >= 0x10000, < 0x00007FFFFFFFFFFF, 8-byte alineado, y FUERA de la imagen del módulo.
 // Se usa tanto en la sonda como en DiagTickPump. Calcula el rango del módulo una vez.
+// EN: File-level heap check: >= 0x10000, < 0x00007FFFFFFFFFFF, 8-byte aligned and OUTSIDE
+//     the module image. Used by the probe and DiagTickPump; module range computed once.
 static bool DiagIsHeap(uintptr_t v) {
     static uintptr_t s_modBase = 0;
     static size_t    s_modSize = 0x4000000; // fallback 64MB
@@ -1084,6 +1326,8 @@ static bool DiagIsHeap(uintptr_t v) {
 // >=80% de caracteres ASCII imprimibles (letra/dígito/espacio/puntuación visible).
 // ReadKenshiString ya tiene SEH y devuelve "" si falla, pero NO valida ASCII, así que
 // puede colar basura binaria — la filtramos aquí.
+// EN: A string only counts as a faction name if it has >= 3 chars and >= 80% printable ASCII.
+//     ReadKenshiString already has SEH but does not validate ASCII, so binary junk is filtered here.
 static bool DiagEsLegible(const std::string& s) {
     if (s.size() < 3) return false;
     int printable = 0;
@@ -1098,6 +1342,8 @@ static bool DiagEsLegible(const std::string& s) {
 // Separado en función propia porque DiagDumpPlayerFaction se invoca dentro de un wrapper
 // SEH (__try/__except), y MSVC no permite mezclar SEH con objetos C++ de destructor no
 // trivial (std::string) en la MISMA función. Aquí sí podemos usar std::string libremente.
+// EN: Real body of probe v2. Split out because the caller runs under SEH (__try/__except) and
+//     MSVC forbids mixing SEH with C++ objects with non-trivial destructors in one function.
 static void DiagDumpPlayerFactionBody(int dumpId) {
     const auto& offsets = GetOffsets();
     const int facNameOff = offsets.factionExtra.nameStr;            // 0x01A8
@@ -1109,6 +1355,9 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
 
     // Lee un Faction* candidato, valida heap, y devuelve su nombre legible (o "").
     // Prueba +0x1A8 (faction.nameStr) y, como respaldo, +0x10 (faction.name).
+    // (Desfasado: faction.name ya vale también 0x1A8, así que ambos intentos leen lo mismo.)
+    // EN: Reads a candidate Faction*, checks heap, returns its readable name (or "") trying
+    //     nameStr then faction.name (both are 0x1A8 today); usadoOff gets the offset used.
     // 'usadoOff' recibe el offset que dio el nombre (para loguearlo). Loguea NADA aquí:
     // el llamante decide el formato según el escaneo.
     auto leerNombreFaccion = [&](uintptr_t facPtr, int& usadoOff) -> std::string {
@@ -1124,6 +1373,8 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
     // ── Resolución de objetos al inicio ──
     // gwObj: objeto GameWorld real. GetResolvedGameWorld() puede devolver la ADDR de la
     // global (dentro del módulo) o el objeto directo. Si el deref es heap, usamos el deref.
+    // EN: Resolve the real GameWorld (gwObj) and PlayerBase/PlayerInterface (pbObj) objects:
+    //     dereference once if the result is heap, otherwise use the address itself.
     uintptr_t gwAddr = GetResolvedGameWorld();
     uintptr_t gwDeref = 0;
     bool gwDerefOk = (gwAddr != 0) && Memory::Read(gwAddr, gwDeref) && DiagIsHeap(gwDeref);
@@ -1143,6 +1394,7 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
 
     // ── ESCANEO A — PlayerBase como PlayerInterface ──
     // Recorre pbObj +0x00..+0x400 de 8 en 8. Cada qword isHeap() se interpreta como Faction*.
+    // EN: SCAN A — walks pbObj +0x00..+0x400 in 8-byte steps; each heap qword is tried as Faction*.
     if (DiagIsHeap(pbObj)) {
         spdlog::info("[DIAG] A: escaneo PlayerBase(0x{:X}) +0x000..+0x400 como Faction*:", pbObj);
         for (int off = 0x00; off <= 0x400; off += 8) {
@@ -1162,6 +1414,8 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
 
     // ── ESCANEO B — GameWorld objeto ──
     // gwObj +0x400..+0xA00 de 8 en 8. Cada qword isHeap() se prueba de dos formas.
+    // EN: SCAN B — gwObj +0x400..+0xA00 in 8-byte steps; each heap qword is tried as
+    //     PlayerInterface* (b1: its +0x2A0/+0x320 as Faction*) and as a direct Faction* (b2).
     if (DiagIsHeap(gwObj)) {
         spdlog::info("[DIAG] B: escaneo GameWorld(0x{:X}) +0x400..+0xA00:", gwObj);
         for (int off = 0x400; off <= 0xA00; off += 8) {
@@ -1199,6 +1453,9 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
     // ── ESCANEO C — vía Character (la facción con CERTEZA) ──
     // Vía 1: pbObj interpretado como array de Character* (pbObj+0 = Character* con vtable módulo).
     // Vía 2: lektor playerCharacters @ pbObj+0x2B0 (size@+0x08, data@+0x10) -> data[0].
+    // EN: SCAN C — via Character (the faction with CERTAINTY). Path 1: pbObj+0 as a Character*
+    //     with a vtable in the module. Path 2: playerCharacters lektor at pbObj+0x2B0 -> data[0].
+    //     Then reads char+0x10 (faction) and also logs [DIAG-COMBAT] state of the host char.
     uintptr_t modBase = Memory::GetModuleBase();
     auto esCharacter = [&](uintptr_t p) -> bool {
         if (!DiagIsHeap(p)) return false;
@@ -1250,6 +1507,10 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
         // el jugador" y NO marcado como remote-controlled por el mod (lo que bloquearía
         // sus órdenes). Si el host apareciese como remote-controlled, ESA sería la causa
         // de que no pueda atacar (el motor trataría sus decisiones como de red).
+        // EN: DIAG-COMBAT: check the host char is "player controlled" and NOT flagged as
+        //     remote-controlled by the mod (which would block its orders / attacks). Logs:
+        //     1) the isPlayerControlled byte if known, 2) ai_hooks::IsRemoteControlled,
+        //     3) squad pointer candidates near the start of the Character.
         //
         // 1) Flag isPlayerControlled (si el offset ya fue descubierto por la sonda de diff).
         int pcOff = offsets.character.isPlayerControlled;
@@ -1296,6 +1557,8 @@ static void DiagDumpPlayerFactionBody(int dumpId) {
 // Los escaneos en rango derefencian punteros como Faction* y leen +0x1A8: aunque cada
 // candidato pasa isHeap() y Memory::Read/ReadKenshiString toleran fallos, blindamos el
 // volcado completo contra cualquier access violation residual. Sin objetos C++ aquí.
+// EN: SEH wrapper for the probe body: shields the whole dump against any residual access
+//     violation. No C++ objects here (MSVC SEH restriction).
 static void SEH_DiagDumpPlayerFactionBody(int dumpId) {
     __try {
         DiagDumpPlayerFactionBody(dumpId);
@@ -1304,6 +1567,10 @@ static void SEH_DiagDumpPlayerFactionBody(int dumpId) {
     }
 }
 
+// ES: Punto de entrada de la sonda: respeta el tope DIAG_MAX_DUMPS (hoy 0 = nunca hace nada),
+//     no toca memoria durante la carga y ejecuta el cuerpo bajo SEH.
+// EN: Probe entry point: honors the DIAG_MAX_DUMPS cap (currently 0 = does nothing),
+//     skips memory access while loading and runs the body under SEH.
 void DiagDumpPlayerFaction() {
     // Límite de volcados (atómico, thread-safe entre hilo de red y de lógica).
     int n = s_diagDumpCount.fetch_add(1);
@@ -1326,6 +1593,11 @@ void DiagDumpPlayerFaction() {
 // resuelto debe ser un puntero de HEAP válido y no nulo (así esperamos a que el player exista).
 // Si no es heap válido, NO contamos el tiempo (no reseteamos el reloj, no disparamos).
 // DiagDumpPlayerFaction ya respeta su límite global de 6 volcados.
+// (Desfasado: el límite actual es DIAG_MAX_DUMPS = 0, sonda desactivada.)
+// EN: Pumps the probe from the game tick (OnGameTick) with a 2 s real-time throttle
+//     (steady_clock; OnGameTick runs at ~framerate). Fires only once the resolved PlayerBase
+//     is a valid heap pointer. DiagDumpPlayerFaction enforces its own global cap
+//     (DIAG_MAX_DUMPS, currently 0 = disabled).
 void DiagTickPump() {
     using clock = std::chrono::steady_clock;
     static clock::time_point s_lastDiag{};   // último volcado (epoch por defecto = nunca)
@@ -1381,9 +1653,21 @@ void DiagTickPump() {
 // en el mismo scope (MSVC C2712). Por eso el bloque __try hace SOLO lectura/escritura
 // cruda en variables POD locales, y TODO el logging (spdlog crea temporales con
 // destructor) se hace FUERA del __try. La parte cruda se aísla en SEH_RawFixFaction.
+//
+// EN: Fixes the HOST character's FACTION: if char+0x10 does not point to the valid player
+//     faction (GameWorld+0x580 -> +0x2A0), writes it. The engine's
+//     Character::isPlayerCharacter() compares char.faction(+0x10) == player(+0x580).faction to
+//     accept your combat orders. SAFE here because the player faction is owned by
+//     PlayerInterface and lives all game long (unlike NPC factions freed on zone unload ->
+//     use-after-free, see player_controller.cpp). All raw access is under __try/__except and
+//     the char is validated (heap pointer, vtable inside the module). Always logs with
+//     [DIAG-FAC]; returns a FixFactionResult so core.cpp knows when the host is fixed.
+//     Logging is kept OUT of the __try because of MSVC C2712 (SEH + destructors).
 
 // Helper SEH puro (sin objetos C++): lee faction antes, escribe si difiere, releé después.
 // Devuelve true si la memoria fue accesible; rellena outBefore/outAfter/outWrote/outVtableOk.
+// EN: Pure SEH helper (no C++ objects): reads the faction before, writes if different, re-reads.
+//     Returns true if memory was accessible; fills outVtable/outBefore/outAfter/outWrote.
 static bool SEH_RawFixFaction(uintptr_t cp, int factionOff, uintptr_t playerFaction,
                               uintptr_t modBase, uintptr_t modSize,
                               uintptr_t& outVtable, uintptr_t& outBefore,
@@ -1409,6 +1693,7 @@ static bool SEH_RawFixFaction(uintptr_t cp, int factionOff, uintptr_t playerFact
     }
 }
 
+// ES: Implementación pública descrita arriba. / EN: Public implementation described above.
 FixFactionResult FixCharacterFactionTo(void* charPtr, uintptr_t playerFaction) {
     uintptr_t cp = reinterpret_cast<uintptr_t>(charPtr);
 
@@ -1459,6 +1744,8 @@ FixFactionResult FixCharacterFactionTo(void* charPtr, uintptr_t playerFaction) {
 }
 
 // ── SetPlayerControlled ──
+// ES: Escribe 1/0 en el byte isPlayerControlled si su offset fue descubierto; si no, false.
+// EN: Writes 1/0 to the isPlayerControlled byte if its offset was discovered; otherwise false.
 bool CharacterAccessor::SetPlayerControlled(bool controlled) {
     int offset = GetOffsets().character.isPlayerControlled;
     if (offset < 0) return false;
@@ -1470,6 +1757,9 @@ bool CharacterAccessor::SetPlayerControlled(bool controlled) {
 } // namespace kmp::game
 
 // ── Deferred AnimClass Probing ──
+// ES: Sondeo diferido de AnimClass: los personajes recién creados pueden no tener posición
+//     asentada en el primer frame; se encolan y se reintenta en cada tick del juego hasta
+//     descubrir animClassOffset o agotar los intentos. Cola protegida por mutex.
 // Characters spawned via in-place replay may not have a settled position on the
 // first frame. We queue them and re-probe each game tick until the animClassOffset
 // is discovered or the queue is exhausted.
@@ -1479,6 +1769,8 @@ static int s_deferredTotalAttempts = 0;
 
 namespace kmp::game {
 
+// ES: Encola un personaje para la sonda diferida (sin duplicados).
+// EN: Queues a character for the deferred probe (no duplicates).
 void ScheduleDeferredAnimClassProbe(uintptr_t charPtr) {
     std::lock_guard lock(s_deferredProbeMutex);
     // Avoid duplicates
@@ -1490,6 +1782,12 @@ void ScheduleDeferredAnimClassProbe(uintptr_t charPtr) {
                  charPtr, s_deferredProbeChars.size());
 }
 
+// ES: Llamar en cada tick: prueba cada personaje encolado (bajo SEH, quitando los que
+//     revientan) y para al primer éxito. Devuelve true si animClassOffset ya se conoce.
+//     Tras 50 ticks sin éxito vacía la cola y se rinde.
+// EN: Call every tick: tries each queued character (under SEH, dropping ones that crash)
+//     and stops at the first success. Returns true if animClassOffset is known.
+//     After 50 unsuccessful ticks it clears the queue and gives up.
 bool ProcessDeferredAnimClassProbes() {
     // Already discovered — no need to probe
     if (GetOffsets().character.animClassOffset >= 0) {
@@ -1543,6 +1841,11 @@ bool ProcessDeferredAnimClassProbes() {
 }
 
 // ── Reset all probe state for reconnect or second game load ──
+// ES: Reinicia todo el estado de las sondas al reconectar o cargar una segunda partida; si no,
+//     los estáticos persistirían y las sondas no volverían a dispararse. También reinicia el
+//     prober unificado (game_offset_prober). Ojo: s_writePosLogged ya no existe y
+//     s_discoveredPlayerControlledOffset NO se reinicia aquí.
+// EN: Also note: s_writePosLogged no longer exists and s_discoveredPlayerControlledOffset is NOT reset here.
 // Without this, statics like s_animClassProbed, s_deferredTotalAttempts, s_writePosLogged
 // persist across game loads, causing probes to never fire on second load.
 void ResetProbeState() {
@@ -1564,6 +1867,10 @@ void ResetProbeState() {
 }
 
 // ── Player Controlled Offset Discovery ──
+// ES: Sonda por diferencia: compara byte a byte (+0x100..+0x500) el personaje del jugador con
+//     un NPC y toma el primer byte que vale 1 en el jugador y 0 en el NPC, con vecinos a 0 en
+//     ambos (para descartar enteros multibyte). Heurística frágil: game_types.h indica que el
+//     campo isPlayerControlled probablemente no existe y se deriva por facción.
 // Exploits the fact that the local player's primary character has isPlayerControlled=true
 // while NPCs have it as false. Scans a range of offsets looking for this distinguishing byte.
 static int s_discoveredPlayerControlledOffset = -1;
@@ -1610,6 +1917,8 @@ void ProbePlayerControlledOffset(uintptr_t playerCharPtr, uintptr_t npcCharPtr) 
                   playerCharPtr, npcCharPtr);
 }
 
+// ES: Versión libre de SetPlayerControlled para un Character* crudo (sin validar el puntero).
+// EN: Free-function version of SetPlayerControlled for a raw Character* (pointer not validated).
 bool WritePlayerControlled(uintptr_t charPtr, bool controlled) {
     int off = GetOffsets().character.isPlayerControlled;
     if (off < 0) return false;
@@ -1623,6 +1932,9 @@ bool WritePlayerControlled(uintptr_t charPtr, bool controlled) {
 } // namespace kmp::game
 
 // ── Bridge functions to avoid circular Core include ──
+// ES: Funciones puente para evitar un include circular con Core: Core rellena aquí las
+//     direcciones resueltas de PlayerBase y GameWorld (vía el resolvedor de funciones del
+//     juego) y el estado "cargando"; este módulo las lee con los getters.
 // Core sets these via the game functions resolver. game_character.cpp reads them.
 static uintptr_t s_resolvedPlayerBase = 0;
 static uintptr_t s_resolvedGameWorld = 0;

@@ -1,3 +1,11 @@
+// ES: game_offset_prober.cpp - Implementación del sondeador de offsets: sondas individuales
+//     (sceneNode, isPlayerControlled, aiPackage, moveSpeed, animState), lectura/escritura de la
+//     caché JSON validada por la huella del ejecutable y la API pública. Se compila también en
+//     KenshiMP.UnitTest. Todas las lecturas de memoria del juego van protegidas con SEH.
+// EN: game_offset_prober.cpp - Offset prober implementation: individual probes (sceneNode,
+//     isPlayerControlled, aiPackage, moveSpeed, animState), JSON cache read/write validated by
+//     the executable fingerprint, and the public API. Also compiled into KenshiMP.UnitTest.
+//     Every game memory read is SEH-protected.
 #include "game_offset_prober.h"
 #include "game_types.h"
 #include "kmp/memory.h"
@@ -17,9 +25,13 @@ namespace kmp::game {
 //  INTERNAL STATE
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Estado interno: si el sondeo terminó y si ya se hizo una pasada completa.
+// EN: Internal state: whether probing finished and whether a full pass already ran.
 static bool s_proberComplete = false;
 static bool s_proberRanOnce  = false;  // Prevent re-running after first full pass
 
+// ES: Flags por offset: cada sonda se intenta como mucho una vez por sesión.
+// EN:
 // Per-offset probed flags — each is attempted at most once per session.
 static bool s_probedSceneNode        = false;
 static bool s_probedIsPlayerCtrl     = false;
@@ -27,6 +39,8 @@ static bool s_probedAnimState        = false;
 static bool s_probedAIPackage        = false;
 static bool s_probedMoveSpeed        = false;
 
+// ES: Nombre del fichero de caché (se guarda junto al ejecutable del juego).
+// EN:
 // Cache file path (next to the DLL / game exe)
 static const char* CACHE_FILE = "KenshiOnline_offset_cache.json";
 
@@ -34,6 +48,8 @@ static const char* CACHE_FILE = "KenshiOnline_offset_cache.json";
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Lectura de un valor protegida con SEH; false si hay violación de acceso.
+// EN:
 // SEH-protected single-value read. Returns false on access violation.
 template<typename T>
 static bool SafeRead(uintptr_t addr, T& out) {
@@ -45,6 +61,9 @@ static bool SafeRead(uintptr_t addr, T& out) {
     }
 }
 
+// ES: ¿Parece un puntero de heap válido? (modo usuario, alineado a 8 y fuera de la imagen de
+//     kenshi_x64.exe, que se supone de 64 MB fijos en vez de leer SizeOfImage).
+// EN:
 // Check if a pointer looks like a valid heap-allocated object (usermode, aligned, outside module).
 static bool IsValidHeapPtr(uintptr_t ptr) {
     if (ptr < 0x10000 || ptr >= 0x00007FFFFFFFFFFF) return false;
@@ -55,6 +74,9 @@ static bool IsValidHeapPtr(uintptr_t ptr) {
     return true;
 }
 
+// ES: ¿La vtable del objeto (primer qword) está dentro del rango de un módulo concreto?
+//     Sirve para reconocer la clase del objeto (p.ej. Ogre::SceneNode si cae en OgreMain_x64.dll).
+// EN:
 // Check if a pointer's vtable lives inside a specific module's image range.
 static bool HasVtableInModule(uintptr_t objPtr, uintptr_t moduleBase, uintptr_t moduleEnd) {
     if (moduleBase == 0 || moduleEnd == 0) return false;
@@ -63,6 +85,9 @@ static bool HasVtableInModule(uintptr_t objPtr, uintptr_t moduleBase, uintptr_t 
     return vtable >= moduleBase && vtable < moduleEnd;
 }
 
+// ES: Base y fin de un módulo cargado (leyendo SizeOfImage de la cabecera PE). La caché la hace
+//     quien llama (ProbeSceneNode guarda el resultado en estáticos), no esta función.
+// EN:
 // Get module base and end for a named DLL (cached after first call).
 static bool GetModuleRange(const char* dllName, uintptr_t& base, uintptr_t& end) {
     HMODULE hMod = GetModuleHandleA(dllName);
@@ -80,6 +105,9 @@ static bool GetModuleRange(const char* dllName, uintptr_t& base, uintptr_t& end)
     return true;
 }
 
+// ES: Huella del ejecutable para invalidar la caché: tamaño del fichero (32 bits bajos) +
+//     TimeDateStamp de la cabecera PE en memoria (32 bits altos). Si cambia el exe, la caché no vale.
+// EN:
 // Compute a simple hash of the game executable for cache invalidation.
 // Uses file size + PE timestamp as a fast fingerprint (no need for crypto hash).
 static uint64_t ComputeExeFingerprint() {
@@ -109,6 +137,9 @@ static uint64_t ComputeExeFingerprint() {
     return (static_cast<uint64_t>(peTimestamp) << 32) | static_cast<uint64_t>(fileSize);
 }
 
+// ES: Ruta del fichero de caché: carpeta del ejecutable del juego + CACHE_FILE (el comentario
+//     inglés habla del padre de la carpeta KenshiMP, pero el código usa la carpeta del exe).
+// EN:
 // Get the directory where the cache file should be written.
 // Uses the Kenshi game directory (parent of the KenshiMP dir).
 static std::string GetCachePath() {
@@ -128,9 +159,15 @@ static std::string GetCachePath() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── sceneNode ──
+// ES: Sonda de sceneNode: busca en el Character (+0x60..+0x300) un puntero cuya vtable esté en
+//     OgreMain_x64.dll (un Ogre::SceneNode, el nodo de escena que lleva la transformación del
+//     personaje) y cuya posición coincida (±5) con la posición en caché char+0x48.
+// EN:
 // Ogre::SceneNode* should be a pointer in the character struct whose vtable
 // resides inside OgreMain_x64.dll. The sceneNode also contains the character's
 // world transform, so we can cross-check the position.
+// ES: True si descubrió el offset. Si la posición es (0,0,0) deja la sonda sin marcar para otro intento.
+// EN: True if the offset was discovered. If the position is (0,0,0) the probe stays unmarked for a retry.
 static bool ProbeSceneNode(uintptr_t charPtr) {
     if (s_probedSceneNode) return false;
     s_probedSceneNode = true;
@@ -138,6 +175,8 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
     auto& offsets = GetOffsets().character;
     if (offsets.sceneNode >= 0) return false; // Already known
 
+    // ES: Rango del módulo OgreMain (cacheado en estáticos).
+    // EN:
     // Resolve OgreMain module range
     static uintptr_t s_ogreBase = 0, s_ogreEnd = 0;
     if (s_ogreBase == 0) {
@@ -147,6 +186,8 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
         }
     }
 
+    // ES: Leer la posición en caché del personaje para validar después.
+    // EN:
     // Read the character's cached position for cross-validation
     Vec3 cachedPos;
     if (offsets.position < 0) return false;
@@ -156,6 +197,8 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
         return false;
     }
 
+    // ES: Recorrer campos alineados a 8 del Character entre +0x60 y +0x300.
+    // EN:
     // Scan pointer-aligned fields in the character struct (0x60..0x300).
     // The sceneNode is typically in the first part of the struct, after
     // basic fields like vtable, squad, faction, name.
@@ -164,9 +207,14 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
         if (!SafeRead(charPtr + probe, candidate)) continue;
         if (!IsValidHeapPtr(candidate)) continue;
 
+        // ES: Comprobación 1: la vtable debe estar en OgreMain_x64.dll.
+        // EN:
         // Check 1: vtable must point into OgreMain_x64.dll
         if (!HasVtableInModule(candidate, s_ogreBase, s_ogreEnd)) continue;
 
+        // ES: Comprobación 2: probar varios offsets típicos de posición dentro de Ogre::Node
+        //     (en tríos x,y,z) y comparar con la posición del personaje.
+        // EN:
         // Check 2: Ogre::SceneNode::_getDerivedPosition() stores the world
         // position. In Ogre 1.x, the derived position is typically at
         // SceneNode+0x50..0x5C (Vec3) or at Node+0xD0..0xDC depending on build.
@@ -184,6 +232,8 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
             if (!SafeRead(candidate + ogre_pos_offsets[i + 1], ny)) continue;
             if (!SafeRead(candidate + ogre_pos_offsets[i + 2], nz)) continue;
 
+            // ES: Coincidencia con tolerancia (la transformación de Ogre puede ir un frame por detrás).
+            // EN:
             // Position match within tolerance (Ogre transform may lag by a frame)
             float dx = std::abs(nx - cachedPos.x);
             float dy = std::abs(ny - cachedPos.y);
@@ -215,12 +265,20 @@ static bool ProbeSceneNode(uintptr_t charPtr) {
 //   inexistente y siempre dejaba el offset en -1. Lo neutralizamos para no gastar ciclos
 //   ni generar falsas expectativas. La distinción player/NPC se hace por facción en la
 //   capa que lo necesita (ver derivación por facción en core.cpp / player_controller).
+// EN: isPlayerControlled - RE FINDING (KenshiLib Character.h + 1.0.68 binary, 2026-06-17):
+//     Character has NO isPlayerControlled-like field. The engine uses a METHOD
+//     (Character::isPlayerCharacter()) derived from faction membership:
+//     character.faction(+0x10) == gameWorld.player(+0x580).faction. The old differential probe
+//     (a byte equal to 1 for the player and 0 for the NPC in 0x80..0x500) could never succeed,
+//     so it is neutralized; player/NPC distinction is done by faction where needed.
 static bool ProbeIsPlayerControlled(uintptr_t playerPtr, uintptr_t npcPtr) {
     (void)playerPtr;
     (void)npcPtr;
     if (s_probedIsPlayerCtrl) return false;
     s_probedIsPlayerCtrl = true;
 
+    // EN: Mark the offset as "not applicable" (-2) to tell it apart from "pending" (-1), and log
+    //     that this is not a probe failure but a non-existent field.
     // Marcamos el offset como "no aplica" (-2) para diferenciarlo de "pendiente" (-1)
     // y dejar constancia en el log de que NO es un fallo de probe, sino que el campo
     // no existe en la clase Character.
@@ -233,10 +291,18 @@ static bool ProbeIsPlayerControlled(uintptr_t playerPtr, uintptr_t npcPtr) {
 }
 
 // ── aiPackage ──
+// ES: Sonda de aiPackage: busca en +0x200..+0x400 un puntero de heap con vtable en el módulo del
+//     juego cuyos 8 primeros qwords apunten de vuelta al personaje o a su facción.
+//     OJO: aiPackage ya vale 0x20 por defecto (AITaskSytem* confirmado por RE), así que esta
+//     sonda sale sin hacer nada; además 0x20 queda fuera del rango que escanea.
+// EN: NOTE: aiPackage already defaults to 0x20 (RE-confirmed AITaskSytem*), so this probe
+//     returns immediately; besides, 0x20 is outside the scanned range.
 // The AI package pointer should be a heap-allocated object with a vtable in
 // the game module (kenshi_x64.exe). It should be near the inventory/stats region.
 // We look for a pointer in range 0x200..0x400 that has a game-module vtable
 // and is NOT the inventory, stats, or other known pointers.
+// ES: True si descubrió el offset.
+// EN: True if the offset was discovered.
 static bool ProbeAIPackage(uintptr_t charPtr) {
     if (s_probedAIPackage) return false;
     s_probedAIPackage = true;
@@ -247,6 +313,8 @@ static bool ProbeAIPackage(uintptr_t charPtr) {
     uintptr_t modBase = Memory::GetModuleBase();
     uintptr_t modEnd  = modBase + 0x4000000; // Conservative 64MB estimate
 
+    // ES: Afinar el fin del módulo leyendo SizeOfImage de la cabecera PE.
+    // EN:
     // Refine module end from PE headers (safe: PE headers are in our address space)
     {
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
@@ -257,6 +325,8 @@ static bool ProbeAIPackage(uintptr_t charPtr) {
         }
     }
 
+    // ES: Offsets conocidos que se saltan (facción, GameData, inventario).
+    // EN:
     // Known offsets to skip (these point to known objects, not AI packages)
     const int knownPtrOffsets[] = {
         offsets.faction,     // 0x10
@@ -276,11 +346,15 @@ static bool ProbeAIPackage(uintptr_t charPtr) {
         if (!SafeRead(charPtr + probe, candidate)) continue;
         if (!IsValidHeapPtr(candidate)) continue;
 
+        // ES: La vtable debe estar en kenshi_x64.exe.
+        // EN:
         // Vtable must be in the game module
         uintptr_t vtable = 0;
         if (!SafeRead(candidate, vtable)) continue;
         if (vtable < modBase || vtable >= modEnd) continue;
 
+        // ES: Buscar un puntero de vuelta al personaje o a su facción en los primeros qwords del objeto.
+        // EN:
         // AI packages typically have a backpointer to the character or faction.
         // Check if any of the first 8 qwords in the AI object point back to
         // the character or its faction.
@@ -310,6 +384,9 @@ static bool ProbeAIPackage(uintptr_t charPtr) {
 }
 
 // ── moveSpeed ──
+// ES: Sonda de moveSpeed: aplazada. Sin observar varios frames no se puede distinguir un float
+//     de velocidad, así que solo marca la sonda como intentada y no descubre nada.
+// EN:
 // Movement speed is a float that should be > 0 when the character is moving
 // and ~0 when stationary. We look for a float in range [0, 30] in the
 // character struct between offsets 0x200 and 0x450 that is NOT part of a
@@ -332,6 +409,8 @@ static bool ProbeMoveSpeed(uintptr_t charPtr) {
 }
 
 // ── animState ──
+// ES: Sonda de animState: también aplazada (necesita observar transiciones de animación).
+// EN:
 // Animation state is typically a small integer (0-255) or enum.
 // Similar to moveSpeed, this needs observation over time to identify.
 static bool ProbeAnimState(uintptr_t charPtr) {
@@ -350,7 +429,14 @@ static bool ProbeAnimState(uintptr_t charPtr) {
 //  CACHE I/O
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Carga la caché JSON: comprueba que la huella del exe coincida, restaura los offsets >= 0 y
+//     marca como sondeados los que se recuperaron. True si restauró al menos uno.
+// EN: Loads the JSON cache: checks the exe fingerprint matches, restores offsets >= 0 and marks
+//     the restored ones as probed. True if at least one was restored.
 bool LoadOffsetCache() {
+    // ES: Sin __try aquí: los objetos json tienen destructores y MSVC no permite SEH con unwinding C++;
+    //     json::parse con allow_exceptions=false maneja los errores de parseo.
+    // EN:
     // NOTE: No __try/__except in this function — json objects have destructors,
     // and MSVC forbids SEH in functions that require C++ unwinding.
     // json::parse with allow_exceptions=false handles parse errors safely.
@@ -368,6 +454,8 @@ bool LoadOffsetCache() {
         return false;
     }
 
+    // ES: Validar la huella del ejecutable.
+    // EN:
     // Validate fingerprint
     uint64_t cachedFingerprint = j.value("exe_fingerprint", uint64_t(0));
     uint64_t currentFingerprint = ComputeExeFingerprint();
@@ -377,6 +465,8 @@ bool LoadOffsetCache() {
         return false;
     }
 
+    // ES: Restaurar los offsets de la caché (solo valores >= 0).
+    // EN:
     // Restore offsets from cache
     auto& offsets = GetOffsets().character;
     int restored = 0;
@@ -403,6 +493,8 @@ bool LoadOffsetCache() {
     if (restored > 0) {
         spdlog::info("OffsetProber: Restored {} offsets from cache ({})", restored, path);
 
+        // ES: Marcar como hechas las sondas cuyos offsets se restauraron.
+        // EN:
         // Mark probes as complete for offsets that were restored
         if (offsets.sceneNode >= 0)          s_probedSceneNode = true;
         if (offsets.isPlayerControlled >= 0) s_probedIsPlayerCtrl = true;
@@ -418,6 +510,8 @@ bool LoadOffsetCache() {
     return false;
 }
 
+// ES: Escribe la caché JSON (huella, versión y offsets descubiertos >= 0) con sangría de 2.
+// EN: Writes the JSON cache (fingerprint, version and discovered offsets >= 0) with 2-space indent.
 void SaveOffsetCache() {
     auto& offsets = GetOffsets().character;
 
@@ -425,6 +519,8 @@ void SaveOffsetCache() {
     j["exe_fingerprint"] = ComputeExeFingerprint();
     j["version"]         = 1;
 
+    // ES: Guardar solo los offsets descubiertos (>= 0).
+    // EN:
     // Save all runtime-discovered offsets (only save if >= 0, i.e., discovered)
     auto save = [&](const char* key, int val) {
         if (val >= 0) j[key] = val;
@@ -457,6 +553,9 @@ void SaveOffsetCache() {
 //  PUBLIC API
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Resultado de una pasada de sondas: nº descubiertos, si hubo alguno nuevo y qué sondas
+//     crashearon (SEH). La función que las ejecuta no puede tener objetos C++ con destructor.
+// EN:
 // SEH-safe probe runner — NO C++ objects with destructors allowed in this function.
 // MSVC forbids __try in functions that need C++ unwinding.
 // Returns: number of newly discovered offsets. Sets flags in |results|.
@@ -470,6 +569,8 @@ struct ProbeResults {
     bool animStateCrashed;
 };
 
+// ES: Ejecuta cada sonda dentro de su propio __try; si una crashea, la marca como intentada.
+// EN: Runs each probe inside its own __try; if one crashes it is marked as attempted.
 static ProbeResults RunProbesSEH(uintptr_t charPtr, uintptr_t npcCharPtr) {
     ProbeResults r = {};
 
@@ -511,14 +612,24 @@ static ProbeResults RunProbesSEH(uintptr_t charPtr, uintptr_t npcCharPtr) {
     return r;
 }
 
+// ES: Punto de entrada: valida el puntero y que el personaje tenga posición, ejecuta las sondas,
+//     loguea fallos y el estado de todos los offsets y, si todas las sondas se intentaron, marca
+//     el sondeo como completo y guarda la caché. Devuelve si hubo offsets nuevos.
+// EN: Entry point: validates the pointer and that the character has a position, runs the probes,
+//     logs crashes and the status of every offset and, once all probes were attempted, marks
+//     probing complete and saves the cache. Returns whether new offsets were found.
 bool RunOffsetProber(uintptr_t charPtr, uintptr_t npcCharPtr) {
     if (s_proberComplete) return false;
     if (charPtr == 0) return false;
 
+    // ES: Validar el puntero del personaje (modo usuario y alineado a 8).
+    // EN:
     // Validate character pointer
     if (charPtr < 0x10000 || charPtr >= 0x00007FFFFFFFFFFF || (charPtr & 0x7) != 0)
         return false;
 
+    // ES: Exigir posición no nula (personaje ya colocado en el mundo).
+    // EN:
     // Verify we have a valid position (character must be fully initialized)
     auto& offsets = GetOffsets().character;
     Vec3 pos;
@@ -532,9 +643,13 @@ bool RunOffsetProber(uintptr_t charPtr, uintptr_t npcCharPtr) {
     spdlog::info("OffsetProber: Running probe suite on char 0x{:X} (npc=0x{:X})",
                  charPtr, npcCharPtr);
 
+    // ES: Ejecutar las sondas en la función SEH separada.
+    // EN:
     // Run all probes in a SEH-safe context (separate function, no C++ destructors)
     ProbeResults results = RunProbesSEH(charPtr, npcCharPtr);
 
+    // ES: Avisos de sondas que crashearon (aquí ya se puede usar spdlog, estamos fuera de __try).
+    // EN:
     // Log crash warnings (safe to use spdlog here — we're outside __try)
     if (results.sceneNodeCrashed)
         spdlog::warn("OffsetProber: sceneNode probe crashed (SEH caught)");
@@ -552,6 +667,8 @@ bool RunOffsetProber(uintptr_t charPtr, uintptr_t npcCharPtr) {
         spdlog::info("OffsetProber: Discovered {} new offsets this run", results.discovered);
     }
 
+    // ES: Volcar al log el estado final de cada offset.
+    // EN:
     // Log final offset status — use spdlog's built-in hex formatting
     auto logOff = [](const char* name, int val) {
         if (val >= 0)
@@ -569,6 +686,8 @@ bool RunOffsetProber(uintptr_t charPtr, uintptr_t npcCharPtr) {
     logOff("moveSpeed         ", offsets.moveSpeed);
     logOff("animState         ", offsets.animState);
 
+    // ES: ¿Se intentaron todas las sondas? Entonces se da por completo y se guarda la caché.
+    // EN:
     // Check if all feasible probes have been attempted
     bool allProbed = s_probedSceneNode && s_probedIsPlayerCtrl &&
                      s_probedAIPackage && s_probedMoveSpeed && s_probedAnimState;
@@ -587,6 +706,8 @@ bool RunOffsetProber(uintptr_t charPtr, uintptr_t npcCharPtr) {
     return results.anyNew;
 }
 
+// ES: Reinicia los flags de sondeo (no restaura los valores de los offsets ya descubiertos).
+// EN: Resets the probing flags (does not restore the already discovered offset values).
 void ResetOffsetProber() {
     s_proberComplete     = false;
     s_proberRanOnce      = false;
@@ -598,6 +719,8 @@ void ResetOffsetProber() {
     spdlog::info("OffsetProber: Reset all probe state");
 }
 
+// ES: True si el sondeo terminó.
+// EN: True if probing has finished.
 bool IsProberComplete() {
     return s_proberComplete;
 }

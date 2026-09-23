@@ -1,12 +1,24 @@
+// ES: game_building.cpp - Implementación de BuildingAccessor: lee campos de un edificio del juego
+//     (nombre, posición, salud, construcción, dueño, inventario) con los offsets de BuildingOffsets.
+//     OJO: esos offsets son heredados y no están verificados en 1.0.68.
+// EN: game_building.cpp - BuildingAccessor implementation: reads fields of a game building
+//     (name, position, health, construction, owner, inventory) using BuildingOffsets.
+//     NOTE: those offsets are inherited and not verified on 1.0.68.
 #include "game_types.h"
 #include "kmp/memory.h"
 #include <spdlog/spdlog.h>
 
 namespace kmp::game {
 
+// ES: Los edificios usan el mismo layout de std::string de MSVC que los personajes.
+// EN:
 // ── BuildingAccessor method implementations ──
 // Buildings in Kenshi use the same MSVC std::string layout as characters.
 
+// ES: Lee el nombre (std::string de MSVC: size en +0x10, capacity en +0x18; si capacity > 15
+//     el texto está en heap y +0x00 es el puntero; si no, está inline (SSO)). Máx 256 caracteres.
+// EN: Reads the name (MSVC std::string: size at +0x10, capacity at +0x18; if capacity > 15 the
+//     text lives on the heap and +0x00 is the pointer; otherwise it is inline (SSO)). Max 256 chars.
 std::string BuildingAccessor::GetName() const {
     auto& offsets = GetOffsets().building;
     if (offsets.name < 0) return "Unknown Building";
@@ -33,6 +45,8 @@ std::string BuildingAccessor::GetName() const {
     return std::string(buffer, size);
 }
 
+// ES: Posición del edificio en el mundo (Vec3).
+// EN: Building world position (Vec3).
 Vec3 BuildingAccessor::GetPosition() const {
     Vec3 pos;
     auto& offsets = GetOffsets().building;
@@ -42,6 +56,8 @@ Vec3 BuildingAccessor::GetPosition() const {
     return pos;
 }
 
+// ES: Salud actual y máxima (floats).
+// EN: Current and max health (floats).
 float BuildingAccessor::GetHealth() const {
     auto& offsets = GetOffsets().building;
     if (offsets.health < 0) return 0.f;
@@ -60,6 +76,8 @@ float BuildingAccessor::GetMaxHealth() const {
     return maxHp;
 }
 
+// ES: Flag de destruido; si no hay offset, se deduce de salud <= 0.
+// EN: Destroyed flag; without an offset it is derived from health <= 0.
 bool BuildingAccessor::IsDestroyed() const {
     auto& offsets = GetOffsets().building;
     if (offsets.isDestroyed < 0) {
@@ -74,6 +92,8 @@ bool BuildingAccessor::IsDestroyed() const {
     return destroyed;
 }
 
+// ES: Progreso de construcción 0-1 (1 si el offset es desconocido).
+// EN: Construction progress 0-1 (1 when the offset is unknown).
 float BuildingAccessor::GetBuildProgress() const {
     auto& offsets = GetOffsets().building;
     if (offsets.buildProgress < 0) return 1.0f; // Assume complete if unknown
@@ -83,6 +103,8 @@ float BuildingAccessor::GetBuildProgress() const {
     return progress;
 }
 
+// ES: Construido del todo; sin offset se deduce de progreso >= 1.
+// EN: Fully constructed; without an offset it is derived from progress >= 1.
 bool BuildingAccessor::IsConstructed() const {
     auto& offsets = GetOffsets().building;
     if (offsets.isConstructed < 0) {
@@ -95,6 +117,8 @@ bool BuildingAccessor::IsConstructed() const {
     return constructed;
 }
 
+// ES: Faction* dueño; solo se devuelve si parece un puntero de usuario válido (si no, 0).
+// EN: Owner Faction*; returned only if it looks like a valid user-mode pointer (else 0).
 uintptr_t BuildingAccessor::GetOwnerFaction() const {
     auto& offsets = GetOffsets().building;
     if (offsets.ownerFaction < 0) return 0;
@@ -104,6 +128,8 @@ uintptr_t BuildingAccessor::GetOwnerFaction() const {
     return (ptr > 0x10000 && ptr < 0x00007FFFFFFFFFFF) ? ptr : 0;
 }
 
+// ES: Inventory* del edificio (si tiene), validado igual que arriba.
+// EN: The building's Inventory* (if any), validated as above.
 uintptr_t BuildingAccessor::GetInventoryPtr() const {
     auto& offsets = GetOffsets().building;
     if (offsets.inventory < 0) return 0;

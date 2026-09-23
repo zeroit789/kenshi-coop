@@ -1,3 +1,9 @@
+// ES: game_inventory.cpp - Implementación de InventoryAccessor: leer items del inventario de un
+//     personaje/edificio (lista de Item* en +0x10, nº en +0x18) y ajustar pilas ya existentes.
+//     No puede crear items nuevos: para eso haría falta el asignador del propio juego.
+// EN: game_inventory.cpp - InventoryAccessor implementation: reads items of a character/building
+//     inventory (Item* list at +0x10, count at +0x18) and adjusts already existing stacks.
+//     It cannot create new items: that would need the game's own allocator.
 #include "game_inventory.h"
 #include "kmp/memory.h"
 #include <spdlog/spdlog.h>
@@ -5,7 +11,11 @@
 namespace kmp::game {
 
 // ── InventoryAccessor base method implementations ──
+// ES: Métodos básicos de lectura.
+// EN: Basic read methods.
 
+// ES: Nº de items del inventario (acotado a 0..9999; 0 si el offset es desconocido).
+// EN: Number of items in the inventory (clamped to 0..9999; 0 when the offset is unknown).
 int InventoryAccessor::GetItemCount() const {
     if (!IsValid()) return 0;
     auto& offsets = GetOffsets().inventory;
@@ -16,6 +26,8 @@ int InventoryAccessor::GetItemCount() const {
     return (count >= 0 && count < 10000) ? count : 0;
 }
 
+// ES: Devuelve el Item* en la posición index del array de punteros (0 si no es válido).
+// EN: Returns the Item* at position index of the pointer array (0 if invalid).
 uintptr_t InventoryAccessor::GetItem(int index) const {
     if (!IsValid() || index < 0 || index >= GetItemCount()) return 0;
     auto& offsets = GetOffsets().inventory;
@@ -30,6 +42,8 @@ uintptr_t InventoryAccessor::GetItem(int index) const {
     return itemPtr;
 }
 
+// ES: Ancho y alto de la rejilla del inventario (en celdas).
+// EN: Inventory grid width and height (in cells).
 int InventoryAccessor::GetWidth() const {
     if (!IsValid()) return 0;
     auto& offsets = GetOffsets().inventory;
@@ -50,10 +64,19 @@ int InventoryAccessor::GetHeight() const {
     return height;
 }
 
+// ES: Manipulación de items: busca una pila existente con la misma plantilla y cambia su
+//     cantidad (Item+0x12C). Crear objetos Item nuevos requiere el asignador del juego.
+// EN:
 // ── InventoryAccessor item manipulation ──
 // These modify inventory items by finding existing stacks and adjusting quantities.
 // Creating entirely new item objects requires the game's allocator, which we don't have.
 
+// ES: Suma 'quantity' a la primera pila cuya plantilla coincida. False si no hay pila.
+//     OJO: ItemOffsets.templateId es ahora +0x40 (un GameData*, 8 bytes) pero aquí se lee como
+//     uint32 y se compara con un id numérico, así que probablemente nunca coincide (sin verificar).
+// EN: Adds 'quantity' to the first stack whose template matches. False if there is no stack.
+//     NOTE: ItemOffsets.templateId is now +0x40 (a GameData*, 8 bytes) but it is read here as a
+//     uint32 and compared with a numeric id, so it probably never matches (unverified).
 bool InventoryAccessor::AddItem(uint32_t templateId, int quantity) {
     if (!IsValid() || quantity <= 0) return false;
 
@@ -89,6 +112,8 @@ bool InventoryAccessor::AddItem(uint32_t templateId, int quantity) {
     return false; // Item type not found in inventory
 }
 
+// ES: Resta 'quantity' a la primera pila que coincida (sin bajar de 0). Misma limitación que AddItem.
+// EN: Subtracts 'quantity' from the first matching stack (not below 0). Same limitation as AddItem.
 bool InventoryAccessor::RemoveItem(uint32_t templateId, int quantity) {
     if (!IsValid() || quantity <= 0) return false;
 
@@ -126,6 +151,10 @@ bool InventoryAccessor::RemoveItem(uint32_t templateId, int quantity) {
     return false; // Item type not found
 }
 
+// ES: Equipa en 'slot' un item ya presente en el inventario escribiendo su Item* en el array de
+//     equipo del personaje dueño (owner +0x88). Requiere character.equipment (se sondea en caliente).
+// EN: Equips into 'slot' an item already in the inventory by writing its Item* into the owner
+//     character's equipment array (owner +0x88). Requires character.equipment (runtime probed).
 bool InventoryAccessor::SetEquipment(EquipSlot slot, uint32_t templateId) {
     if (!IsValid()) return false;
 
@@ -138,6 +167,9 @@ bool InventoryAccessor::SetEquipment(EquipSlot slot, uint32_t templateId) {
         return false;
     }
 
+    // ES: El array de equipo está en el offset de equipo del personaje; cada ranura es un Item*.
+    //     Se busca en el inventario el item con esa plantilla y se escribe su puntero (mejor esfuerzo).
+    // EN:
     // Equipment array is at the character's equipment offset.
     // Each slot is a pointer to an item object. We scan existing inventory items
     // to find one matching the templateId and write its pointer to the equipment slot.

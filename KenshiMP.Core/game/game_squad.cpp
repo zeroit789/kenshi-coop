@@ -1,22 +1,37 @@
+// ES: game_squad.cpp - Escuadras (squads, "platoons" internamente en Kenshi): sondeo en caliente
+//     de los offsets de la lista de miembros y la implementación de SquadAccessor.
+// EN: game_squad.cpp - Squads ("platoons" internally in Kenshi): runtime probing of the member
+//     list offsets and the SquadAccessor implementation.
 #include "game_types.h"
 #include "kmp/memory.h"
 #include <spdlog/spdlog.h>
 
 namespace kmp::game {
 
+// ES: Sondeo de offsets de escuadra: comprueba que memberList sea un puntero válido (o 0) y
+//     memberCount un entero pequeño coherente; si no, escanea la estructura buscándolos.
+// EN:
 // ── Runtime Squad Offset Probing ──
 // Validates squad struct offsets by checking if the member list and count
 // are consistent: memberList should be a valid pointer (or 0), and
 // memberCount should be a small positive integer matching the list length.
 
+// ES: Solo se sondea una vez por proceso.
+// EN: Probing happens only once per process.
 static bool s_squadProbed = false;
 
+// ES: Valida SquadOffsets con una escuadra real; si fallan, busca en +0x20..+0x100 un par
+//     [puntero a array][int count] consecutivo (count en probe+8) y actualiza la tabla.
+// EN: Validates SquadOffsets against a real squad; if they fail, scans +0x20..+0x100 for a
+//     consecutive [array pointer][int count] pair (count at probe+8) and updates the table.
 void ProbeSquadOffsets(uintptr_t squadPtr) {
     if (s_squadProbed || squadPtr == 0) return;
     s_squadProbed = true;
 
     auto& sq = GetOffsets().squad;
 
+    // ES: Comprobar memberCount (entero razonable 0-256) y memberList (puntero válido o nulo).
+    // EN:
     // Verify memberCount: read at the current offset and check if it's a reasonable int (0-256)
     int memberCount = -1;
     if (sq.memberCount >= 0) {
@@ -50,6 +65,8 @@ void ProbeSquadOffsets(uintptr_t squadPtr) {
         }
     }
 
+    // ES: Los offsets por defecto no cuadran: escanear buscando la pareja lista/contador.
+    // EN:
     // Offsets seem wrong — scan for the member list/count
     spdlog::debug("ProbeSquadOffsets: Default offsets failed (count={}, list=0x{:X}), scanning...",
                   memberCount, memberList);
@@ -86,9 +103,13 @@ void ProbeSquadOffsets(uintptr_t squadPtr) {
     spdlog::debug("ProbeSquadOffsets: Could not verify squad member offsets");
 }
 
+// ES: Implementación de SquadAccessor (Kenshi llama "platoons" a las escuadras internamente).
+// EN:
 // ── SquadAccessor method implementations ──
 // Kenshi organizes characters into squads (called "platoons" internally).
 
+// ES: Nombre de la escuadra (std::string de MSVC con SSO).
+// EN: Squad name (MSVC std::string with SSO).
 std::string SquadAccessor::GetName() const {
     auto& offsets = GetOffsets();
     if (offsets.squad.name < 0) return "Unknown Squad";
@@ -116,6 +137,8 @@ std::string SquadAccessor::GetName() const {
     return std::string(buffer, size);
 }
 
+// ES: Nº de miembros (0..255).
+// EN: Member count (0..255).
 int SquadAccessor::GetMemberCount() const {
     auto& offsets = GetOffsets();
     if (offsets.squad.memberCount < 0) return 0;
@@ -125,6 +148,8 @@ int SquadAccessor::GetMemberCount() const {
     return (count >= 0 && count < 256) ? count : 0;
 }
 
+// ES: Character* del miembro index (array de punteros en memberList).
+// EN: Character* of member index (pointer array at memberList).
 uintptr_t SquadAccessor::GetMember(int index) const {
     auto& offsets = GetOffsets();
     if (offsets.squad.memberList < 0) return 0;
@@ -139,6 +164,8 @@ uintptr_t SquadAccessor::GetMember(int index) const {
     return charPtr;
 }
 
+// ES: Faction* de la escuadra (offset factionId, sin verificar en 1.0.68).
+// EN: The squad's Faction* (factionId offset, unverified on 1.0.68).
 uintptr_t SquadAccessor::GetFactionPtr() const {
     auto& offsets = GetOffsets();
     if (offsets.squad.factionId < 0) return 0;
@@ -148,6 +175,8 @@ uintptr_t SquadAccessor::GetFactionPtr() const {
     return factionPtr;
 }
 
+// ES: Flag de escuadra del jugador (1 byte, offset sin verificar).
+// EN: Player-squad flag (1 byte, unverified offset).
 bool SquadAccessor::IsPlayerSquad() const {
     auto& offsets = GetOffsets();
     if (offsets.squad.isPlayerSquad < 0) return false;

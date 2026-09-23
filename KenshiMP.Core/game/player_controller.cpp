@@ -1,3 +1,9 @@
+// ES: player_controller.cpp - Implementación de PlayerController: inicialización del jugador
+//     local, resolución del personaje primario, registro/baja de remotos, preparación de los
+//     personajes remotos al spawnear (renombrado) y elección de la facción local por votación.
+// EN: player_controller.cpp - PlayerController implementation: local player initialization,
+//     primary character resolution, remote register/unregister, remote character setup on spawn
+//     (renaming) and local faction election by voting.
 #include "player_controller.h"
 #include "game_types.h"
 #include "spawn_manager.h"
@@ -9,6 +15,10 @@
 namespace kmp {
 
 
+// ES: Guarda id y nombre del jugador local y captura la facción (char+0x10) del primer personaje
+//     registrado cuyo puntero sea de heap válido (alineado a 8 y fuera del módulo del juego).
+// EN: Stores the local player id and name and captures the faction (char+0x10) of the first
+//     registered character whose pointer is a valid heap pointer (8-aligned, outside the game module).
 void PlayerController::InitializeLocalPlayer(PlayerID localId, const std::string& playerName) {
     std::lock_guard lock(m_mutex);
     m_localPlayerId = localId;
@@ -17,6 +27,8 @@ void PlayerController::InitializeLocalPlayer(PlayerID localId, const std::string
 
     spdlog::info("PlayerController: Initialized local player '{}' (ID: {})", playerName, localId);
 
+    // ES: Capturar la facción del primer personaje local válido.
+    // EN:
     // Capture faction from the first local character we can find
     auto& registry = Core::Get().GetEntityRegistry();
     auto localEntities = registry.GetPlayerEntities(localId);
@@ -39,10 +51,14 @@ void PlayerController::InitializeLocalPlayer(PlayerID localId, const std::string
     }
 }
 
+// ES: Entidades del registro que pertenecen al jugador local.
+// EN: Registry entities owned by the local player.
 std::vector<EntityID> PlayerController::GetLocalSquadEntities() const {
     return Core::Get().GetEntityRegistry().GetPlayerEntities(m_localPlayerId);
 }
 
+// ES: Personaje primario del jugador local.
+// EN: The local player's primary character.
 void* PlayerController::GetPrimaryCharacter() const {
     // [FIX-PRIMARY 2026-07] Re-resolver SIEMPRE contra la fuente de verdad NATIVA
     // del motor: PlayerInterface+0x2B0 (lektor playerCharacters), data[0] = el
@@ -53,6 +69,11 @@ void* PlayerController::GetPrimaryCharacter() const {
     // primero" y TODOS los fixes del host (facción, platoon, hostilidad) se
     // aplicaban al fantasma mientras el personaje real se quedaba congelado
     // (confirmado en vivo: ambos con activeTask=NULL, amIdle=1, char+0xDC=0).
+    // EN: [FIX-PRIMARY 2026-07] Always re-resolve against the engine's NATIVE source of truth:
+    //     PlayerInterface+0x2B0 (playerCharacters lektor), data[0] = the player's REAL character.
+    //     Previously "the first registry entity with a game object" was returned; when the network
+    //     registry reassigned ids, the ghost NPC "Player N" could become first and every host fix
+    //     (faction, platoon, hostility) was applied to the ghost while the real character froze.
     uintptr_t native = game::GetPlayerPrimaryCharacterDirect();
     if (native != 0) {
         return reinterpret_cast<void*>(native);
@@ -61,6 +82,8 @@ void* PlayerController::GetPrimaryCharacter() const {
     // Fallback: si la resolución nativa falla (juego aún no cargado, lista sin
     // poblar), cae al comportamiento anterior — primera entidad del registry
     // con game object válido. NO eliminar: cubre el timing post-carga.
+    // EN: Fallback: if native resolution fails (game not loaded, list not populated) use the old
+    //     behavior, the first registry entity with a valid game object. Do not remove: covers post-load timing.
     auto& registry = Core::Get().GetEntityRegistry();
     auto entities = registry.GetPlayerEntities(m_localPlayerId);
     if (entities.empty()) return nullptr;
@@ -73,6 +96,8 @@ void* PlayerController::GetPrimaryCharacter() const {
     return nullptr;
 }
 
+// ES: Registra (o actualiza) un jugador remoto; ignora el propio id local por seguridad.
+// EN: Registers (or updates) a remote player; ignores our own local id as a safety measure.
 void PlayerController::RegisterRemotePlayer(PlayerID id, const std::string& name) {
     // Guard against registering self as remote (defense-in-depth)
     if (id == m_localPlayerId) {
@@ -87,6 +112,8 @@ void PlayerController::RegisterRemotePlayer(PlayerID id, const std::string& name
     spdlog::info("PlayerController: Registered remote player '{}' (ID: {})", name, id);
 }
 
+// ES: Borra el estado del jugador remoto (sus entidades las limpia quien llama).
+// EN: Deletes the remote player state (the caller cleans up its entities).
 void PlayerController::RemoveRemotePlayer(PlayerID id) {
     std::lock_guard lock(m_mutex);
     auto it = m_remotePlayers.find(id);
@@ -97,6 +124,9 @@ void PlayerController::RemoveRemotePlayer(PlayerID id) {
     }
 }
 
+// ES: Valida un Faction*: legible y con un primer qword que parece una vtable (dirección alta).
+//     Código muerto: no se usa en ningún sitio del repo.
+// EN:
 // Validate faction pointer: readable and has a vtable-like first qword
 static bool SEH_ValidateFaction(uintptr_t factionPtr, uintptr_t& outVtable) {
     __try {
@@ -109,6 +139,9 @@ static bool SEH_ValidateFaction(uintptr_t factionPtr, uintptr_t& outVtable) {
     }
 }
 
+// ES: Envoltorio SEH para escribir la facción en char+0x10 sin crashear si el char se liberó.
+//     MSVC no permite __try junto a destructores C++ (error C2712). También sin uso en el repo.
+// EN:
 // SEH wrapper — __try can't coexist with C++ destructors (MSVC C2712)
 static bool SEH_WriteFactionToChar(void* gameObj, uintptr_t factionPtr) {
     __try {
@@ -122,6 +155,10 @@ static bool SEH_WriteFactionToChar(void* gameObj, uintptr_t factionPtr) {
     return false;
 }
 
+// ES: Actualiza la facción local. El arreglo de facción de los personajes remotos está
+//     desactivado: escribir punteros de facción de NPC causaba use-after-free al descargar la zona.
+// EN: Updates the local faction. Faction fix-up of remote characters is disabled: writing NPC
+//     faction pointers caused use-after-free when the source zone unloaded.
 void PlayerController::SetLocalFactionPtr(uintptr_t factionPtr) {
     uintptr_t oldFaction = m_localFactionPtr;
     m_localFactionPtr = factionPtr;
@@ -132,12 +169,20 @@ void PlayerController::SetLocalFactionPtr(uintptr_t factionPtr) {
                  factionPtr, oldFaction);
 }
 
+// ES: Prepara el personaje de un remoto recién spawneado: apunta la entidad en su estado,
+//     guarda su facción y lo renombra (máx 15 caracteres, cabe en el SSO de std::string).
+//     La escritura de facción está desactivada (el log final aún dice "faction set").
+// EN: Sets up a freshly spawned remote character: records the entity in its state, stores its
+//     faction and renames it (max 15 chars, fits in std::string SSO).
+//     The faction write is disabled (the final log line still says "faction set").
 bool PlayerController::OnRemoteCharacterSpawned(EntityID entityId, void* gameObject, PlayerID owner) {
     if (!gameObject) return false;
 
     game::CharacterAccessor accessor(gameObject);
     if (!accessor.IsValid()) return false;
 
+    // ES: Buscar el nombre del jugador remoto (bajo mutex).
+    // EN:
     // Find the remote player's name
     std::string displayName;
     {
@@ -159,6 +204,8 @@ bool PlayerController::OnRemoteCharacterSpawned(EntityID entityId, void* gameObj
         displayName = "Player_" + std::to_string(owner);
     }
 
+    // ES: 1. Renombrar el personaje con el nombre del remoto (solo el nombre de la instancia).
+    // EN:
     // ── 1. Rename the character to the remote player's name ──
     // NOTE: Only the instance name is written here. GameData template name write
     // is done by the caller via RenameModCharacterSafely() because it's only
@@ -173,6 +220,10 @@ bool PlayerController::OnRemoteCharacterSpawned(EntityID entityId, void* gameObj
         }
     }
 
+    // ES: 2. Escritura de facción DESACTIVADA: al descargarse la zona del NPC de origen su Faction se
+    //     libera y el motor crashea leyendo faction+0x250 (en game+0x927E94). El remoto conserva la
+    //     facción asignada por la fábrica.
+    // EN:
     // ── 2. Faction write DISABLED ──
     // Writing a captured NPC faction pointer to the remote character causes a
     // use-after-free crash: when the source NPC's zone unloads, its faction object
@@ -188,6 +239,8 @@ bool PlayerController::OnRemoteCharacterSpawned(EntityID entityId, void* gameObj
     return true;
 }
 
+// ES: Escribe el nombre del remoto en la plantilla GameData del personaje (solo plantillas únicas del mod).
+// EN: Writes the remote player's name into the character's GameData template (unique mod templates only).
 bool PlayerController::WriteGameDataNameForModLink(void* gameObject, PlayerID owner) {
     if (!gameObject) return false;
 
@@ -216,12 +269,18 @@ bool PlayerController::WriteGameDataNameForModLink(void* gameObject, PlayerID ow
     return ok;
 }
 
+// ES: Devuelve un puntero al estado del remoto. OJO: el lock se suelta al salir, así que el
+//     puntero puede quedar colgando si otro hilo modifica el mapa.
+// EN: Returns a pointer to the remote state. NOTE: the lock is released on return, so the
+//     pointer may dangle if another thread modifies the map.
 const RemotePlayerState* PlayerController::GetRemotePlayer(PlayerID id) const {
     std::lock_guard lock(m_mutex);
     auto it = m_remotePlayers.find(id);
     return it != m_remotePlayers.end() ? &it->second : nullptr;
 }
 
+// ES: Copia de todos los estados remotos (seguro entre hilos).
+// EN: Copy of all remote states (thread-safe).
 std::vector<RemotePlayerState> PlayerController::GetAllRemotePlayers() const {
     std::lock_guard lock(m_mutex);
     std::vector<RemotePlayerState> result;
@@ -232,6 +291,8 @@ std::vector<RemotePlayerState> PlayerController::GetAllRemotePlayers() const {
     return result;
 }
 
+// ES: Punto de enganche futuro; hoy no hace nada (el bucle de sync vive en core.cpp).
+// EN: Future hook point; does nothing today (the sync loop lives in core.cpp).
 int PlayerController::GatherLocalEntityUpdates(float deltaTime) {
     // This is a hook point for future optimization.
     // Currently, OnGameTick in core.cpp handles the actual sync loop.
@@ -239,6 +300,8 @@ int PlayerController::GatherLocalEntityUpdates(float deltaTime) {
     return 0;
 }
 
+// ES: Mete la posición recibida como snapshot en el sistema de interpolación con la hora de sesión.
+// EN: Pushes the received position as a snapshot into the interpolation system with session time.
 void PlayerController::ApplyRemotePositionUpdate(EntityID entityId, const Vec3& pos,
                                                    const Quat& rot, uint8_t moveSpeed, uint8_t animState) {
     // Delegate to interpolation system
@@ -246,6 +309,12 @@ void PlayerController::ApplyRemotePositionUpdate(EntityID entityId, const Vec3& 
     Core::Get().GetInterpolation().AddSnapshot(entityId, now, pos, rot, moveSpeed, animState);
 }
 
+// ES: Elige la facción local por votación entre los primeros 12 personajes: +1 por aparición,
+//     +10 si el nombre coincide con el de la config y +3 si la facción es de jugador (+0x250 != 0).
+//     Máx 4 candidatas. Solo fija m_localFactionPtr si aún estaba a 0.
+// EN: Elects the local faction by voting over the first 12 characters: +1 per appearance,
+//     +10 if the name matches the config name and +3 if it is a player faction (+0x250 != 0).
+//     Max 4 candidates. Only sets m_localFactionPtr if it was still 0.
 void PlayerController::OnGameWorldLoaded() {
     spdlog::info("PlayerController: Game world loaded");
 
@@ -283,6 +352,8 @@ void PlayerController::OnGameWorldLoaded() {
             }
         }
 
+        // ES: Comprobar el flag de facción de jugador (puntero PlayerInterface* en +0x250).
+        // EN:
         // Check isPlayerFaction flag
         // audit-14: isPlayerFaction (0x250) = PlayerInterface* (8 bytes), != 0 ⇒ jugador.
         // Antes se leía como bool de 1 byte (offset 0x90 erróneo) → señal basura.
@@ -296,6 +367,8 @@ void PlayerController::OnGameWorldLoaded() {
             }
         }
 
+        // ES: Buscar o añadir la facción en la lista de votos y sumar puntos.
+        // EN:
         // Find or add to vote list
         int idx = -1;
         for (int i = 0; i < voteCount; i++) {
@@ -312,6 +385,8 @@ void PlayerController::OnGameWorldLoaded() {
         }
     }
 
+    // ES: Elegir la facción con más puntos (faction.id vale -1, así que el id del log sale 0).
+    // EN:
     // Elect winner
     uintptr_t bestFaction = 0;
     int bestScore = 0;
@@ -336,10 +411,14 @@ void PlayerController::OnGameWorldLoaded() {
     }
 }
 
+// ES: Solo registra en el log la llegada de la instantánea del mundo.
+// EN: Only logs the arrival of the world snapshot.
 void PlayerController::OnWorldSnapshotReceived(int entityCount) {
     spdlog::info("PlayerController: World snapshot received with {} entities", entityCount);
 }
 
+// ES: Limpia remotos y facción local (al desconectar); id y nombre local se conservan.
+// EN: Clears remote players and local faction (on disconnect); local id and name are kept.
 void PlayerController::Reset() {
     std::lock_guard lock(m_mutex);
     m_remotePlayers.clear();

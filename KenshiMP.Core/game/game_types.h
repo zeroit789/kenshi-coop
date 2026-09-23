@@ -1,8 +1,27 @@
+// ES: game_types.h - Estructuras reconstruidas del juego Kenshi (kenshi_x64.exe Steam 1.0.68).
+//     Contiene las tablas de offsets (posición de cada campo dentro de las clases del juego:
+//     Character, Squad, GameWorld, Building, Inventory, Item, Faction, Stats...), los enums
+//     nativos relevantes, los "accessors" (clases envoltorio que leen/escriben memoria del juego
+//     de forma segura usando esas tablas) y los typedefs de las funciones del juego que se hookean.
+//     Un offset (p.ej. char+0x650) es la distancia en bytes desde el inicio del objeto hasta el campo.
+//     Un valor -1 en una tabla significa "offset desconocido": el accessor devuelve un valor seguro.
+// EN: game_types.h - Reconstructed Kenshi game structures (kenshi_x64.exe Steam 1.0.68).
+//     Holds the offset tables (byte position of each field inside the game classes:
+//     Character, Squad, GameWorld, Building, Inventory, Item, Faction, Stats...), the relevant
+//     native enums, the "accessors" (wrapper classes that safely read/write game memory using
+//     those tables) and the typedefs of the game functions that get hooked.
+//     An offset (e.g. char+0x650) is the byte distance from the object start to the field.
+//     A value of -1 in a table means "unknown offset": the accessor returns a safe default.
 #pragma once
 #include "kmp/types.h"
 #include <cstdint>
 #include <string>
 
+// ES: Layouts reconstruidos de clases de Kenshi, obtenidos por ingeniería inversa de
+//     kenshi_x64.exe v1.0.68 (cadenas de punteros de Cheat Engine, referencias a strings,
+//     datos de KServerMod/RE_Kenshi y el esquema fcs.def). El escáner de patrones puede
+//     verificarlos en tiempo de ejecución; si un offset vale -1 el accessor da un valor seguro.
+// EN:
 // Reconstructed Kenshi game class layouts.
 // Based on reverse engineering kenshi_x64.exe v1.0.68 via:
 //   - Cheat Engine pointer chains (CE community verified)
@@ -13,8 +32,12 @@
 // Use the pattern scanner to verify offsets at runtime.
 // If offsets are -1, the accessor returns safe defaults.
 
+// ES: Espacio de nombres con todo lo que modela objetos y memoria del juego.
+// EN: Namespace holding everything that models game objects and game memory.
 namespace kmp::game {
 
+// ES: Declaraciones adelantadas de las estructuras opacas del juego (solo se usan como punteros).
+// EN: Forward declarations of the opaque game structures (only used as pointers).
 // Forward declarations
 struct KCharacter;
 struct KSquad;
@@ -29,9 +52,19 @@ struct KAIPackage;
 // ═══════════════════════════════════════════════════════════════════════════
 //  OFFSET TABLES
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Tablas de offsets. Se rellenan en tiempo de ejecución con el escáner/prober o se quedan
+//     con los valores por defecto (verificados con Cheat Engine / KenshiLib / RE de bytes).
+// EN:
 // Filled at runtime by the scanner, or using hardcoded CE-verified fallbacks.
 
+// ES: Offsets dentro de la clase Character del juego (un personaje: jugador, NPC o animal).
+//     Cada campo es la distancia en bytes desde el puntero Character* hasta el dato.
+// EN: Offsets inside the game's Character class (a character: player, NPC or animal).
+//     Each field is the byte distance from the Character* pointer to the data.
 struct CharacterOffsets {
+    // ES: Datos básicos: nombre (+0x18, std::string), facción (+0x10, Faction*), posición en caché
+    //     de solo lectura (+0x48, Vec3), rotación (+0x58, cuaternión) y nodo de escena Ogre (sin verificar).
+    // EN:
     // Core character data — KServerMod / CE verified for v1.0.68
     int name          = 0x18;    // Kenshi std::string (KServerMod verified)
     int faction       = 0x10;    // Faction* (KServerMod verified)
@@ -44,7 +77,15 @@ struct CharacterOffsets {
     // de tareas es un lektor<Tasker*> INLINE en AITaskSytem+0x2E8 (size@+0x2F0 uint32, cap@+0x2F4,
     // data@+0x2F8 Tasker**). Un char con char+0x20==NULL no tiene IA y queda inerte (el think
     // pesado [char_vtbl+0x1D8]→0x5CE020 no tiene manager que procesar). Ver [DIAG-AITASK] en core.cpp.
+    // EN: CONFIRMED (byte RE 2026-06-18, AI::create 0x622110): the Character's "AI package" is an
+    //     AITaskSytem* (sic, RTTI name) that AI::create allocates (0x3B8 bytes) and stores at char+0x20.
+    //     The task queue is an inline lektor<Tasker*> at AITaskSytem+0x2E8 (size +0x2F0, cap +0x2F4,
+    //     data +0x2F8). A character with char+0x20 == NULL has no AI and stays inert.
     int aiPackage     = 0x20;    // AITaskSytem* — char+0x20 (CONFIRMADO RE; cola jobs en +0x2E8/+0x2F0)
+    // ES: inventory (+0x2E8) = Inventory* del personaje; stats (+0x450) = bloque de habilidades;
+    //     equipment/currentTask/isAlive aún sin offset fijo (se sondean o se derivan).
+    // EN: inventory (+0x2E8) = the character's Inventory*; stats (+0x450) = skills block;
+    //     equipment/currentTask/isAlive have no fixed offset yet (probed or derived).
     int inventory     = 0x2E8;   // Inventory* (KServerMod verified)
     int stats         = 0x450;   // Stats base (KServerMod verified)
     int equipment     = -1;      // Equipment array (runtime probed)
@@ -55,11 +96,18 @@ struct CharacterOffsets {
     // campo. La distinción player/NPC se deriva por facción:
     //   char.faction(+0x10) == gameWorld.player(+0x580).faction  (Character::isPlayerCharacter()).
     // El probe diferencial quedó neutralizado en game_offset_prober.cpp.
+    // EN: isPlayerControlled: -1 = pending, -2 = N/A (field does NOT exist in Character).
+    //     RE 2026-06-17: player vs NPC is derived from the faction:
+    //     char.faction(+0x10) == gameWorld.player(+0x580).faction. The differential probe was disabled.
     int isPlayerControlled = -1; // Ver nota arriba — campo inexistente, se deriva por facción
 
+    // ES: Offset directo de salud (si el escáner lo encuentra; si no, se usa la cadena de abajo).
+    // EN:
     // Direct health offset (if scanner finds it; otherwise use chain below)
     int health            = -1;      // Direct offset to health array (use chain if -1)
 
+    // ES: Movimiento: velocidad actual (float) y estado de animación; ambos sin offset conocido.
+    // EN:
     // Movement
     int moveSpeed     = -1;      // Offset to current move speed float (derived from physics)
     int animState     = -1;      // Offset to animation state index
@@ -74,11 +122,20 @@ struct CharacterOffsets {
     // (_myMemory, una copia) — un deref de más. 0x458+0x1A0 = 0x5F8, por eso "coincidía".
     // El motor jamás escribe salud por esa ruta (confirmado: MedicalSystem::_setHealth 0x645EF0
     // usa [rcx+0x198]/[rcx+0x1A0]; MedicalSystem::applyDamage 0x64F300 escribe [part+0x40]/[+0x44]).
+    // EN: CANONICAL health chain, byte-verified on Steam 1.0.68:
+    //     Character+0x458 is an INLINE MedicalSystem (by value, not a pointer).
+    //     partArray = *(void**)(char+0x5F8) (= medical+0x1A0), partCount = *(int*)(char+0x5F0)
+    //     (= medical+0x198), part_i = partArray[i] (8-byte stride), flesh = *(float*)(part_i+0x40).
+    //     The old chain via char+0x2B8 (CharacterMemory*, a copy) was an extra, invalid dereference.
     int healthPartArray = 0x5F8;  // char → HealthPartStatus** (array de punteros)
     int healthPartCount = 0x5F0;  // char → int, nº de partes (humanos = 7)
     int healthBase      = 0x40;   // HealthPartStatus → flesh (float)
     int healthStride    = 8;      // stride DENTRO del array de punteros (sizeof(void*))
 
+    // ES: Cadena de posición ESCRIBIBLE: Character -> AnimationClassHuman* (+animClassOffset, se
+    //     sondea) -> CharMovement* (+0xC0) -> estructura de posición (+0x320) -> x,y,z (+0x20).
+    //     Escribir aquí mueve de verdad al personaje en el motor de físicas (la +0x48 es solo caché).
+    // EN:
     // Writable position chain (from KServerMod RE):
     // character -> AnimationClassHuman ptr (+animClassOffset)
     //   -> CharMovement ptr (+charMovementOffset from AnimClass)
@@ -90,12 +147,18 @@ struct CharacterOffsets {
     int writablePosOffset    = 0x320; // CharMovement -> writable position struct
     int writablePosVecOffset = 0x20;  // position struct -> x float
 
+    // ES: Puntero a la escuadra (KSquad*); se descubre en tiempo de ejecución.
+    // EN:
     // Squad pointer (heuristic: near faction in struct)
     int squad         = -1;      // Offset to KSquad* (discovered at runtime)
 
+    // ES: Puntero al GameData* plantilla (datos del record FCS del que se creó el personaje).
+    // EN:
     // GameData backpointer (template/archetype data)
     int gameDataPtr   = 0x40;    // Offset to GameData* template
 
+    // ES: Cadena del dinero (verificada con CE): [[char+0x298]+0x78]+0x88 = dinero (int).
+    // EN:
     // Money chain (CE-verified)
     // character+0x298 -> +0x78 -> +0x88 = money (int)
     int moneyChain1   = 0x298;
@@ -103,6 +166,10 @@ struct CharacterOffsets {
     int moneyBase     = 0x88;
 };
 
+// ES: Offsets dentro de una escuadra (Squad/Platoon): nombre, array de miembros, nº de miembros,
+//     facción y flag de escuadra del jugador. Valores heredados, sin verificación reciente.
+// EN: Offsets inside a squad (Squad/Platoon): name, member array, member count, faction and
+//     player-squad flag. Inherited values, not recently verified.
 struct SquadOffsets {
     int name           = 0x10;   // Offset to name string
     int memberList     = 0x28;   // Offset to member pointer array
@@ -111,6 +178,10 @@ struct SquadOffsets {
     int isPlayerSquad  = 0x40;   // Offset to is-player-squad flag
 };
 
+// ES: Offsets dentro del objeto GameWorld (el mundo global): velocidad de juego (+0x700),
+//     PlayerInterface* (+0x580), flag de pausa (+0x8B9) y ZoneManager (+0x8B0).
+// EN: Offsets inside the GameWorld object (the global world): game speed (+0x700),
+//     PlayerInterface* (+0x580), pause flag (+0x8B9) and ZoneManager (+0x8B0).
 struct WorldOffsets {
     int timeOfDay      = -1;     // On TimeManager (+0x08), NOT GameWorld — use time_hooks
     int gameSpeed      = 0x700;  // GameWorld+0x700 (KenshiLib verified)
@@ -120,6 +191,9 @@ struct WorldOffsets {
     // devolvía faction=0x0 y nombres basura. La lista real del jugador se obtiene
     // ahora vía player(+0x580) -> PlayerInterface(+0x2B0 playerCharacters).
     // Se conserva solo como ÚLTIMO fallback histórico.
+    // EN: DEPRECATED: GameWorld+0x888 is NOT the character list in 1.0.68, it is
+    //     'mainUpdateListRemovalQueue' (usually empty). The real player list is read via
+    //     player(+0x580) -> PlayerInterface(+0x2B0 playerCharacters). Kept only as a last fallback.
     int characterList  = 0x0888; // [DEPRECADO] removal queue, NO la lista de personajes
     int player         = 0x0580; // GameWorld -> PlayerInterface* (KenshiLib GameWorld.h:137)
     int buildingList   = -1;     // Not yet verified
@@ -130,6 +204,7 @@ struct WorldOffsets {
 
 // Offsets dentro de PlayerInterface (apuntado por GameWorld+0x580).
 // Verificados en KenshiLib Include/kenshi/PlayerInterface.h y Faction.h para v1.0.68.
+// EN: Offsets inside PlayerInterface (pointed to by GameWorld+0x580), verified against KenshiLib.
 struct PlayerInterfaceOffsets {
     int participant      = 0x02A0; // PlayerInterface -> participant (Faction*) — PlayerInterface.h:248
     // ⚠ NUEVO (audit-09, confirmado RUNTIME 2026-06-18 + bytes): controlledChar es el char que
@@ -137,17 +212,25 @@ struct PlayerInterfaceOffsets {
     // data[0] del lektor playerCharacters. Escrito por SetControlledChar (RVA 0x802520) como
     // Faction(PI+0x2A0)+0x218[memberCount-1]; consumido en 0x50E9CF (mov rcx,[rcx+0x2A8]).
     // El mod DEBE resolver el char primario por aquí, no por data[0] (que era 'Dani' != 'Sinnombre_0').
+    // EN: controlledChar (+0x2A8) is the character the player REALLY controls (the one engine orders
+    //     apply to). It differs from data[0] of the playerCharacters lektor. Written by
+    //     SetControlledChar (RVA 0x802520). The mod must resolve the primary character through here.
     int controlledChar   = 0x02A8; // PlayerInterface -> controlledChar (Character*) — char activo real
     int playerCharacters = 0x02B0; // PlayerInterface -> lektor<Character*> — PlayerInterface.h:250
 };
 
 // Offsets adicionales dentro de Faction (apuntado por participant / character.faction).
 // Verificados en KenshiLib Include/kenshi/Faction.h para v1.0.68.
+// EN: Extra offsets inside Faction: name (+0x1A8, std::string) and isPlayer (+0x250, PlayerInterface*).
 struct FactionExtraOffsets {
     int nameStr   = 0x01A8; // Faction -> name (std::string) — Faction.h:147
     int isPlayer  = 0x0250; // Faction -> isPlayer (PlayerInterface*) — Faction.h:158
 };
 
+// ES: Offsets dentro de un edificio (Building): nombre, posición, rotación, facción dueña, salud,
+//     flag de destruido, inventario, progreso de construcción... Sin verificación reciente en 1.0.68.
+// EN: Offsets inside a Building: name, position, rotation, owner faction, health, destroyed flag,
+//     inventory, construction progress... Not recently verified on 1.0.68.
 struct BuildingOffsets {
     int name           = 0x10;   // Building name string
     int position       = 0x48;   // Vec3 world position
@@ -163,6 +246,10 @@ struct BuildingOffsets {
     int isConstructed  = 0x114;  // Fully constructed flag
 };
 
+// ES: Offsets dentro de un Inventory: lektor de items (+0x10 datos, +0x18 tamaño), tamaño de
+//     rejilla y dueño (+0x88, RootObject* corregido en audit-02).
+// EN: Offsets inside an Inventory: item lektor (+0x10 data, +0x18 size), grid size and
+//     owner (+0x88, RootObject*, fixed in audit-02).
 struct InventoryOffsets {
     int items          = 0x10;   // Item array pointer (lektor<Item*> _allItems — KenshiLib Inventory.h)
     int itemCount      = 0x18;   // Number of items (int) — size del lektor en +0x18
@@ -173,10 +260,16 @@ struct InventoryOffsets {
     // (callbackObject vive en +0x80; owner en +0x88; totalWeight float en +0x90).
     // El bug histórico de pickup/drop (pasar inventory* en vez del char* dueño) se arregla
     // leyendo +0x88, no +0x28. Antes: 0x28 → ahora: 0x88.
+    // EN: FIX audit-02: owner was +0x28 (wrong). KenshiLib confirms owner (RootObject*) at +0x88
+    //     (callbackObject +0x80, totalWeight float +0x90). Fixes the pickup/drop owner bug.
     int owner          = 0x88;   // Owner character/building pointer (RootObject*) — KenshiLib +0x88
     int maxStackMult   = 0x30;   // Stackable bonus multiplier
 };
 
+// ES: Offsets dentro de un Item (InventoryItemBase): nombre, plantilla GameData*, cantidad,
+//     calidad, peso, ranura de equipo y cargas.
+// EN: Offsets inside an Item (InventoryItemBase): name, GameData* template, quantity,
+//     quality, weight, equip slot and charges.
 struct ItemOffsets {
     // ⚠ CORRECCIÓN audit-14 (2026-06-19): TODO ItemOffsets estaba ⛔ (offsets viejos 0x10-0x58).
     // Item == InventoryItemBase (hereda RootObjectBase). Verificado contra KenshiLib Item.h
@@ -186,6 +279,9 @@ struct ItemOffsets {
     //   Layout real (InventoryItemBase): displayName@0x18 · data(GameData* plantilla)@0x40 ·
     //   slotType(AttachSlot)@0x110 · chargesLeft(float)@0x118 · quality(float)@0x11C ·
     //   weight(float)@0x120 · quantity(int)@0x12C · itemWidth@0x130 · itemHeight@0x134.
+    // EN: FIX audit-14: all old ItemOffsets were wrong. Real layout: displayName@0x18,
+    //     data(GameData*)@0x40, slotType@0x110, chargesLeft@0x118, quality@0x11C, weight@0x120,
+    //     quantity@0x12C. The old templateId=0x20 fell inside displayName and sent garbage over the network.
     int name           = 0x18;   // ✅ displayName (std::string, RootObjectBase) — era 0x10 (⛔)
     int templateId     = 0x40;   // ✅ data (GameData* plantilla, RootObjectBase) — era 0x20 (⛔, caía en displayName)
     int stackCount     = 0x12C;  // ✅ quantity (int) — era 0x30 (⛔)
@@ -196,6 +292,8 @@ struct ItemOffsets {
     int condition      = 0x118;  // ✅ chargesLeft (float) — era 0x58 (⛔, caía en handle de RootObjectBase)
 };
 
+// ES: Offsets dentro de una facción (Faction).
+// EN: Offsets inside a Faction.
 struct FactionOffsets {
     // ⚠ CORRECCIÓN audit-02 (2026-06-18): id ERA +0x08 (INCORRECTO Y PELIGROSO).
     // KenshiLib Faction.h confirma que en +0x08 está 'bool _antiSlavery', NO un id.
@@ -214,11 +312,16 @@ struct FactionOffsets {
     // builtin_commands) → con -1 dejan de enviar/leer basura. El fix REAL (identificar la
     // facción por name/GameData en el protocolo) es trabajo de la cola de facciones (#4),
     // no de este fix de offsets.  Antes: 0x08 → ahora: -1 (pendiente RE del identificador real).
+    // EN: FIX audit-02: id was +0x08, which is actually 'bool _antiSlavery'. Faction has no plain
+    //     uint32 id; the stable identifier is its name (+0x1A8) or its GameData* (+0x240). Set to -1
+    //     so call-sites stop sending garbage ids (all of them check `fIdOff >= 0`).
     int id             = -1;     // NO RESUELTO — +0x08 era _antiSlavery (bool), no un id. Ver nota.
     int name           = 0x1A8;  // Faction name (std::string) — KenshiLib Faction.h:147, +0x1A8 ✅
     // ⚠ audit-02: los offsets de abajo NO están confirmados contra KenshiLib (varios chocan:
     // +0x30 = allowSlavesWeapons, +0x90 = dentro de tradeCulture). Se conservan sus valores
     // por ahora porque NO se usan en rutas críticas, pero quedan marcados como dudosos.
+    // EN: audit-02: the offsets below are NOT confirmed against KenshiLib (several clash); kept only
+    //     because they are not used in critical paths.
     int members        = 0x30;   // ❓ DUDOSO (KenshiLib: +0x30 = allowSlavesWeapons, no members)
     int memberCount    = 0x38;   // ❓ DUDOSO (no confirmado)
     // ✅ CONFIRMADOS (audit-09, bytes SetControlledChar 0x80267A/0x802683 + runtime 2026-06-18):
@@ -226,6 +329,9 @@ struct FactionOffsets {
     //     memberCountReal @+0x210 (uint32) ; memberArrayReal @+0x218 (Character**).
     //   SetControlledChar elige memberArrayReal[memberCountReal-1] (ÚLTIMO miembro) y lo vuelca a
     //   PlayerInterface+0x2A8. Usamos estos como FALLBACK al resolver el char primario del host.
+    // EN: CONFIRMED (audit-09): the REAL member list of the player faction is memberCountReal @+0x210
+    //     and memberArrayReal @+0x218. SetControlledChar picks the LAST member and stores it in
+    //     PlayerInterface+0x2A8. Used as fallback to resolve the host's primary character.
     int memberCountReal = 0x210; // Faction -> memberCount real (uint32) — confirmado RE
     int memberArrayReal = 0x218; // Faction -> memberArray real (Character**) — confirmado RE
     // ✅ CONFIRMADO (RE de bytes Steam 1.0.68, triple verificación 2026-06-19):
@@ -244,6 +350,10 @@ struct FactionOffsets {
     //   map (recorrido boost frágil), escribe FR+0x60 = -100.0 en las facciones "Player N" → el host
     //   se vuelve enemigo de todo sin entry. SetControlledChar 0x802520 RESETEA este +0x78 al
     //   ejecutarse, así que el FIX se aplica DESPUÉS del FIX-CONTROL.
+    // EN: CONFIRMED: Faction+0x78 = FactionRelations* (a boost::unordered_map<Faction*,RelationData>).
+    //     isEnemy 0x6B26D0 means rel <= -30; 0x6B2630 is isAlly (rel >= +50). The hooked function is
+    //     isAlly (polarity fixed in audit-16). FIX-HOSTILITY writes FR+0x60 = -100.0 on "Player N"
+    //     factions so the host becomes enemy of everyone; SetControlledChar resets +0x78, so it runs after FIX-CONTROL.
     int relations      = 0x78;   // ✅ FactionRelations* (Faction+0x78) — rango [-100,+100]
     int color1         = 0x80;   // ❓ DUDOSO (KenshiLib: +0x80 = factionOwnerships*)
     int color2         = 0x84;   // ❓ DUDOSO (no confirmado)
@@ -254,9 +364,12 @@ struct FactionOffsets {
     // (FactionAccessor::IsPlayerFaction, SEH_CheckIsPlayerFaction en entity_hooks,
     // player_controller) se actualizaron para leerlo como uintptr_t y comprobar != 0 — leerlo
     // como bool de 1 byte daría falsos negativos (byte bajo del puntero == 0). Antes 0x90 (⛔).
+    // EN: FIX audit-14: isPlayerFaction was 0x90 (inline TradeCulture). The real player flag is the
+    //     PlayerInterface* at +0x250 (non-zero => player faction). It is an 8-byte POINTER, not a bool.
     int isPlayerFaction = 0x250; // ✅ = isPlayerIface (PlayerInterface*, != 0 ⇒ jugador) — era 0x90 (⛔)
     int money          = 0xA0;   // ❓ DUDOSO (no confirmado)
     // ✅ CONFIRMADOS (RE de bytes Steam 1.0.68, 2026-06-18) — usados por el FIX-HOSTILITY:
+    // EN: CONFIRMED (byte RE 2026-06-18), used by FIX-HOSTILITY: PlayerInterface* and GameData* of the faction.
     int isPlayerIface  = 0x250;  // PlayerInterface* (≠0 ⇒ facción de jugador). Distingue jugador vs mundo.
     int data           = 0x240;  // GameData* (string-id estable del record FCS en GameData+0x58)
     // relCount real del map de relaciones = *(uint32*)(faction + relations[0x78] + 0x28)
@@ -264,6 +377,8 @@ struct FactionOffsets {
 
 // ── FactionManager (instancia embebida en GameWorld+0x21345B8) — RE confirmado 2026-06-18 ──
 // Layout extraído de getFactionByStringID (RVA 0x2E7A20): array PLANO de Faction*, no lektor/vector.
+// EN: FactionManager (instance embedded at GameWorld+0x21345B8), layout taken from
+//     getFactionByStringID (RVA 0x2E7A20): a FLAT Faction* array, not a lektor/vector.
 struct FactionManagerOffsets {
     int factionCount   = 0x08;   // uint32 — nº de facciones cargadas
     int factionArray   = 0x10;   // Faction** — array contiguo de punteros a Faction
@@ -288,6 +403,12 @@ struct FactionManagerOffsets {
 //     isEnemy/isAlly leen ESTE float como la relación. Escribir FR+0x60 = -100.0 hace que
 //     isEnemy(faction, X)=true para CUALQUIER X sin entry → hostilidad global de la facción.
 //     Es la vía MÁS ROBUSTA (4 bytes atómicos, sin alocar, sin iterar el map boost, sin hook).
+// EN: FactionRelations (boost::unordered_map<Faction*, RelationData>, at Faction+0x78).
+//     CRITICAL FIX: it is a boost map, NOT an MSVC std::_Hash. Real layout: bucket_count +0x38,
+//     element_count (SIZE) +0x40, buckets +0x58. Boost node: +0x00 next, +0x08 hash, +0x10 key,
+//     +0x18 RelationData (relation float at node+0x1C).
+//     KEY FIELD for FIX-HOSTILITY: FR+0x60 = defaultFactionRelation (float), read by isEnemy/isAlly
+//     when there is no specific entry. Writing -100.0 makes the faction hostile to everyone.
 struct FactionRelationsOffsets {
     int bucketCount    = 0x38;   // boost: nº de buckets (size_t)
     int size           = 0x40;   // boost: element_count = nº de entradas (relCount real) ⚠ era 0x28
@@ -299,6 +420,8 @@ struct FactionRelationsOffsets {
     int nodeRelation   = 0x1C;   // = nodo+0x18 (RelationData) + 0x4 (relation) — float que ve el motor
 };
 
+// ES: Offsets dentro de GameData (un record de datos FCS: plantilla de personaje, facción, item...).
+// EN: Offsets inside GameData (an FCS data record: character, faction, item template...).
 struct GameDataOffsets {
     int id             = 0x08;   // Template ID (uint32_t)
     int managerPtr     = 0x10;   // GameDataManager* backpointer
@@ -309,14 +432,22 @@ struct GameDataOffsets {
     //   ⚠ NO confundir con +0x28 (name, legible para humanos) ni con la vieja suposición +0x18.
     //   Lo usa el hook del gate de combate (FIX-HOSTILITY-HOOK) para localizar la facción Nameless
     //   por su stringID y heredar sus relaciones reales (vía Faction+0x240 → GameData+0x58).
+    // EN: CONFIRMED (audit-15): GameData+0x58 = stringID, the stable FCS record id
+    //     (e.g. "204-gamedata.base" for the vanilla 'Nameless' player faction). Not +0x28 (human name).
     int stringID       = 0x58;   // ✅ Kenshi std::string — string-id estable del record (getFactionByStringID)
 };
 
+// ES: Offsets dentro de TimeManager: hora del día (float 0-1) y multiplicador de velocidad.
+// EN: Offsets inside TimeManager: time of day (float 0-1) and speed multiplier.
 struct TimeManagerOffsets {
     int timeOfDay      = 0x08;   // Float 0.0-1.0 (day cycle)
     int gameSpeed      = 0x10;   // Float (current game speed multiplier)
 };
 
+// ES: Offsets de cada habilidad dentro del bloque de stats del personaje (char+0x450).
+//     Cada una es un float 0-100. Layout heredado, sin verificar a fondo en 1.0.68.
+// EN: Offsets of each skill inside the character stats block (char+0x450).
+//     Each one is a 0-100 float. Inherited layout, not thoroughly verified on 1.0.68.
 struct StatsOffsets {
     // Core combat stats
     int meleeAttack    = 0x00;   // Melee attack skill (float 0-100)
@@ -348,6 +479,8 @@ struct StatsOffsets {
     int labouring      = 0x60;   // Labouring (mining, hauling)
 };
 
+// ES: Estructura que agrupa todas las tablas de offsets (una instancia global, ver GetOffsets()).
+// EN:
 // Combined offsets structure
 struct GameOffsets {
     CharacterOffsets        character;
@@ -371,16 +504,24 @@ struct GameOffsets {
     bool discoveredByScanner = false;
 };
 
+// ES: Devuelve la instancia global única de las tablas de offsets.
+// EN:
 // Singleton accessor for offsets
 GameOffsets& GetOffsets();
 
+// ES: Aplica a las tablas lo que haya encontrado el escáner (llamar al principio del arranque).
+// EN:
 // Initialize offsets from scanner results (call early in startup)
 void InitOffsetsFromScanner();
 
+// ES: Puente PlayerBase: Core guarda aquí la dirección resuelta por patrones y CharacterIterator la lee.
+// EN:
 // PlayerBase bridge: set by Core after pattern resolution, read by CharacterIterator.
 uintptr_t GetResolvedPlayerBase();
 void SetResolvedPlayerBase(uintptr_t addr);
 
+// ES: Puente GameWorld: Core guarda la dirección resuelta; CharacterIterator la usa como alternativa.
+// EN:
 // GameWorld bridge: set by Core after pattern resolution, read by CharacterIterator as fallback.
 uintptr_t GetResolvedGameWorld();
 void SetResolvedGameWorld(uintptr_t addr);
@@ -389,12 +530,16 @@ void SetResolvedGameWorld(uintptr_t addr);
 // Resuelve: GameWorld -> +0x580 (player/PlayerInterface*) -> +0x2A0 (participant) = Faction*.
 // Devuelve 0 si la cadena no es válida (cada paso se valida como puntero de heap).
 // Es la fuente PRIMARIA de facción: no depende de que la lista de personajes esté poblada.
+// EN: DIRECT getter of the player faction, without iterating characters:
+//     GameWorld -> +0x580 (PlayerInterface*) -> +0x2A0 (participant) = Faction*. Returns 0 if invalid.
 uintptr_t GetPlayerFactionDirect();
 
 // Getter DIRECTO del personaje PRIMARIO del jugador (el que controla), SIN iterar por nombre.
 // Resuelve: GameWorld -> +0x580 (player) -> +0x2B0 (playerCharacters lektor) -> data[0].
 // Devuelve 0 si la lista aún no está poblada (justo tras la carga) — reintentar por tick.
 // Vía ROBUSTA para el flujo connected-then-load (no depende del nombre "Player N").
+// EN: DIRECT getter of the player's primary character: GameWorld -> +0x580 -> +0x2B0
+//     (playerCharacters lektor) -> data[0]. Returns 0 while the list is not populated yet.
 uintptr_t GetPlayerPrimaryCharacterDirect();
 
 // [FIX-GHOST 2026-07] Comprueba si charPtr está en la lista NATIVA de personajes
@@ -403,10 +548,13 @@ uintptr_t GetPlayerPrimaryCharacterDirect();
 // encaje con el patrón "Player N" (evita reclamar NPCs fantasma del mundo).
 // Devuelve:  1 = está en la lista;  0 = lista legible pero NO está;
 //           -1 = lista no disponible (juego sin cargar / lektor sin poblar).
+// EN: [FIX-GHOST] Checks whether charPtr is in the engine's native player list (PlayerInterface+0x2B0).
+//     Returns 1 = in list, 0 = list readable but not in it, -1 = list not available.
 int IsInPlayerCharactersList(uintptr_t charPtr);
 
 // Resultado de FixCharacterFactionTo (ver abajo). Permite al orquestador decidir
 // cuándo dar por arreglado el char del host y dejar de reintentar.
+// EN: Result of FixCharacterFactionTo, so the orchestrator knows when to stop retrying.
 enum class FixFactionResult {
     InvalidChar,      // char nulo / no alineado / vtable fuera del módulo
     NoPlayerFaction,  // playerFaction no es un puntero de heap válido (no hay fuente)
@@ -426,6 +574,10 @@ enum class FixFactionResult {
 // SEGURO para el host: la player faction vive toda la partida (no se descarga con
 // zonas), a diferencia de las facciones de NPC del caso remoto (que causaban UAF).
 // Protegido con SEH; loguea SIEMPRE [DIAG-FAC] con faction antes/después y si coincide.
+// EN: Fixes the HOST character's faction by writing the valid player faction into char+0x10 if
+//     it differs. The engine treats a character as the player only when char.faction equals
+//     gameWorld.player(+0x580).faction; otherwise attack orders are rejected. SEH-protected,
+//     always logs [DIAG-FAC]. Safe for the host because the player faction lives all game long.
 FixFactionResult FixCharacterFactionTo(void* charPtr, uintptr_t playerFaction);
 
 // VOLCADO DE DIAGNÓSTICO [DIAG] — SONDA v2, solo log, NO cambia comportamiento.
@@ -434,19 +586,28 @@ FixFactionResult FixCharacterFactionTo(void* charPtr, uintptr_t playerFaction);
 //   C) char[0].faction (char+0x10, VERIFICADO) = facción del jugador con CERTEZA.
 // Filtra candidatos con un test de string LEGIBLE (>=3 chars, >=80% ASCII imprimible).
 // Loguea cada Faction* candidato en hex para cruzarlos. Máx 6 volcados globales.
+// EN: DIAGNOSTIC dump [DIAG] (probe v2), log only. Scans PlayerBase and GameWorld ranges for
+//     Faction* candidates with a readable name and logs them in hex. Max 6 global dumps.
 void DiagDumpPlayerFaction();
 
 // Bombea la sonda desde el game tick (OnGameTick). Throttle de 2s REALES (steady_clock).
 // Solo dispara cuando el PlayerBase resuelto es un puntero de heap válido (el player ya existe).
 // Llamar una vez por tick en AMBAS ramas de OnGameTick (sync + legacy).
+// EN: Pumps the diagnostic probe from OnGameTick, throttled to 2 real seconds; only fires when
+//     the resolved PlayerBase is a valid heap pointer. Call once per tick in both OnGameTick branches.
 void DiagTickPump();
 
+// ES: Puente del estado de carga: Core lo activa al entrar/salir de la fase de carga y
+//     CharacterIterator no lee memoria del juego mientras tanto (los lektor no son atómicos).
+// EN:
 // Loading state bridge: set by Core when entering/exiting Loading phase.
 // CharacterIterator checks this and skips game memory reads during loading
 // to prevent heap corruption from non-atomic lektor reads.
 bool IsGameLoading();
 void SetGameLoadingState(bool loading);
 
+// ES: Puente SetPosition: Core guarda el puntero a la función del juego CharacterSetPosition.
+// EN:
 // SetPosition bridge: set by Core with the resolved CharacterSetPosition function ptr.
 void SetGameSetPositionFn(void* fn);
 
@@ -455,9 +616,17 @@ void SetGameSetPositionFn(void* fn);
 // en lugar de escribir GameWorld+0x8B9 a pelo — así refresca los caches de pausa de los
 // subsistemas (obj+0xB8), oculta el cartel "PAUSED" del HUD y emite "Resume_Game".
 // Esto arregla la "pausa fantasma" que bloqueaba las órdenes del jugador (atacar/hablar).
+// EN: SetPaused bridge: Core stores the official GameWorld::setPaused setter (RVA 0x787D40).
+//     If available, GameWorldAccessor::SetPaused calls it instead of writing GameWorld+0x8B9
+//     directly, so subsystem pause caches, the "PAUSED" HUD label and "Resume_Game" stay in sync.
+//     This fixes the "ghost pause" that blocked player orders.
 void SetGameSetPausedFn(void* fn);
 bool HasGameSetPausedFn();
 
+// ES: Sondeo diferido de animClassOffset: se encola un personaje y se procesa en ticks siguientes,
+//     porque hace falta una posición en caché no nula para validar la cadena de posición.
+//     ResetProbeState limpia todo el estado de sondeo (al desconectar o recargar partida).
+// EN:
 // ── Deferred AnimClass Probing ──
 // Schedule a character for animClassOffset discovery on subsequent game ticks.
 // The probe needs a non-zero cached position to validate the chain, so freshly
@@ -472,6 +641,9 @@ bool ProcessDeferredAnimClassProbes();
 // Call on disconnect/reconnect or second game load to prevent stale state.
 void ResetProbeState();
 
+// ES: Descubrimiento del offset isPlayerControlled comparando un personaje del jugador con un NPC.
+//     OJO: según la nota de CharacterOffsets ese campo no existe y el probe quedó neutralizado.
+// EN:
 // ── Player Controlled Offset Discovery ──
 // Discovers the isPlayerControlled bool offset by comparing a known player-controlled
 // character with an NPC. Call after game load when both types are available.
@@ -480,6 +652,8 @@ void ProbePlayerControlledOffset(uintptr_t playerCharPtr, uintptr_t npcCharPtr);
 // Write the isPlayerControlled flag on a character (requires discovered offset).
 bool WritePlayerControlled(uintptr_t charPtr, bool controlled);
 
+// ES: El prober unificado (game_offset_prober.h) descubre offsets en caliente y los cachea a disco.
+// EN:
 // ── Unified Runtime Offset Prober ──
 // Discovers sceneNode, isPlayerControlled, aiPackage, equipment, animClassOffset, squad
 // offsets at runtime by probing live game objects. Caches results to disk.
@@ -499,6 +673,10 @@ bool WritePlayerControlled(uintptr_t charPtr, bool controlled);
 //   ningún fix desplegado; solo elimina una trampa latente para código futuro y para
 //   CharacterAccessor::GetCurrentTask() (que devuelve el valor CRUDO del binario).
 //   Índices decimales anotados = valor real del binario (== KenshiLib).
+// EN: Task types: a subset of the 291 native taskType values relevant to multiplayer.
+//     Source of truth: KenshiLib Enums.h, cross-checked with binary literals already in use
+//     (USE_BED=0x62, RANGED_ATTACK=0x106). FIX 2026-07-13: values >= IDLE were shifted; the
+//     decimal values now match the real binary. GetCurrentTask() returns the raw binary value.
 enum class TaskType : uint32_t {
     NULL_TASK = 0,
     MOVE_ON_FREE_WILL = 1,
@@ -526,6 +704,8 @@ enum class TaskType : uint32_t {
     SHOOT_AT_TARGET = 235,        // era 244 (mal)
 };
 
+// ES: Ranuras de enganche de equipo (del enum nativo fcs_enums.def).
+// EN:
 // Attach slots for equipment (from fcs_enums.def)
 enum class AttachSlot : uint8_t {
     WEAPON    = 0,
@@ -545,6 +725,8 @@ enum class AttachSlot : uint8_t {
     BELT      = 14,
 };
 
+// ES: Clasificación del tipo de NPC.
+// EN:
 // NPC type classification
 enum class CharacterType : uint8_t {
     OT_NONE       = 0,
@@ -557,6 +739,8 @@ enum class CharacterType : uint8_t {
     OT_ANIMAL     = 7,
 };
 
+// ES: Tipos de clima que afectan al mundo.
+// EN:
 // Weather affecting types
 enum class WeatherType : uint8_t {
     WA_NONE       = 0,
@@ -566,6 +750,8 @@ enum class WeatherType : uint8_t {
     WA_GAS        = 4,
 };
 
+// ES: Tipos de función de un edificio.
+// EN:
 // Building function types
 enum class BuildingFunction : uint8_t {
     BF_ANY           = 0,
@@ -584,6 +770,9 @@ enum class BuildingFunction : uint8_t {
 // ═══════════════════════════════════════════════════════════════════════════
 //  CHARACTER ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Accessor seguro de un Character: lee/escribe memoria del juego usando la tabla de offsets
+//     (con comprobaciones de puntero y SEH en la implementación, game_character.cpp).
+// EN:
 // Safe accessor that reads game memory using the offset table.
 
 class CharacterAccessor {
@@ -604,6 +793,8 @@ public:
     // Read the character's name (MSVC std::string)
     std::string GetName() const;
 
+    // ES: Escribe el nombre (respeta SSO para <=15 caracteres, memoria de heap para más largos).
+    // EN:
     // Write the character's name (SSO-safe for names <= 15 chars, heap for longer)
     bool WriteName(const std::string& name);
 
@@ -616,12 +807,16 @@ public:
     // Get the faction pointer
     uintptr_t GetFactionPtr() const;
 
+    // ES: Escribe el puntero de facción (char+0x10) para cambiar al personaje de facción.
+    // EN:
     // Write faction pointer (point character to a different faction)
     bool WriteFaction(uintptr_t factionPtr);
 
     // Get the GameData* template pointer (backpointer at +0x40)
     uintptr_t GetGameDataPtr() const;
 
+    // ES: Escribe la posición física (cadena escribible) para teletransportar al personaje.
+    // EN:
     // Write the character's writable (physics) position.
     bool WritePosition(const Vec3& pos);
 
@@ -643,6 +838,8 @@ public:
     // Get money via pointer chain
     int GetMoney() const;
 
+    // ES: Activa el flag isPlayerControlled (requiere offset descubierto; ver nota de CharacterOffsets).
+    // EN:
     // Set the isPlayerControlled flag (requires discovered offset from ProbePlayerControlledOffset)
     bool SetPlayerControlled(bool controlled);
 
@@ -657,6 +854,8 @@ private:
 //  SQUAD ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Accessor de una escuadra: nombre, miembros, facción y si es del jugador.
+// EN: Squad accessor: name, members, faction and whether it belongs to the player.
 class SquadAccessor {
 public:
     explicit SquadAccessor(void* squadPtr)
@@ -680,6 +879,8 @@ private:
 //  INVENTORY ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Accessor de un inventario: nº de items, item i, tamaño de rejilla y modificación de pilas.
+// EN: Inventory accessor: item count, item i, grid size and stack modification.
 class InventoryAccessor {
 public:
     explicit InventoryAccessor(void* invPtr)
@@ -694,6 +895,8 @@ public:
     int GetWidth() const;
     int GetHeight() const;
 
+    // ES: Cambia la cantidad de una pila existente (no puede crear items nuevos).
+    // EN:
     // Modify quantity of existing item stack (cannot create new items)
     bool AddItem(uint32_t templateId, int quantity);
     bool RemoveItem(uint32_t templateId, int quantity);
@@ -709,6 +912,8 @@ private:
 //  BUILDING ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Accessor de un edificio: nombre, posición, salud, estado de construcción, dueño e inventario.
+// EN: Building accessor: name, position, health, construction state, owner and inventory.
 class BuildingAccessor {
 public:
     explicit BuildingAccessor(void* bldPtr)
@@ -736,6 +941,8 @@ private:
 //  FACTION ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Accessor de una facción: nombre, nº de miembros, si es del jugador y dinero.
+// EN: Faction accessor: name, member count, whether it is the player's and money.
 class FactionAccessor {
 public:
     explicit FactionAccessor(void* factionPtr)
@@ -758,6 +965,8 @@ private:
 //  STATS ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Accessor del bloque de habilidades de un personaje (cada getter lee un float 0-100).
+// EN: Accessor for a character's skills block (each getter reads a 0-100 float).
 class StatsAccessor {
 public:
     explicit StatsAccessor(void* statsPtr)
@@ -786,6 +995,8 @@ private:
 // ═══════════════════════════════════════════════════════════════════════════
 //  CHARACTER LIST ITERATOR
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Iterador sobre los personajes del jugador/mundo (usa los puentes PlayerBase/GameWorld).
+// EN:
 // Iterates over all characters in the game world
 
 class CharacterIterator {
@@ -807,6 +1018,8 @@ private:
 // ═══════════════════════════════════════════════════════════════════════════
 //  GAME WORLD ACCESSOR
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Lee y escribe el estado global del juego (hora, velocidad, clima, pausa) en GameWorld.
+// EN:
 // Reads global game state from the GameWorld singleton
 
 class GameWorldAccessor {
@@ -832,11 +1045,17 @@ public:
     //    Estos métodos usan ResolveWorldObject() para manejar el layout de instancia
     //    embebida de Steam 1.0.68 (NO se puede dereferenciar a ciegas el singleton). ──
     // Devuelve: 1=pausado, 0=despausado, -1=desconocido (no se pudo resolver/leer).
+    // EN: Pause (GameWorld+0x8B9, 1-byte bool, confirmed in KenshiLib and binary: isPaused RVA 0xDEE00;
+    //     the game loop RVA 0x788A00 forces the simulation delta to 0 when paused). These use
+    //     ResolveWorldObject() to handle the embedded-instance layout of Steam 1.0.68.
+    //     Returns 1 = paused, 0 = unpaused, -1 = unknown.
     int  GetPausedRaw() const;
     // Escribe el flag paused. Devuelve true si la escritura tuvo éxito.
+    // EN: Writes the paused flag; returns true on success.
     bool SetPaused(bool paused);
     // Expone la dirección del OBJETO GameWorld real (instancia o *puntero), o 0.
     // Útil para sondas de diagnóstico [DIAG] sin duplicar la lógica de resolución.
+    // EN: Exposes the real GameWorld object address (instance or *pointer), or 0. Handy for [DIAG] probes.
     uintptr_t GetWorldObject() const { return ResolveWorldObject(); }
 
 private:
@@ -847,14 +1066,23 @@ private:
     //   - instancia embebida (1.0.68): *m_addr es la vtable (.text) -> el objeto es m_addr
     //   - puntero clasico             : *m_addr es heap-ptr al objeto -> el objeto es *m_addr
     // Devuelve 0 si no hay objeto valido. Definido en game_world.cpp.
+    // EN: Resolves the real GameWorld object from m_addr. Embedded instance (1.0.68): *m_addr is the
+    //     vtable, so the object is m_addr. Classic pointer: *m_addr is the heap object. Returns 0 if invalid.
     uintptr_t ResolveWorldObject() const;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  FUNCTION POINTER TYPEDEFS
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Firmas de las funciones del juego que se hookean (un hook desvía la función original
+//     hacia la nuestra y guarda un trampolín para llamar a la original). __fastcall es la
+//     convención de llamada x64 de Microsoft. Agrupadas por sistema (entidades, movimiento,
+//     combate, zonas, bucle, guardado, escuadras, inventario, facciones, IA, torretas).
+// EN:
 // Signatures for hooked game functions. __fastcall = Microsoft x64 calling convention.
 
+// ES: Espacio de nombres de los typedefs de punteros a función del juego.
+// EN: Namespace for the game function-pointer typedefs.
 namespace func_types {
 
 // Entity lifecycle
