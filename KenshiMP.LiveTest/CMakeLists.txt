@@ -1,3 +1,9 @@
+# ES: KenshiMP.LiveTest: test de integración en vivo que lanza servidor, TestClient y Kenshi
+#     y vigila sus logs. Enlaza con Shlwapi/Version/Shell32 para rutas, versiones y ShellExecute.
+#     (El include de Common es redundante: ya llega vía KenshiMP.Common PUBLIC.)
+# EN: KenshiMP.LiveTest: live integration test that launches server, TestClient and Kenshi
+#     and watches their logs. Links Shlwapi/Version/Shell32 for paths, versions and ShellExecute.
+#     (The Common include is redundant: it already comes via KenshiMP.Common PUBLIC.)
 project(KenshiMP.LiveTest LANGUAGES CXX)
 
 add_executable(KenshiMP.LiveTest main.cpp)

@@ -1,3 +1,7 @@
+# ES: KenshiMP.IntegrationTest: ejecutable de consola de pruebas de integración de red
+#     contra el servidor (ENet + protocolo de Common).
+# EN: KenshiMP.IntegrationTest: console executable for network integration tests
+#     against the server (ENet + Common protocol).
 add_executable(KenshiMP.IntegrationTest
     main.cpp
 )

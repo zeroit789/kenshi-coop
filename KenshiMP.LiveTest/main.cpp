@@ -1,4 +1,22 @@
-// KenshiMP.LiveTest — Full dual-player integration test
+// ES: KenshiMP.LiveTest — test de integración completo con dos jugadores.
+//     Modos:
+//       Simple: KenshiMP.LiveTest.exe [nombreJugador] [ipServidor] [puertoServidor]
+//       Dual:   KenshiMP.LiveTest.exe --dual [nombreJugador]
+//     En modo dual lanza:
+//       1. KenshiMP.Server (servidor dedicado en 127.0.0.1:27800)
+//       2. KenshiMP.TestClient (Jugador 2 automático — camina y envía posiciones)
+//       3. Kenshi vía Steam (Jugador 1 — cliente real del juego con la DLL del mod)
+//     Vigila el log de Kenshi y la salida estándar del TestClient buscando hitos:
+//       - Los dos jugadores conectados
+//       - Los dos jugadores con entidades creadas
+//       - Visibilidad cruzada de entidades (P1 ve a P2 y P2 ve a P1)
+//       - Sincronización de posiciones en ambos sentidos
+//       - Autoridad bien asignada (cada jugador solo es dueño de sus entidades)
+//     Los hitos se detectan buscando textos concretos en los logs, así que dependen de
+//     que los mensajes de log del Core/TestClient no cambien.
+// EN: KenshiMP.LiveTest — Full dual-player integration test
+//     Milestones are detected by searching for specific text in the logs, so they depend
+//     on the Core/TestClient log messages staying unchanged.
 //
 // Modes:
 //   Single: KenshiMP.LiveTest.exe [playerName] [serverIP] [serverPort]
@@ -37,6 +55,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  CONSOLE COLORS
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Colores de consola: atributos de texto de Win32 y funciones de impresión con
+//     prefijo de color (OK, WARN, FAIL, INFO, STEP, P1, P2).
+// EN: Console colors: Win32 text attributes and print helpers with a colored
+//     prefix (OK, WARN, FAIL, INFO, STEP, P1, P2).
 
 static HANDLE g_hConsole = INVALID_HANDLE_VALUE;
 
@@ -65,9 +87,14 @@ static void PrintP2(const std::string& msg)    { Print(MAGENTA, " P2 ", msg); }
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Find Kenshi install path
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Localiza Kenshi (registro de Steam o Program Files). Copia de la función del
+//     Injector (process.cpp), con el mismo doble RegCloseKey.
+// EN: Locates Kenshi (Steam registry or Program Files). Copy of the Injector's
+//     function (process.cpp), with the same double RegCloseKey.
 
 static std::wstring FindKenshiPath() {
-    // Try Steam registry
+    // ES: Probar el registro de Steam
+    // EN: Try Steam registry
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                       L"SOFTWARE\\WOW6432Node\\Valve\\Steam",
@@ -91,6 +118,10 @@ static std::wstring FindKenshiPath() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Install Ogre plugin
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Añade "Plugin=KenshiMP.Core" a Plugins_x64.cfg si falta, para que Ogre cargue la
+//     DLL del mod al arrancar Kenshi (copia de la lógica del Injector).
+// EN: Adds "Plugin=KenshiMP.Core" to Plugins_x64.cfg if missing, so Ogre loads the mod
+//     DLL when Kenshi starts (copy of the Injector's logic).
 
 static bool InstallOgrePlugin(const std::wstring& gamePath) {
     std::wstring cfgPath = gamePath + L"\\Plugins_x64.cfg";
@@ -122,6 +153,12 @@ static bool InstallOgrePlugin(const std::wstring& gamePath) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Write client.json for auto-connect
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Escribe %APPDATA%\KenshiMP\client.json con autoConnect=true para que el Core se
+//     conecte solo al cargar la partida. Ojo: el JSON se monta a mano sin escapar, así que
+//     un nombre con comillas o barras invertidas produciría un JSON inválido.
+// EN: Writes %APPDATA%\KenshiMP\client.json with autoConnect=true so Core connects by
+//     itself once the game loads. Note: the JSON is built by hand without escaping, so a
+//     name with quotes or backslashes would produce invalid JSON.
 
 static bool WriteClientConfig(const std::string& playerName, const std::string& serverIP, int port) {
     char appData[MAX_PATH];
@@ -149,6 +186,10 @@ static bool WriteClientConfig(const std::string& playerName, const std::string& 
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Copy DLL to game directory
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Copia KenshiMP.Core.dll a la carpeta del juego desde junto al exe o desde las
+//     salidas Debug/Release; si no puede, acepta una DLL que ya estuviera allí.
+// EN: Copies KenshiMP.Core.dll into the game folder from next to the exe or from the
+//     Debug/Release outputs; if it can't, accepts a DLL already present there.
 
 static bool CopyDllToGame(const std::wstring& gamePath) {
     wchar_t exePath[MAX_PATH] = {};
@@ -185,6 +226,10 @@ static bool CopyDllToGame(const std::wstring& gamePath) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Check if a process is running
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Recorre la lista de procesos (Toolhelp32) y dice si alguno tiene ese nombre de exe
+//     (comparación sin distinguir mayúsculas).
+// EN: Walks the process list (Toolhelp32) and reports whether any has that exe name
+//     (case-insensitive comparison).
 
 static bool IsProcessRunning(const wchar_t* name) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -206,6 +251,10 @@ static bool IsProcessRunning(const wchar_t* name) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Find exe path (server, test client, etc.)
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Busca un ejecutable del proyecto junto a este exe, en las salidas Debug/Release o en
+//     la carpeta del juego. Devuelve "" si no lo encuentra.
+// EN: Looks for a project executable next to this exe, in the Debug/Release outputs or in
+//     the game folder. Returns "" if not found.
 
 static std::wstring FindExe(const std::wstring& gamePath, const wchar_t* exeName) {
     wchar_t exePath[MAX_PATH] = {};
@@ -230,6 +279,10 @@ static std::wstring FindExe(const std::wstring& gamePath, const wchar_t* exeName
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Launch server process
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Arranca KenshiMP.Server.exe en una consola nueva y devuelve el handle del proceso
+//     (INVALID_HANDLE_VALUE si falla). El directorio de trabajo es el heredado de este proceso.
+// EN: Starts KenshiMP.Server.exe in a new console and returns the process handle
+//     (INVALID_HANDLE_VALUE on failure). The working directory is inherited from this process.
 
 static HANDLE LaunchServer(const std::wstring& gamePath) {
     std::wstring serverExe = FindExe(gamePath, L"KenshiMP.Server.exe");
@@ -256,6 +309,8 @@ static HANDLE LaunchServer(const std::wstring& gamePath) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Launch TestClient as Player 2 (with output pipe)
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Proceso hijo con su stdout/stderr redirigidos a una tubería que leemos nosotros.
+// EN: Child process with its stdout/stderr redirected to a pipe we read from.
 
 struct PipedProcess {
     HANDLE hProcess = INVALID_HANDLE_VALUE;
@@ -263,6 +318,10 @@ struct PipedProcess {
     DWORD  pid = 0;
 };
 
+// ES: Lanza KenshiMP.TestClient.exe <ip> <puerto> <nombre> como Jugador 2 capturando su salida.
+//     Ojo: la conversión string→wstring es byte a byte (solo vale para ASCII).
+// EN: Launches KenshiMP.TestClient.exe <ip> <port> <name> as Player 2, capturing its output.
+//     Note: the string→wstring conversion is byte by byte (ASCII only).
 static PipedProcess LaunchTestClient(const std::wstring& gamePath,
                                       const std::string& serverIP, int port,
                                       const std::string& playerName) {
@@ -274,7 +333,8 @@ static PipedProcess LaunchTestClient(const std::wstring& gamePath,
         return result;
     }
 
-    // Create pipe for reading TestClient stdout
+    // ES: Crear la tubería para leer la salida estándar del TestClient
+    // EN: Create pipe for reading TestClient stdout
     HANDLE hReadPipe, hWritePipe;
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
@@ -283,10 +343,12 @@ static PipedProcess LaunchTestClient(const std::wstring& gamePath,
         PrintErr("Failed to create pipe for TestClient");
         return result;
     }
-    // Don't inherit the read end
+    // ES: El extremo de lectura no lo hereda el hijo
+    // EN: Don't inherit the read end
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    // Build command line: TestClient.exe <ip> <port> <name>
+    // ES: Montar la línea de comandos: TestClient.exe <ip> <puerto> <nombre>
+    // EN: Build command line: TestClient.exe <ip> <port> <name>
     std::wstring cmdLine = L"\"" + tcExe + L"\" " +
         std::wstring(serverIP.begin(), serverIP.end()) + L" " +
         std::to_wstring(port) + L" " +
@@ -308,6 +370,8 @@ static PipedProcess LaunchTestClient(const std::wstring& gamePath,
     }
 
     CloseHandle(pi.hThread);
+    // ES: Cerrar el extremo de escritura en el padre (si no, ReadFile nunca vería fin de datos)
+    // EN: Close the write end in the parent (otherwise ReadFile would never see end of data)
     CloseHandle(hWritePipe); // Close write end in parent
 
     result.hProcess = pi.hProcess;
@@ -320,6 +384,8 @@ static PipedProcess LaunchTestClient(const std::wstring& gamePath,
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Launch Kenshi via Steam
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Pide a Steam arrancar Kenshi (App ID 233860). True si ShellExecute tuvo éxito (> 32).
+// EN: Asks Steam to start Kenshi (App ID 233860). True if ShellExecute succeeded (> 32).
 
 static bool LaunchKenshi() {
     HINSTANCE result = ShellExecuteW(nullptr, L"open",
@@ -330,6 +396,10 @@ static bool LaunchKenshi() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITY: Find Kenshi process PID (waits for it)
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Espera (sondeando cada segundo) a que aparezca kenshi_x64.exe y devuelve su PID,
+//     o 0 si pasa timeoutSeconds.
+// EN: Waits (polling every second) for kenshi_x64.exe to appear and returns its PID,
+//     or 0 after timeoutSeconds.
 
 static DWORD FindKenshiPID(int timeoutSeconds = 60) {
     auto start = std::chrono::steady_clock::now();
@@ -360,6 +430,8 @@ static DWORD FindKenshiPID(int timeoutSeconds = 60) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  MILESTONES: Player 1 (Kenshi game client, from log file)
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Hito del test: nombre visible, texto a buscar en el log/salida y si ya se alcanzó.
+// EN: Test milestone: display name, text to search in the log/output and whether it was hit.
 
 struct Milestone {
     const char* name;
@@ -367,6 +439,12 @@ struct Milestone {
     bool        hit = false;
 };
 
+// ES: Hitos del Jugador 1 (Kenshi con el mod), buscados en el log del Core.
+//     Ojo: el dashboard y el informe final usan índices fijos (p.ej. [10] = "Remote Entity
+//     Spawn"); si se reordena esta lista hay que actualizarlos. "Player '" es muy genérico.
+// EN: Player 1 milestones (Kenshi with the mod), searched in the Core log.
+//     Note: the dashboard and final report use fixed indices (e.g. [10] = "Remote Entity
+//     Spawn"); reordering this list requires updating them. "Player '" is very generic.
 static Milestone g_p1Milestones[] = {
     {"P1: DLL Loaded",          "=== Kenshi-Online v"},
     {"P1: Config Loaded",       "Config loaded"},
@@ -387,6 +465,10 @@ static constexpr int NUM_P1_MILESTONES = sizeof(g_p1Milestones) / sizeof(g_p1Mil
 // ═══════════════════════════════════════════════════════════════════════════
 //  MILESTONES: Player 2 (TestClient, from stdout pipe)
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Hitos del Jugador 2 (TestClient), buscados en su salida estándar. "Sees P1 Entity"
+//     salta con cualquier "Entity spawn:" de otra entidad, no necesariamente de P1.
+// EN: Player 2 milestones (TestClient), searched in its stdout. "Sees P1 Entity" fires on
+//     any other entity's "Entity spawn:", not necessarily P1's.
 
 static Milestone g_p2Milestones[] = {
     {"P2: Connected",           "Connected to server"},
@@ -403,6 +485,8 @@ static constexpr int NUM_P2_MILESTONES = sizeof(g_p2Milestones) / sizeof(g_p2Mil
 //  LOG MONITORING
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Ruta del log del Core para un proceso de Kenshi: <juego>\KenshiOnline_<PID>.log.
+// EN: Core log path for a Kenshi process: <game>\KenshiOnline_<PID>.log.
 static std::string FindLogFile(const std::wstring& gamePath, DWORD pid) {
     std::string logPath;
     char buf[MAX_PATH];
@@ -411,6 +495,12 @@ static std::string FindLogFile(const std::wstring& gamePath, DWORD pid) {
     return logPath + "\\KenshiOnline_" + std::to_string(pid) + ".log";
 }
 
+// ES: Lee solo lo nuevo del log (desde lastPos hasta el final), marca los hitos cuyo texto
+//     aparezca y muestra las líneas que parecen errores graves (SEH/CRASH/FAILED + error).
+//     Un hito cuyo texto quede partido entre dos lecturas podría no detectarse.
+// EN: Reads only the new part of the log (from lastPos to the end), marks milestones whose
+//     text appears and prints lines that look like critical errors (SEH/CRASH/FAILED + error).
+//     A milestone whose text is split across two reads might be missed.
 static void ScanLogForMilestones(const std::string& logPath, size_t& lastPos,
                                   Milestone* milestones, int count, const char* tag) {
     std::ifstream file(logPath, std::ios::binary);
@@ -432,7 +522,8 @@ static void ScanLogForMilestones(const std::string& logPath, size_t& lastPos,
         }
     }
 
-    // Check for critical errors
+    // ES: Buscar errores críticos
+    // EN: Check for critical errors
     std::istringstream stream(newContent);
     std::string line;
     while (std::getline(stream, line)) {
@@ -445,7 +536,9 @@ static void ScanLogForMilestones(const std::string& logPath, size_t& lastPos,
     }
 }
 
-// Read non-blocking from TestClient pipe and check milestones
+// ES: Lee sin bloquear de la tubería del TestClient (PeekNamedPipe para saber cuánto hay),
+//     procesa las líneas completas buscando hitos y muestra las líneas interesantes.
+// EN: Read non-blocking from TestClient pipe and check milestones
 static void ScanPipeForMilestones(HANDLE hPipe, std::string& pipeBuffer,
                                    Milestone* milestones, int count) {
     DWORD avail = 0;
@@ -461,14 +554,16 @@ static void ScanPipeForMilestones(HANDLE hPipe, std::string& pipeBuffer,
         avail -= bytesRead;
     }
 
-    // Process complete lines
+    // ES: Procesar las líneas completas (lo que quede a medias se guarda para la siguiente vez)
+    // EN: Process complete lines
     size_t pos;
     while ((pos = pipeBuffer.find('\n')) != std::string::npos) {
         std::string line = pipeBuffer.substr(0, pos);
         pipeBuffer.erase(0, pos + 1);
         if (!line.empty() && line.back() == '\r') line.pop_back();
 
-        // Check milestones
+        // ES: Comprobar hitos
+        // EN: Check milestones
         for (int i = 0; i < count; i++) {
             if (!milestones[i].hit && line.find(milestones[i].searchString) != std::string::npos) {
                 milestones[i].hit = true;
@@ -476,7 +571,8 @@ static void ScanPipeForMilestones(HANDLE hPipe, std::string& pipeBuffer,
             }
         }
 
-        // Print interesting P2 lines
+        // ES: Mostrar las líneas interesantes de P2 (las 20 primeras y luego una de cada 50)
+        // EN: Print interesting P2 lines
         if (line.find("[*]") != std::string::npos ||
             line.find("[<]") != std::string::npos ||
             line.find("ERROR") != std::string::npos) {
@@ -493,6 +589,10 @@ static void ScanPipeForMilestones(HANDLE hPipe, std::string& pipeBuffer,
 // ═══════════════════════════════════════════════════════════════════════════
 //  DASHBOARD
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Panel periódico (cada 15 s): hitos de P1, y en modo dual los de P2, comprobaciones
+//     de autoridad/visibilidad y progreso total con color según lo conseguido.
+// EN: Periodic panel (every 15 s): P1 milestones and, in dual mode, P2 milestones,
+//     authority/visibility checks and total progress colored by how much passed.
 
 static void PrintDualDashboard(DWORD kenshiPID, DWORD tcPID, int elapsedSec, bool dualMode) {
     printf("\n");
@@ -500,7 +600,8 @@ static void PrintDualDashboard(DWORD kenshiPID, DWORD tcPID, int elapsedSec, boo
     printf("==================== LIVE TEST DASHBOARD (%ds elapsed) ====================\n", elapsedSec);
     SetColor(WHITE);
 
-    // Player 1 milestones
+    // ES: Hitos del Jugador 1
+    // EN: Player 1 milestones
     SetColor(GREEN);
     printf("  Player 1 (Kenshi PID %lu):\n", kenshiPID);
     SetColor(WHITE);
@@ -533,7 +634,8 @@ static void PrintDualDashboard(DWORD kenshiPID, DWORD tcPID, int elapsedSec, boo
             }
         }
 
-        // Authority check
+        // ES: Comprobación de autoridad (derivada de los hitos por índice fijo)
+        // EN: Authority check
         printf("\n");
         SetColor(CYAN);
         printf("  Authority Verification:\n");
@@ -576,6 +678,10 @@ static void PrintDualDashboard(DWORD kenshiPID, DWORD tcPID, int elapsedSec, boo
 // ═══════════════════════════════════════════════════════════════════════════
 //  FINAL REPORT
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Informe final: PASS/FAIL de cada hito, resumen de autoridad y sincronización y
+//     estado del pipeline. Devuelve 0 (éxito) si P1 alcanzó al menos 6 hitos, si no 1.
+// EN: Final report: PASS/FAIL per milestone, authority and sync summary and pipeline
+//     status. Returns 0 (success) if P1 hit at least 6 milestones, otherwise 1.
 
 static int PrintFinalReport(int elapsedSec, bool dualMode) {
     printf("\n");
@@ -585,7 +691,8 @@ static int PrintFinalReport(int elapsedSec, bool dualMode) {
     printf("╚══════════════════════════════════════════════════════════════════╝\n");
     SetColor(WHITE);
 
-    // Player 1
+    // ES: Jugador 1
+    // EN: Player 1
     printf("\n");
     SetColor(GREEN);
     printf("  Player 1 (Kenshi Game Client):\n");
@@ -609,7 +716,8 @@ static int PrintFinalReport(int elapsedSec, bool dualMode) {
             if (g_p2Milestones[i].hit) p2Passed++;
         }
 
-        // Authority summary
+        // ES: Resumen de autoridad
+        // EN: Authority summary
         printf("\n");
         SetColor(CYAN);
         printf("  Authority & Sync Summary:\n");
@@ -630,7 +738,8 @@ static int PrintFinalReport(int elapsedSec, bool dualMode) {
             PrintOK("FULL MULTIPLAYER PIPELINE VERIFIED");
     }
 
-    // Summary
+    // ES: Resumen
+    // EN: Summary
     printf("\n");
     int total = p1Passed + (dualMode ? p2Passed : 0);
     int totalMax = NUM_P1_MILESTONES + (dualMode ? NUM_P2_MILESTONES : 0);
@@ -643,7 +752,8 @@ static int PrintFinalReport(int elapsedSec, bool dualMode) {
         printf("  Result: %d/%d milestones in %ds\n", p1Passed, NUM_P1_MILESTONES, elapsedSec);
     SetColor(WHITE);
 
-    // Pipeline status
+    // ES: Estado del pipeline por umbrales de hitos alcanzados
+    // EN: Pipeline status
     printf("\n");
     if (p1Passed >= 6) PrintOK("Core pipeline (DLL -> hooks -> game load -> network)");
     if (p1Passed >= 8) PrintOK("Network connection (handshake + player join)");
@@ -656,11 +766,16 @@ static int PrintFinalReport(int elapsedSec, bool dualMode) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN
 // ═══════════════════════════════════════════════════════════════════════════
+// ES: Punto de entrada: prepara el entorno (DLL, plugin, client.json), lanza servidor,
+//     TestClient (modo dual) y Kenshi, y vigila los hitos hasta pulsar Enter o que Kenshi se cierre.
+// EN: Entry point: prepares the environment (DLL, plugin, client.json), launches server,
+//     TestClient (dual mode) and Kenshi, and watches milestones until Enter or Kenshi exits.
 
 int main(int argc, char* argv[]) {
     g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
 
-    // Parse args
+    // ES: Leer argumentos (--dual/-d, --help/-h y posicionales nombre, ip, puerto)
+    // EN: Parse args
     std::string playerName = "LiveTestPlayer";
     std::string serverIP = "127.0.0.1";
     int serverPort = 27800;
@@ -680,7 +795,8 @@ int main(int argc, char* argv[]) {
             printf("  --help, -h    Show this help\n");
             return 0;
         } else {
-            // Positional args
+            // ES: Argumentos posicionales
+            // EN: Positional args
             static int posIdx = 0;
             if (posIdx == 0) playerName = arg;
             else if (posIdx == 1) serverIP = arg;
@@ -691,8 +807,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ES: Nombre pseudoaleatorio del bot (Jugador 2)
+    // EN: Pseudo-random bot name (Player 2)
     std::string p2Name = "TestBot_" + std::to_string(GetTickCount() % 999);
 
+    // ES: Cabecera con la configuración del test
+    // EN: Banner with the test configuration
     SetColor(CYAN);
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════╗\n");
@@ -711,7 +831,8 @@ int main(int argc, char* argv[]) {
     printf("\n");
     SetColor(WHITE);
 
-    // ── Step 1: Find Kenshi ──
+    // ES: ── Paso 1: localizar Kenshi ──
+    // EN: ── Step 1: Find Kenshi ──
     PrintStep("Finding Kenshi installation...");
     std::wstring gamePath = FindKenshiPath();
     if (gamePath.empty()) {
@@ -724,7 +845,8 @@ int main(int argc, char* argv[]) {
         PrintOK(std::string("Kenshi found at: ") + buf);
     }
 
-    // ── Step 2: Check Steam ──
+    // ES: ── Paso 2: comprobar que Steam está abierto ──
+    // EN: ── Step 2: Check Steam ──
     PrintStep("Checking Steam...");
     if (!IsProcessRunning(L"steam.exe") && !IsProcessRunning(L"Steam.exe")) {
         PrintErr("Steam is not running! Start Steam first.");
@@ -732,14 +854,16 @@ int main(int argc, char* argv[]) {
     }
     PrintOK("Steam is running");
 
-    // ── Step 3: Copy DLL ──
+    // ES: ── Paso 3: copiar la DLL ──
+    // EN: ── Step 3: Copy DLL ──
     PrintStep("Copying KenshiMP.Core.dll...");
     if (!CopyDllToGame(gamePath)) {
         PrintErr("Could not find or copy KenshiMP.Core.dll");
         return 1;
     }
 
-    // ── Step 4: Install Ogre plugin ──
+    // ES: ── Paso 4: registrar el plugin de Ogre ──
+    // EN: ── Step 4: Install Ogre plugin ──
     PrintStep("Installing Ogre plugin...");
     if (!InstallOgrePlugin(gamePath)) {
         PrintErr("Failed to modify Plugins_x64.cfg");
@@ -747,7 +871,8 @@ int main(int argc, char* argv[]) {
     }
     PrintOK("Ogre plugin installed (Plugins_x64.cfg)");
 
-    // ── Step 5: Write client config ──
+    // ES: ── Paso 5: escribir la config del cliente (en modo dual se fuerza 127.0.0.1) ──
+    // EN: ── Step 5: Write client config ──
     PrintStep("Writing client config for P1...");
     if (dualMode)
         serverIP = "127.0.0.1"; // Force local in dual mode
@@ -756,7 +881,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ── Step 6: Start server ──
+    // ES: ── Paso 6: arrancar el servidor ──
+    //     Ojo: las dos ramas (dual y simple) son idénticas; en modo simple también se lanza
+    //     un servidor local aunque se haya indicado una IP de servidor remota.
+    // EN: ── Step 6: Start server ──
+    //     Note: both branches (dual and single) are identical; single mode also launches a
+    //     local server even when a remote server IP was given.
     HANDLE hServer = INVALID_HANDLE_VALUE;
     if (dualMode) {
         PrintStep("Starting KenshiMP server...");
@@ -776,7 +906,8 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 
-    // ── Step 7: Launch TestClient (dual mode only) ──
+    // ES: ── Paso 7: lanzar el TestClient (solo modo dual; si falla se degrada a modo simple) ──
+    // EN: ── Step 7: Launch TestClient (dual mode only) ──
     PipedProcess testClient = {};
     if (dualMode) {
         PrintStep("Launching TestClient as Player 2...");
@@ -787,7 +918,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ── Step 8: Launch Kenshi ──
+    // ES: ── Paso 8: lanzar Kenshi (o reutilizar una instancia ya abierta) ──
+    // EN: ── Step 8: Launch Kenshi ──
     if (IsProcessRunning(L"kenshi_x64.exe")) {
         PrintWarn("Kenshi is already running! The existing instance will be used.");
         PrintInfo("If it doesn't have the mod loaded, close it and re-run this test.");
@@ -801,7 +933,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ── Step 9: Wait for Kenshi process ──
+    // ES: ── Paso 9: esperar al proceso de Kenshi (máximo 120 s; si no, se matan servidor y bot) ──
+    // EN: ── Step 9: Wait for Kenshi process ──
     PrintStep("Waiting for kenshi_x64.exe to start...");
     DWORD kenshiPID = FindKenshiPID(120);
     if (kenshiPID == 0) {
@@ -812,7 +945,8 @@ int main(int argc, char* argv[]) {
     }
     PrintOK("Kenshi started (PID " + std::to_string(kenshiPID) + ")");
 
-    // ── Step 10: Monitor both processes ──
+    // ES: ── Paso 10: vigilar ambos procesos (bucle cada 2 s hasta Enter o cierre de Kenshi) ──
+    // EN: ── Step 10: Monitor both processes ──
     std::string logPath = FindLogFile(gamePath, kenshiPID);
     PrintInfo("Monitoring P1 log: " + logPath);
     if (dualMode) {
@@ -831,7 +965,8 @@ int main(int argc, char* argv[]) {
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
 
     while (true) {
-        // Check for Enter key (non-blocking)
+        // ES: Comprobar si se pulsó Enter (sin bloquear, leyendo eventos de consola)
+        // EN: Check for Enter key (non-blocking)
         DWORD events = 0;
         if (GetNumberOfConsoleInputEvents(hStdin, &events) && events > 0) {
             INPUT_RECORD ir;
@@ -845,7 +980,8 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Scan P1 log file
+        // ES: Revisar el log de P1
+        // EN: Scan P1 log file
         ScanLogForMilestones(logPath, logPos, g_p1Milestones, NUM_P1_MILESTONES, "P1");
 
         if (!firstLogFound && logPos > 0) {
@@ -853,24 +989,31 @@ int main(int argc, char* argv[]) {
             PrintP1("Log file detected — DLL is loaded!");
         }
 
-        // Scan P2 pipe (dual mode)
+        // ES: Revisar la tubería de P2 (modo dual)
+        // EN: Scan P2 pipe (dual mode)
         if (dualMode && testClient.hReadPipe != INVALID_HANDLE_VALUE) {
             ScanPipeForMilestones(testClient.hReadPipe, p2PipeBuffer,
                                   g_p2Milestones, NUM_P2_MILESTONES);
         }
 
-        // Check if Kenshi is still running
+        // ES: Comprobar si Kenshi sigue abierto (si se cierra, se sale del bucle)
+        // EN: Check if Kenshi is still running
         if (!IsProcessRunning(L"kenshi_x64.exe")) {
             PrintWarn("Kenshi process exited!");
             break;
         }
 
-        // Check if TestClient is still running (dual mode)
+        // ES: Comprobar si el TestClient sigue vivo (modo dual). Ojo: si terminó, el aviso se
+        //     repite en cada vuelta del bucle porque no se marca como ya notificado.
+        // EN: Check if TestClient is still running (dual mode)
+        //     Note: once it has exited, the warning repeats every loop iteration since it isn't
+        //     flagged as already reported.
         if (dualMode && testClient.hProcess != INVALID_HANDLE_VALUE) {
             DWORD exitCode = 0;
             if (GetExitCodeProcess(testClient.hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
                 PrintWarn("TestClient exited (code " + std::to_string(exitCode) + ")");
-                // Drain remaining pipe output
+                // ES: Vaciar lo que quede en la tubería
+                // EN: Drain remaining pipe output
                 if (testClient.hReadPipe != INVALID_HANDLE_VALUE) {
                     ScanPipeForMilestones(testClient.hReadPipe, p2PipeBuffer,
                                           g_p2Milestones, NUM_P2_MILESTONES);
@@ -878,7 +1021,8 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Dashboard every 15s
+        // ES: Panel cada 15 s
+        // EN: Dashboard every 15s
         auto now = std::chrono::steady_clock::now();
         auto sinceDashboard = std::chrono::duration_cast<std::chrono::seconds>(now - lastDashboard);
         if (sinceDashboard.count() >= 15) {
@@ -891,11 +1035,14 @@ int main(int argc, char* argv[]) {
     }
 
 done:
+    // ES: Fin de la vigilancia: informe final con el tiempo total
+    // EN: End of monitoring: final report with total time
     auto endTime = std::chrono::steady_clock::now();
     auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
     int exitCode = PrintFinalReport(static_cast<int>(totalElapsed.count()), dualMode);
 
-    // ── Cleanup prompt ──
+    // ES: ── Preguntar si se matan servidor y bot ──
+    // EN: ── Cleanup prompt ──
     printf("\n");
     SetColor(YELLOW);
     printf("Kill server and test client? (y/n): ");
@@ -913,7 +1060,8 @@ done:
         }
     }
 
-    // Close handles
+    // ES: Cerrar handles
+    // EN: Close handles
     if (testClient.hProcess != INVALID_HANDLE_VALUE) CloseHandle(testClient.hProcess);
     if (testClient.hReadPipe != INVALID_HANDLE_VALUE) CloseHandle(testClient.hReadPipe);
     if (hServer != INVALID_HANDLE_VALUE) CloseHandle(hServer);
