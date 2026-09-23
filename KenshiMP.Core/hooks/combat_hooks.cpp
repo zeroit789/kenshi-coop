@@ -1,3 +1,17 @@
+// ES: Implementación de los hooks de combate.
+//     - Hooks de red: CharacterDeath y CharacterKO. Llaman al original y encolan el evento en un
+//       ring buffer sin locks; ProcessDeferredEvents (game tick) lo envía al servidor.
+//     - Hooks DIAG (solo log, no cambian el juego): Tasker::pushOrder, validador de
+//       Character::addOrder (con el bypass FIX-CARRY-HAND) y CombatClass::update.
+//     Todos corren en el hilo de juego que llama a esas funciones (hilo principal/lógica).
+//     ApplyDamage NO se hookea a propósito (ver Install).
+// EN: Combat hooks implementation.
+//     - Network hooks: CharacterDeath and CharacterKO. They call the original and push the event
+//       into a lock-free ring buffer; ProcessDeferredEvents (game tick) sends it to the server.
+//     - DIAG hooks (log only, they do not change the game): Tasker::pushOrder, the
+//       Character::addOrder validator (with the FIX-CARRY-HAND bypass) and CombatClass::update.
+//     All of them run on the game thread that calls those functions (main/logic thread).
+//     ApplyDamage is deliberately NOT hooked (see Install).
 #include "combat_hooks.h"
 #include "ai_hooks.h"
 #include "../core.h"
@@ -17,8 +31,22 @@
 namespace kmp::combat_hooks {
 
 // ── Function Types ──
+// ES: Firmas de las funciones del juego hookeadas. CharacterDeath(personaje, asesino) — muerte
+//     (resuelta por el string "{1} has died from blood loss."); CharacterKO(personaje, atacante,
+//     motivo) — noqueo (string ancla "knockout").
+// EN: Signatures of the hooked game functions. CharacterDeath(character, killer) — death
+//     (resolved via the string "{1} has died from blood loss."); CharacterKO(character, attacker,
+//     reason) — knockout (anchor string "knockout").
 using CharacterDeathFn = void(__fastcall*)(void* character, void* killer);
 using CharacterKOFn = void(__fastcall*)(void* character, void* attacker, int reason);
+// EN: IssueOrder/setJobTarget(character=RCX, target=RDX, immediate=R8b) — `48 8B C4` prologue
+//     (mov rax,rsp); HookManager::InstallAt applies the MovRaxRsp fix automatically. Described
+//     as the REAL function the engine calls when the player clicks a target, replacing the old
+//     "StartAttack" target (0x7B2A20, which RE showed to be "Cutting damage calc"). NOTE: Install()
+//     below states that 0x722EF0 (what funcs.IssueOrder resolves to) is actually UI/MyGUI code
+//     and keeps this hook DISABLED, so this comment is outdated. The type name is kept for
+//     minimal compatibility.
+// ES:
 // IssueOrder/setJobTarget(character=RCX, target=RDX, immediate=R8b) — prólogo `48 8B C4`
 // (mov rax,rsp). HookManager::InstallAt aplica el fix MovRaxRsp automáticamente.
 // Es la función REAL que el motor llama cuando el jugador clica un objetivo (atacar,
@@ -28,6 +56,14 @@ using CharacterKOFn = void(__fastcall*)(void* character, void* attacker, int rea
 using StartAttackFn = void(__fastcall*)(void* character, void* target, void* immediate);
 
 // ── DIAG-PUSHORDER (Fase 4) ──
+// EN: Tasker::pushOrder(Tasker* this, RootObject* subject, int mode) — RVA 0x674300. This is
+//     where the attack order ENTERS the platoon Tasker's map (this = *(char+0x658 ActivePlatoon
+//     +0x98)). Byte-level RE 2026-06-19: attackTarget 0x5CB0A0 → enqueueCombatOrder 0x6744A0
+//     (mode=4) → pushOrder 0x674300. Hooking it confirms at RUNTIME whether the HOST order gets
+//     queued and into WHICH Tasker. The "Tasker mismatch" theory was REFUTED by RE: the AI tick
+//     consumes the right queue (via AI+0x20 → selector → CharBody+0x68), not char+0x448+0xE8.
+//     This DIAG closes the case at runtime; the AUTOTEST measures whether it is CONSUMED.
+// ES:
 // Tasker::pushOrder(Tasker* this, RootObject* subject, int mode) — RVA 0x674300.
 // Es donde la orden de ataque ENTRA en el map del Tasker del platoon
 // (this = *(char+0x658 ActivePlatoon +0x98)). RE 2026-06-19 byte a byte:
@@ -40,6 +76,16 @@ using StartAttackFn = void(__fastcall*)(void* character, void* target, void* imm
 using PushOrderFn = void(__fastcall*)(void* tasker, void* subject, int mode);
 
 // ── DIAG-ADDORDER-BACKEND ──
+// EN: Character::addOrder "normal/replace" backend — RVA 0x5D1940 (thunk 0x274A26, called by
+//     addOrder 0x5D20D0). It is the VALIDATOR that swallows orders: it validates BEFORE queueing
+//     and, if the arm check fails, shows a native speech bubble ("My arm is broken!" / "I can't
+//     carry anyone with this arm.") and returns TRUE ("handled") WITHOUT queueing anything — the
+//     attack/eat/carry order silently disappears. If it passes, it returns FALSE and the order
+//     continues (the Task is built and inserted into the queue at 0x508380).
+//     Signature VERIFIED by static RE 2026-07-12 (function 0x5D1940..0x5D20C3, 0x783 bytes):
+//     only rcx/edx/r8 are used, bool return in al. Clean prologue 40 55 56 57 (NO mov rax,rsp)
+//     → plain MinHook, no MovRaxRsp fix.
+// ES:
 // Character::addOrder backend "normal/replace" — RVA 0x5D1940 (thunk 0x274A26, llamado por
 // addOrder 0x5D20D0). Es el VALIDADOR que traga órdenes: valida ANTES de encolar y, si el
 // chequeo de brazos falla, muestra un globo nativo ("My arm is broken!" / "I can't carry
@@ -53,12 +99,18 @@ using PushOrderFn = void(__fastcall*)(void* tasker, void* subject, int mode);
 using AddOrderBackendFn = bool(__fastcall*)(void* character, int taskType, void* subject);
 
 // ── DIAG-COMBATSEED ──
+// EN: CombatClass::update(float) — RVA 0x60D650. Virtual, void return, one float argument (dt)
+//     → this in rcx, dt in xmm1. CLEAN prologue (no mov rax,rsp) → plain MinHook, so the hook
+//     body CAN read game memory with Memory::Read (SEH), just like Hook_AddOrderBackend.
+// ES:
 // CombatClass::update(float) — RVA 0x60D650, mangled ?update@CombatClass@@UEAAXM@Z.
 // Virtual, retorno void, 1 argumento float (dt) → this en rcx, dt en xmm1. Prólogo LIMPIO
 // (40 53 48 83 EC 20 48 8B D9, sin mov rax,rsp) → MinHook normal, sin el fix MovRaxRsp, así que
 // el hook body PUEDE leer memoria del juego con Memory::Read (SEH) igual que Hook_AddOrderBackend.
 using CombatClassUpdateFn = void(__fastcall*)(void* combatClass, float dt);
 
+// ES: Trampolines a las funciones originales (los rellena HookManager::InstallAt).
+// EN: Trampolines to the original functions (filled in by HookManager::InstallAt).
 static CharacterDeathFn s_origCharDeath    = nullptr;
 static CharacterKOFn    s_origCharKO       = nullptr;
 static StartAttackFn    s_origStartAttack  = nullptr;
@@ -66,12 +118,18 @@ static PushOrderFn      s_origPushOrder    = nullptr;
 static AddOrderBackendFn s_origAddOrderBackend = nullptr;
 static CombatClassUpdateFn s_origCombatClassUpdate = nullptr;
 
+// EN: Host Tasker (see combat_hooks.h), published by the core's [AUTOTEST] (CombatAutotestTick).
+// ES:
 // Tasker del host (char+0x658 ActivePlatoon → +0x98) publicado por el [AUTOTEST] del core
 // (CombatAutotestTick) antes de disparar attackTarget. El hook DIAG-PUSHORDER lo compara con
 // el `this` (Tasker) de cada inserción para saber si la orden ENTRÓ en el Tasker del host.
 // 0 = aún no resuelto. Lo escribe el hilo de lógica (core), lo lee el hook (mismo hilo de juego).
 std::atomic<uintptr_t> g_hostTaskerForDiag{0};
 
+// EN: [DIAG-COMBATSEED] Host CombatClass and AI, published every tick by the logic thread
+//     (PublishHostCombatDiag). The CombatClass::update hook reads them to (a) filter ONLY the
+//     host CombatClass ticks and (b) read AI+0x28.
+// ES:
 // [DIAG-COMBATSEED] CombatClass y AI del host, publicados cada tick por el hilo de lógica
 // (PublishHostCombatDiag, llamada desde ProcessDeferredEvents). El hook de CombatClass::update
 // los lee para (a) filtrar SOLO los ticks del CombatClass del host y (b) leer AI+0x28.
@@ -79,6 +137,14 @@ std::atomic<uintptr_t> g_hostCombatClassForDiag{0};
 std::atomic<uintptr_t> g_hostAiForDiag{0};
 
 // ── DIAG-COMBAT: contadores y ring de eventos StartAttack ──
+// EN: DIAG-COMBAT: counters and StartAttack event ring. Goal: check whether the game's order
+//     function IS CALLED when the player clicks to attack. The hook body cannot use spdlog (it
+//     runs inside the naked MovRaxRsp detour, where a heap allocation corrupts the 4KB stack
+//     gap), so it logs with OutputDebugStringA (stack buffer) and defers structured data to a
+//     ring buffer drained from ProcessDeferredEvents (safe game-tick context).
+//     All the rings in this file follow the same single-producer/single-consumer pattern:
+//     Push drops the event when full; Pop returns false when empty.
+// ES:
 // Objetivo del diagnóstico: comprobar si, cuando el jugador hace clic para atacar,
 // la función StartAttack del juego SE LLAMA o NO. El cuerpo del hook NO puede usar
 // spdlog (corre dentro del naked detour MovRaxRsp, donde una asignación de heap
@@ -87,6 +153,8 @@ std::atomic<uintptr_t> g_hostAiForDiag{0};
 // ring buffer que se vacía desde ProcessDeferredEvents (contexto seguro de game tick).
 static std::atomic<int> s_startAttackCount{0};
 
+// ES: Evento diferido de orden: atacante, objetivo y (reutilizado) el flag `immediate`.
+// EN: Deferred order event: attacker, target and (reused field) the `immediate` flag.
 struct DeferredStartAttack {
     uintptr_t attacker;
     uintptr_t target;
@@ -114,6 +182,10 @@ static bool PopStartAttack(DeferredStartAttack& out) {
 }
 
 // ── DIAG-PUSHORDER: ring de inserciones de orden en el Tasker ──
+// EN: DIAG-PUSHORDER: ring of order insertions into the Tasker. Captures (tasker=this, subject,
+//     mode) of every pushOrder; mode==4 = combat order (the one attackTarget produces). The
+//     deferred log flags whether tasker==hostTasker — direct evidence that queueing WORKS.
+// ES:
 // Capturamos (tasker=this, subject, mode) de cada pushOrder. mode==4 = orden de combate
 // (la que produce attackTarget). El log diferido marca si tasker==hostTasker (la orden del
 // HOST entró en su Tasker) — evidencia directa de que el encolado FUNCIONA.
@@ -146,6 +218,11 @@ static bool PopPushOrder(DeferredPushOrder& out) {
 }
 
 // ── DIAG-ADDORDER-BACKEND: ring de llamadas al validador de órdenes ──
+// EN: DIAG-ADDORDER-BACKEND: ring of calls to the order validator. Captures taskType, pointers,
+//     the medical state bytes the validator checks (char+0x5BD/+0x5BE = canUseArms flags;
+//     [[AI+0x318]+0x166] = arm byte for carrying) and the original's RETURN value
+//     (true = order ABORTED/swallowed, false = order continues).
+// ES:
 // Capturamos taskType, punteros, los bytes de estado médico que el validador consulta
 // (char+0x5BD/+0x5BE = flags canUseArms; [[AI+0x318]+0x166] = byte de brazos para cargar)
 // y el RETORNO del original (true = orden ABORTADA/tragada, false = orden continúa).
@@ -184,6 +261,13 @@ static bool PopAddOrder(DeferredAddOrder& out) {
 }
 
 // ── DIAG-COMBATSEED: ring de snapshots del CombatClass del host ──
+// EN: DIAG-COMBATSEED: ring of host CombatClass snapshots. Each snapshot captures the host
+//     CombatClass state on one CombatClass::update tick: perception counter (+0x200),
+//     currentTarget (+0x290), field +0x1F0, and AI+0x28 (inline AttackState, the target that
+//     attackTarget writes when queueing). The goal is to compare in the log "cold, freshly
+//     claimed host" vs "host after hitting the training dummy" vs "host attacking fine" and find
+//     WHICH field changes (to seed it when claiming the character).
+// ES:
 // Cada snapshot captura el estado del CombatClass del host en un tick de CombatClass::update:
 // contador de percepciones (+0x200), currentTarget (+0x290), campo +0x1F0, y AI+0x28
 // (AttackState inline, el target que attackTarget escribe al encolar). El objetivo es comparar
@@ -220,6 +304,10 @@ static bool PopCombatSeed(DeferredCombatSeed& out) {
     return true;
 }
 
+// EN: DIAG-COMBATSEED session state (same game thread → no locks). s_lastSeenHostCC tells "first
+//     time this host CombatClass is seen" (the pointer changed, e.g. after FIX-COMBATCLASS or a
+//     re-claim) from "already seen".
+// ES:
 // Estado de sesión del DIAG-COMBATSEED (mismo hilo de juego → sin locks).
 // s_lastSeenHostCC diferencia "primera vez que se ve este CombatClass del host" (el puntero
 // cambió, p.ej. tras el FIX-COMBATCLASS o un re-claim) de "ya se había visto".
@@ -228,6 +316,8 @@ static std::atomic<uint32_t>  s_hostCCSeenCount{0};
 static std::atomic<uint64_t>  s_lastSeedLogMs{0};   // GetTickCount64 del último log (throttle)
 
 // ── Hook Health ──
+// ES: Contadores de salud por hook (fallos SEH al llamar al trampolín) que usan los SafeCall_*.
+// EN: Per-hook health counters (SEH failures when calling the trampoline) used by SafeCall_*.
 static HookHealth s_deathHealth{"CharacterDeath"};
 static HookHealth s_koHealth{"CharacterKO"};
 static HookHealth s_startAttackHealth{"StartAttack"};
@@ -236,10 +326,15 @@ static HookHealth s_addOrderHealth{"AddOrderBackend"};
 static HookHealth s_combatSeedHealth{"CombatClassUpdate"};
 
 // ── Diagnostic Counters ──
+// ES: Número total de muertes/KOs vistos por los hooks.
+// EN: Total number of deaths/KOs seen by the hooks.
 static std::atomic<int> s_deathCount{0};
 static std::atomic<int> s_koCount{0};
 
 // ── Echo suppression flags ──
+// ES: Banderas de supresión de eco (ver combat_hooks.h): las activa el packet handler al aplicar
+//     S2C_CombatDeath/S2C_CombatKO para que el hook no reenvíe el evento al servidor.
+// EN: (original below)
 // Set by packet_handler before calling native CharacterDeath/CharacterKO from
 // server-sourced events (S2C_CombatDeath, S2C_CombatKO). When set, the hook
 // skips pushing to the deferred queue, preventing C2S→S2C→C2S echo loops.
@@ -249,6 +344,14 @@ static std::atomic<bool> s_serverSourcedKO{false};
 // ═══════════════════════════════════════════════════════════════════════════
 //  DEFERRED EVENT QUEUE
 //
+//  ES: COLA DE EVENTOS DIFERIDOS. Los hooks de combate corren dentro de detours naked
+//  MovRaxRsp donde: spdlog reserva heap (corrompe el hueco de pila de 4KB), SendReliable
+//  toma el mutex de ENet (deadlock), PacketWriter tiene destructor (el unwinding crashea) y
+//  CharacterAccessor lee memoria del juego (AV en contexto de pila incorrecto).
+//  SOLUCIÓN: el hook hace lo mínimo (llamar al original + capturar IDs en una cola sin
+//  locks) y ProcessDeferredEvents(), desde OnGameTick, hace el log, los paquetes y el envío.
+//
+//  EN:
 //  Combat hooks fire inside MovRaxRsp naked detours where:
 //  - spdlog calls allocate from heap → corrupt the 4KB stack gap
 //  - SendReliable acquires ENet mutex → deadlock if game thread holds it
@@ -260,6 +363,8 @@ static std::atomic<bool> s_serverSourcedKO{false};
 //  OnGameTick context to do logging, packet building, and network sends.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Tipo de evento de combate diferido y su contenido (IDs de red, no punteros del juego).
+// EN: Deferred combat event type and payload (network IDs, not game pointers).
 enum class CombatEventType : uint8_t { Death, KO };
 
 struct DeferredCombatEvent {
@@ -275,6 +380,10 @@ static std::atomic<int> s_eventWriteIdx{0};
 static std::atomic<int> s_eventReadIdx{0};
 static std::atomic<int> s_dropCount{0}; // Tracks events dropped due to full buffer
 
+// ES: Ring buffer sin locks de un productor (hook) y un consumidor (game tick); ambos corren en
+//     el MISMO hilo de juego. PushEvent descarta (y cuenta en s_dropCount) si está lleno;
+//     PopEvent devuelve false si está vacío.
+// EN: (original below)
 // Lock-free single-producer (hook) single-consumer (game tick) ring buffer.
 // Safe because: hooks run on game thread (single producer), ProcessDeferredEvents
 // runs on game thread (single consumer), and both are the SAME thread.
@@ -304,8 +413,17 @@ static bool PopEvent(DeferredCombatEvent& out) {
 //  HOOK BODIES — MINIMAL WORK ONLY
 //  No spdlog. No PacketWriter. No SendReliable. No CharacterAccessor.
 //  Just: call original + push event IDs to ring buffer.
+//  ES: CUERPOS DE HOOK — SOLO TRABAJO MÍNIMO: sin spdlog, PacketWriter, SendReliable ni
+//  CharacterAccessor. Solo llamar al original y encolar los IDs.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ES: Detour de CharacterDeath (RVA 0x7A6200). ANTES: cuenta la muerte. Llama al original
+//     (protegido con SEH) para que la lógica de muerte del juego SIEMPRE corra. DESPUÉS: si no
+//     viene del servidor y hay conexión, traduce personaje/asesino a IDs de red y encola un
+//     evento Death. Corre en el hilo de juego.
+// EN: CharacterDeath detour (RVA 0x7A6200). BEFORE: counts the death. Calls the original
+//     (SEH-protected) so the game's death logic ALWAYS runs. AFTER: if not server-sourced and
+//     connected, maps character/killer to network IDs and queues a Death event. Game thread.
 static void __fastcall Hook_CharacterDeath(void* character, void* killer) {
     s_deathCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -335,6 +453,10 @@ static void __fastcall Hook_CharacterDeath(void* character, void* killer) {
     PushEvent(evt);
 }
 
+// ES: Detour de CharacterKO (RVA 0x345C10). Igual que el de muerte, pero encola un evento KO con
+//     el atacante y el motivo (`reason`, truncado a uint8). Corre en el hilo de juego.
+// EN: CharacterKO detour (RVA 0x345C10). Same as the death one, but queues a KO event with the
+//     attacker and the reason (`reason`, truncated to uint8). Runs on the game thread.
 static void __fastcall Hook_CharacterKO(void* character, void* attacker, int reason) {
     s_koCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -377,6 +499,13 @@ static void __fastcall Hook_CharacterKO(void* character, void* attacker, int rea
 //
 //  IMPORTANTE: este hook NO altera el combate. Llama al original tal cual y solo
 //  registra. Cuerpo mínimo (sin spdlog/heap): OutputDebugStringA + ring buffer.
+//
+//  EN: DIAG-COMBAT: diagnostic hook on StartAttack (LOG ONLY, changes nothing). Tells whether
+//  the player's attack order (click on an NPC) REACHES the engine: if "[DIAG-COMBAT] ... called"
+//  shows up when attacking, the order arrives and the problem is further down (damage calc);
+//  if NOTHING shows, the order is lost earlier (order path, AI or input). It calls the original
+//  unchanged. Minimal body (no spdlog/heap): OutputDebugStringA + ring buffer.
+//  NOTE: this hook is currently NOT installed (see Install: IssueOrder DIAG disabled).
 // ═══════════════════════════════════════════════════════════════════════════
 static void __fastcall Hook_StartAttack(void* character, void* target, void* immediate) {
     int n = s_startAttackCount.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -417,6 +546,12 @@ static void __fastcall Hook_StartAttack(void* character, void* target, void* imm
 //  Cuerpo mínimo: registra (this=Tasker, subject, mode) y marca si this==hostTasker
 //  (publicado por el AUTOTEST). Llama al original SIN modificar. Confirma en runtime que
 //  la orden del host llega a encolarse y a QUÉ Tasker — cierra el "mismatch de Tasker".
+//
+//  EN: DIAG-PUSHORDER: diagnostic hook on Tasker::pushOrder 0x674300 (Phase 4). pushOrder is
+//  where the combat order ENTERS the platoon Tasker's map. Clean prologue (48 85 D2 0F 84 ...),
+//  NO mov rax,rsp → no MovRaxRsp fix needed. Minimal body: records (this=Tasker, subject, mode)
+//  and flags whether this==hostTasker (published by the AUTOTEST). Calls the original UNCHANGED.
+//  Starts disabled; enabled when the game loads.
 // ═══════════════════════════════════════════════════════════════════════════
 static void __fastcall Hook_PushOrder(void* tasker, void* subject, int mode) {
     int n = s_pushOrderCount.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -475,12 +610,30 @@ static void __fastcall Hook_PushOrder(void* tasker, void* subject, int mode) {
 //  juego pero un clon del mod podría tener la cadena AI incompleta). Prólogo limpio
 //  → MinHook normal (sin naked detour), pero mantenemos el patrón del proyecto:
 //  ODS barato en el cuerpo + spdlog diferido desde ProcessDeferredEvents.
+//
+//  EN: DIAG-ADDORDER-BACKEND: diagnostic hook on the order validator 0x5D1940. Normally
+//  READ/LOG ONLY — it forwards the SAME arguments to the original and returns EXACTLY its
+//  result. The "normal/replace" backend of Character::addOrder validates the order BEFORE
+//  queueing it: on failure → native bubble + return TRUE without queueing (the host order is
+//  silently SWALLOWED); on success → return FALSE and the order continues. Per order we log
+//  taskType, pointers, the medical bytes the validator reads, and the verdict.
+//  Validator branches (run by the ORIGINAL; we only read for the log):
+//   - taskType in {4,5,0x10,0x15} and {0x106,0x107}: canUseArms 0x644150 reads char+0x5BD and
+//     char+0x5BE (MedicalSystem inline at char+0x458, flags +0x165/+0x166). Both 0 → aborts
+//     with "My arm is broken!".
+//   - taskType in {0x69,0x44,0xD5,0xAA,0x94,0xE1} (arm actions, incl. CARRY): reads
+//     [[AI+0x318]+0x166] with AI=*(char+0x650). Byte 0 → aborts with "I can't carry anyone
+//     with this arm.".
+//  Reads are SEH-safe via Memory::Read. Clean prologue → plain MinHook. Exception: the
+//  FIX-CARRY-HAND block below DOES change behavior (skips the original for the host carry
+//  order when the "hand" pointer is corrupt). Runs on the game thread that calls addOrder.
 // ═══════════════════════════════════════════════════════════════════════════
 static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void* subject) {
     int n = s_addOrderCount.fetch_add(1, std::memory_order_relaxed) + 1;
 
     uintptr_t charU = reinterpret_cast<uintptr_t>(character);
 
+    // EN: SEH-safe diagnostic reads (0xFF = unreadable) BEFORE calling the original.
     // ── Lecturas de diagnóstico SEH-safe (0xFF = ilegible) ANTES del original ──
     uint8_t arm5BD = 0xFF, arm5BE = 0xFF, carryArm = 0xFF;
     uintptr_t ai = 0, aiSub = 0;
@@ -494,6 +647,19 @@ static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void*
         }
     }
 
+    // EN: FIX-CARRY-HAND: gate bypass for the host CARRY order when "hand" is corrupt.
+    //     The host clone has [AI+0x318] ('aiSub') pointing at a static .rdata vtable (INSIDE the
+    //     game module, read-only) instead of a real heap instance. The native gate reads
+    //     [aiSub+0x166] (a constant byte, always 0) and aborts with "I can't carry anyone with
+    //     this arm.". Patching that byte would corrupt a vtable shared by ALL characters.
+    //     Static RE (2026-07-13, full .text scan): no game code uses this "hand" pointer as the
+    //     `this` of a virtual call, and the actual pickup (Character_Pick_Up_Person, RVA
+    //     0x34FBE0) never re-reads [AI+0x318], so skipping the gate here equals the native
+    //     "arms OK" branch. Two conditions must BOTH hold: (1) taskType is an arm/carry action;
+    //     (2) aiSub lies inside [base, base+size) of the game module (a real heap hand never
+    //     does). IsHost() is process-wide (this process hosts the session), not per character,
+    //     so it may also fire for NPCs/remote clones with the same clone bug — harmless per RE.
+    // ES:
     // ── FIX-CARRY-HAND: bypass del gate para la orden de CARGA del host con "hand" corrupto ──
     // El clon del host tiene [AI+0x318] (aquí la variable 'aiSub') apuntando a una vtable
     // estática de .rdata (DENTRO del módulo del juego, memoria de solo lectura) en vez de a una
@@ -532,6 +698,8 @@ static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void*
                           "modulo, vtable .rdata) -> bypass gate, orden continua\n",
                           (unsigned)taskType, (unsigned long long)aiSub);
                 OutputDebugStringA(dbg);
+                // EN: return false == native "arm OK" branch: do NOT forward to the original
+                //     gate (0x5D1940); the caller continues the normal queueing pipeline.
                 // return false == rama "arm OK" nativa: NO reenviar al gate original (0x5D1940);
                 // el caller sigue el pipeline de encolado normal y la orden de carga continúa.
                 return false;
@@ -539,12 +707,16 @@ static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void*
         }
     }
 
+    // EN: Call the original with the SAME arguments and capture its return value.
     // ── Llama al original con los MISMOS argumentos y captura su retorno ──
     bool ret = false;
     bool callOk = SafeCall_Bool_PtrIPtr(reinterpret_cast<void*>(s_origAddOrderBackend),
                                         character, taskType, subject,
                                         &ret, &s_addOrderHealth);
 
+    // EN: Cheap immediate log (stack buffer, no heap) visible in DebugView. SWALLOWED orders
+    //     (ret=true) are ALWAYS logged; the rest throttled (first 50, then 1 in 50) because the
+    //     AI also calls this backend, not only the player.
     // ── Log inmediato barato (buffer de pila, sin heap) — visible en DebugView ──
     // Las órdenes TRAGADAS (ret=true) se loguean SIEMPRE (son el objetivo del DIAG);
     // el resto con throttle (primeras 50 y 1 de cada 50) — el backend también lo
@@ -563,6 +735,7 @@ static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void*
         OutputDebugStringA(dbg);
     }
 
+    // EN: Defer to the structured (spdlog) log from the game tick.
     // ── Difiere para el log estructurado (spdlog) desde el game tick ──
     DeferredAddOrder e{};
     e.character = charU;
@@ -577,6 +750,8 @@ static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void*
     e.callOk    = callOk ? 1 : 0;
     PushAddOrder(e);
 
+    // EN: Return EXACTLY what the original returned (if the trampoline failed, false = "not
+    //     handled" → the caller follows the normal pipeline, safe degradation).
     // Devuelve EXACTAMENTE lo que devolvió el original (si el trampoline falló,
     // false = "no manejada" → el caller sigue el pipeline normal, degradación segura).
     return ret;
@@ -600,11 +775,22 @@ static bool __fastcall Hook_AddOrderBackend(void* character, int taskType, void*
 //  El CombatClass del host lo publica el hilo de lógica (PublishHostCombatDiag →
 //  g_hostCombatClassForDiag); el hook solo compara su `this` contra esa caché (fast path para
 //  los NPCs: una carga atómica + comparación + llamada al original).
+//
+//  EN: DIAG-COMBATSEED: diagnostic hook on CombatClass::update(float) 0x60D650. READ/LOG ONLY —
+//  calls the original with the SAME args (this=rcx, dt=xmm1) and changes no game value.
+//  CombatClass::update is the combat AI tick that consumes the perception array
+//  (CombatClass+0x208, counter +0x200) to produce currentTarget (CombatClass+0x290) and fire
+//  Task_MeleeAttack. Hypothesis: on a freshly claimed host that "start-up" does not happen cold
+//  but does after hitting the dummy. For the host CombatClass ONLY, this hook captures the
+//  state (throttled ~1.5 s, always on firstSight) to find WHICH field changes. The host
+//  CombatClass is published by the logic thread; for NPCs the hook is just an atomic load +
+//  compare + call to the original. Runs on the game thread, once per character per frame.
 // ═══════════════════════════════════════════════════════════════════════════
 static void __fastcall Hook_CombatClassUpdate(void* combatClass, float dt) {
     uintptr_t cc = reinterpret_cast<uintptr_t>(combatClass);
     uintptr_t hostCC = g_hostCombatClassForDiag.load(std::memory_order_acquire);
 
+    // EN: Fast path: only the HOST CombatClass is instrumented; for NPCs call the original and leave.
     // Fast path: solo instrumentamos el CombatClass del HOST. Para el resto (NPCs) llamamos al
     // original y salimos — el tick corre para muchos personajes cada frame, coste mínimo aquí.
     if (hostCC == 0 || cc != hostCC) {
@@ -613,6 +799,9 @@ static void __fastcall Hook_CombatClassUpdate(void* combatClass, float dt) {
         return;
     }
 
+    // EN: Host CombatClass tick. firstSight = the pointer changed since last seen (new instance
+    //     created by FIX-COMBATCLASS or a re-claim); resets the counter so "seen" counts ticks
+    //     since that moment.
     // ── Es el tick del CombatClass del host ──
     // firstSight: el puntero del CombatClass del host cambió respecto al último visto → es una
     // instancia nueva (FIX-COMBATCLASS la creó, o el char se re-reclamó). Reinicia el contador
@@ -622,6 +811,7 @@ static void __fastcall Hook_CombatClassUpdate(void* combatClass, float dt) {
     if (firstSight) s_hostCCSeenCount.store(0, std::memory_order_relaxed);
     uint32_t seen = s_hostCCSeenCount.fetch_add(1, std::memory_order_relaxed) + 1;
 
+    // EN: Throttle: ALWAYS on firstSight; otherwise once every ~1.5 s.
     // Throttle: SIEMPRE en firstSight (captura el instante del reclamo/creación); el resto, 1 vez
     // cada ~1.5s (el tick corre ~1/frame para el host y no queremos inundar el log).
     uint64_t now = GetTickCount64();
@@ -631,6 +821,8 @@ static void __fastcall Hook_CombatClassUpdate(void* combatClass, float dt) {
     if (doLog) {
         s_lastSeedLogMs.store(now, std::memory_order_relaxed);
 
+        // EN: SEH-safe reads of the host CombatClass fields (0 = unreadable), done BEFORE the
+        //     original so they capture the persistent state left by the previous tick.
         // Lecturas SEH-safe de los campos del CombatClass del host (0 = ilegible). Se leen ANTES
         // del original: capturan el estado persistente que dejó el tick anterior (currentTarget,
         // contador de percepciones), que es justo lo que cambia entre "frío" y "tras entrenar".
@@ -666,6 +858,7 @@ static void __fastcall Hook_CombatClassUpdate(void* combatClass, float dt) {
         PushCombatSeed(e);
     }
 
+    // EN: Call the original UNCHANGED — the AI tick must run exactly the same.
     // Llama al original SIN modificar — el AI tick debe ejecutarse exactamente igual.
     SafeCall_Void_PtrF(reinterpret_cast<void*>(s_origCombatClassUpdate),
                        combatClass, dt, &s_combatSeedHealth);
@@ -676,6 +869,11 @@ static void __fastcall Hook_CombatClassUpdate(void* combatClass, float dt) {
 // del host y su cadena CharBody(*(char+0x648)) → CombatClass(*(CharBody+0x8)), y AI(*(char+0x650)),
 // todo con Memory::Read SEH-safe. Si algún paso falla, deja la caché como está (el hook simplemente
 // no marca ticks hasta que se resuelva). NO escribe memoria del juego.
+// EN: [DIAG-COMBATSEED] Publishes the host CombatClass and AI for the hook. Runs on the LOGIC
+//     THREAD (ProcessDeferredEvents), throttled to 250 ms, host only. Resolves the host primary
+//     character and the chain CharBody(*(char+0x648)) → CombatClass(*(CharBody+0x8)), plus
+//     AI(*(char+0x650)), all via SEH-safe Memory::Read. On failure the cache is left as is.
+//     It does NOT write game memory.
 static void PublishHostCombatDiag(Core& core) {
     if (!core.IsHost()) return;
 
@@ -701,6 +899,8 @@ static void PublishHostCombatDiag(Core& core) {
 // [DIAG-COMBATSEED] Vaciado del ring (log estructurado spdlog, contexto seguro de game tick).
 // Una línea por snapshot con TODO: puntero del CombatClass, contador de percepciones, currentTarget,
 // AI+0x28 y las marcas firstSight/seen para reconstruir la secuencia frío→entreno→ataque OK.
+// EN: [DIAG-COMBATSEED] Drains the ring into spdlog (safe game-tick context), max 32 per tick,
+//     one line per snapshot.
 static void DrainCombatSeedRing() {
     DeferredCombatSeed cs;
     int n = 0;
@@ -714,6 +914,9 @@ static void DrainCombatSeedRing() {
     }
 }
 
+// ES: Lee la salud del pecho con CharacterAccessor bajo SEH; si falla devuelve -100 (se asume
+//     muerto). La función existe aparte porque __try no admite objetos C++ con destructor.
+// EN: (original below; returns -100 = assume dead on read failure)
 // ── SEH wrapper for reading health (no C++ objects allowed in __try) ──
 static float SEH_ReadChestHealth(void* gameObj) {
     __try {
@@ -724,6 +927,8 @@ static float SEH_ReadChestHealth(void* gameObj) {
     }
 }
 
+// ES: Lee la salud de las 7 partes del cuerpo bajo SEH; si falla rellena -100 y devuelve false.
+// EN: (original below; fills -100 and returns false on failure)
 // ── SEH wrapper for reading all 7 limb health values ──
 static bool SEH_ReadAllLimbHealth(void* gameObj, float outHealth[7]) {
     __try {
@@ -738,6 +943,9 @@ static bool SEH_ReadAllLimbHealth(void* gameObj, float outHealth[7]) {
     }
 }
 
+// ES: Envía C2S_LimbHealth (entityId + 7 floats de salud) por canal fiable tras un evento de
+//     combate. Solo desde el game tick (usa PacketWriter y SendReliable).
+// EN: (original below; game-tick context only, uses PacketWriter and SendReliable)
 // ── Helper: send C2S_LimbHealth for an entity after a combat event ──
 static void SendLimbHealthUpdate(EntityID entityId, void* gameObj) {
     if (!gameObj) return;
@@ -756,12 +964,17 @@ static void SendLimbHealthUpdate(EntityID entityId, void* gameObj) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  DEFERRED PROCESSING — called from Core::OnGameTick (safe context)
 //  Here we can safely: log, build packets, send via ENet, read game memory.
+//  ES: PROCESADO DIFERIDO — se llama desde Core::OnGameTick (contexto seguro): aquí sí se
+//  puede loguear, construir paquetes, enviar por ENet y leer memoria del juego.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── DIAG-ADDORDER-BACKEND: vaciado del ring (log estructurado, contexto seguro) ──
 // Compartido por la rama offline y la conectada: el DIAG del validador aplica igual
 // en single-player del host (el bug de órdenes tragadas no depende de la conexión).
 // Una sola línea por evento con TODO: taskType, punteros, bytes médicos y veredicto.
+// EN: DIAG-ADDORDER-BACKEND ring drain (structured log, safe context), shared by the offline and
+//     connected branches; max 32 per tick, one line per event with taskType, pointers, medical
+//     bytes and verdict.
 static void DrainAddOrderRing() {
     DeferredAddOrder ao;
     int aoN = 0;
@@ -776,14 +989,25 @@ static void DrainAddOrderRing() {
     }
 }
 
+// ES: Punto de entrada por tick (hilo de lógica/juego). Publica el estado DIAG del host; si no
+//     hay conexión vacía la cola de red sin enviar y solo vuelca los logs DIAG; conectado, vacía
+//     los rings DIAG y envía hasta 64 eventos Death/KO por tick (con snapshot de salud de miembros).
+// EN: Per-tick entry point (logic/game thread). Publishes the host DIAG state; when disconnected
+//     it drains the network queue without sending and only flushes DIAG logs; when connected it
+//     drains the DIAG rings and sends up to 64 Death/KO events per tick (with a limb-health snapshot).
 void ProcessDeferredEvents() {
     auto& core = Core::Get();
 
+    // EN: [DIAG-COMBATSEED] Publish host CombatClass/AI FIRST (also applies in host single-player).
     // [DIAG-COMBATSEED] Publica el CombatClass/AI del host para el hook de CombatClass::update.
     // Va lo PRIMERO (antes del check de conexión) porque aplica igual en single-player del host.
     PublishHostCombatDiag(core);
 
     if (!core.IsConnected()) {
+        // ES: Desconectado: vaciar la cola de red sin procesarla. Los rings DIAG se siguen
+        //     volcando al log porque el diagnóstico aplica también al host en single-player.
+        // EN: Disconnected: the DIAG rings are still flushed to the log (DIAG also applies to
+        //     host single-player).
         // Drain queue without processing if disconnected
         DeferredCombatEvent discard;
         while (PopEvent(discard)) {}
@@ -818,12 +1042,15 @@ void ProcessDeferredEvents() {
         return;
     }
 
+    // ES: Informa y reinicia el contador de eventos descartados (no se puede loguear en el hook).
     // Report and reset drop counter (can't log from hook context, so we log here)
     int dropped = s_dropCount.exchange(0, std::memory_order_relaxed);
     if (dropped > 0) {
         spdlog::warn("combat_hooks: {} combat events DROPPED (ring buffer was full)", dropped);
     }
 
+    // EN: DIAG-COMBAT: drain the StartAttack ring, resolving attacker/target network IDs to see
+    //     WHO attacks WHOM and whether they are registered network entities.
     // ── DIAG-COMBAT: vaciado del ring de StartAttack (log estructurado seguro) ──
     // Aquí (game tick) sí podemos usar spdlog y consultar el registro de entidades.
     // Resolvemos netId del atacante y del objetivo para entender QUIÉN ataca a QUIÉN
@@ -843,6 +1070,10 @@ void ProcessDeferredEvents() {
         }
     }
 
+    // EN: DIAG-PUSHORDER: drain the ring. `mode=4 isHost=1` after the AUTOTEST fires means the
+    //     host attack order DOES enter its queue; the AUTOTEST then measures whether it is consumed.
+    //     pushOrder host+mode4 YES + AUTOTEST amIdle=1 → queued but the AI tick does not consume it;
+    //     pushOrder host+mode4 NO → the order never arrives (isAlly / faction gate).
     // ── DIAG-PUSHORDER: vaciado del ring (log estructurado seguro) ──
     // mode==4 = orden de combate (la que genera attackTarget). isHost=1 → la orden se insertó en
     // el Tasker del HOST. Si vemos `mode=4 isHost=1` tras el disparo del AUTOTEST → la orden de
@@ -874,6 +1105,13 @@ void ProcessDeferredEvents() {
     while (PopEvent(evt) && processed < 64) { // Cap per tick to avoid stalls
         processed++;
 
+        // ES: Se envían eventos de CUALQUIER entidad registrada (no solo propias): si A mata a un
+        //     personaje de B, la muerte ocurre en la máquina de A y debe llegar al servidor. El
+        //     eco ya se filtró en el hook; lo que llega aquí es combate local genuino.
+        //     Death → C2S_CombatDeath(entity, killer); KO → C2S_CombatKO(entity, attacker,
+        //     reason, salud del pecho). Ambos seguidos de C2S_LimbHealth.
+        // EN: Death → C2S_CombatDeath(entity, killer); KO → C2S_CombatKO(entity, attacker,
+        //     reason, chest health). Both followed by C2S_LimbHealth.
         // Send events for ANY registered entity (not just owned).
         // Cross-player combat: when player A kills player B's character,
         // the death fires on A's machine and must be reported to the server.
@@ -932,15 +1170,34 @@ void ProcessDeferredEvents() {
 //  corrigió allí la firma del retorno (era `char`, truncaba el puntero de 64 bits a 1 byte —
 //  causa directa del crash game+0x9A18DA; el real es `void*`). Temáticamente BuyItem es de
 //  comercio/inventario, no de combate, así que inventory_hooks.cpp es su sitio correcto.
+//
+//  EN: FIX-UAF-BUYITEM (0x74A630) — MOVED to inventory_hooks.cpp (2026-07-14). The use-after-free
+//  guard on BuyItem's return value was removed from here and merged into the BuyItem network sync
+//  hook in inventory_hooks.cpp, because both hooks targeted the SAME RVA and MinHook deduplicates
+//  by address (the second MH_CreateHook was silently rejected with MH_ERROR_ALREADY_CREATED).
+//  There the return type was also fixed (it was `char`, truncating the 64-bit pointer — direct
+//  cause of the game+0x9A18DA crash; the real type is `void*`).
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Install/Uninstall ──
 
+// ES: Instala los hooks de combate usando las direcciones ya resueltas por el escáner
+//     (core.GetGameFunctions()). Death y KO quedan activos; PushOrder y CombatClassUpdate se
+//     instalan deshabilitados (se activan al cargar partida); AddOrderBackend queda activo
+//     desde el arranque; IssueOrder/StartAttack NO se instala. Los que no se resolvieron se omiten.
+// EN: Installs the combat hooks using the addresses already resolved by the scanner
+//     (core.GetGameFunctions()). Death and KO are active; PushOrder and CombatClassUpdate are
+//     installed disabled (enabled on game load); AddOrderBackend is active from startup;
+//     IssueOrder/StartAttack is NOT installed. Unresolved ones are skipped.
 bool Install() {
     auto& core = Core::Get();
     auto& hookMgr = HookManager::Get();
     auto& funcs = core.GetGameFunctions();
 
+    // ES: NO hookear ApplyDamage (0x7A33A0): prólogo `mov rax, rsp` y cientos de llamadas por
+    //     tick de combate; los slots globales de RSP del wrapper MovRaxRsp se corrompen → crash
+    //     determinista al "atacar sin provocación". El daño se sincroniza con muerte/KO + sondeo
+    //     de salud.
     // ═══ DO NOT HOOK ApplyDamage ═══
     // ApplyDamage (0x7A33A0) uses `mov rax, rsp` prologue and fires hundreds
     // of times per combat tick. The MovRaxRsp wrapper's global RSP slots corrupt
@@ -963,6 +1220,10 @@ bool Install() {
                           &Hook_CharacterKO, &s_origCharKO);
     }
 
+    // EN: DIAG-COMBAT on IssueOrder: DISABLED. 0x722EF0 (what funcs.IssueOrder resolves to) is NOT
+    //     the player order: byte-level RE (2026-06-18) showed it builds a MyGUI::UString → UI code.
+    //     Hooking it adds risk for nothing, so it stays off until the real order RVA is resolved.
+    //     Hook_StartAttack is kept in case it is re-pointed to the right function.
     // ═══ DIAG-COMBAT en IssueOrder: DESHABILITADO ═══
     // 0x722EF0 (que funcs.IssueOrder resuelve) NO es la orden del jugador: el RE de bytes
     // (doble verificación 2026-06-18) demostró que construye un MyGUI::UString → es UI/GUI,
@@ -975,6 +1236,9 @@ bool Install() {
                  "Tasker/GOAPTaskMgr (RVA sin resolver).",
                  reinterpret_cast<uintptr_t>(funcs.IssueOrder));
 
+    // EN: DIAG-PUSHORDER on Tasker::pushOrder 0x674300 — the real queueing function (unique AOB,
+    //     clean prologue). Installed DISABLED and enabled on game load
+    //     (Core::OnGameLoaded → HookManager::Enable("PushOrder")). Log only.
     // ═══ DIAG-PUSHORDER en Tasker::pushOrder 0x674300 ═══
     // ESTA SÍ es la función de encolado real (RE byte a byte 2026-06-19, AOB único, prólogo
     // limpio sin mov rax,rsp). Confirma en runtime si la orden de ataque del HOST entra en su
@@ -992,6 +1256,9 @@ bool Install() {
         spdlog::warn("combat_hooks: [DIAG-PUSHORDER] funcs.PushOrder no resuelto — DIAG no disponible");
     }
 
+    // EN: DIAG-ADDORDER-BACKEND on the Character::addOrder backend 0x5D1940 (the validator that
+    //     swallows orders). Clean prologue → plain MinHook. Installed ACTIVE from startup (unlike
+    //     PushOrder) to capture orders from the very first moment.
     // ═══ DIAG-ADDORDER-BACKEND en Character::addOrder backend 0x5D1940 ═══
     // El VALIDADOR que traga órdenes (RE 2026-07-11/12): si el chequeo de brazos falla,
     // devuelve true SIN encolar → la orden de atacar/comer/cargar del host desaparece en
@@ -1011,6 +1278,10 @@ bool Install() {
                      "DIAG no disponible");
     }
 
+    // EN: DIAG-COMBATSEED on CombatClass::update(float) 0x60D650. Installed DISABLED and enabled
+    //     on game load (Core::SetConnected / OnGameLoaded → Enable("CombatClassUpdate")), because
+    //     it fires for EVERY character each frame and must not run during the 130+ creations of
+    //     the load. Read/log only.
     // ═══ DIAG-COMBATSEED en CombatClass::update(float) 0x60D650 ═══
     // Hook de SOLO diagnóstico del AI tick de combate. Prólogo limpio (40 53 48 83 EC 20 48 8B D9,
     // sin mov rax,rsp) → MinHook normal. Se instala DESHABILITADO y se activa al cargar el juego
@@ -1029,6 +1300,8 @@ bool Install() {
                      "DIAG no disponible");
     }
 
+    // EN: FIX-UAF-BUYITEM: MOVED to inventory_hooks.cpp; the only detour on 0x74A630 is now
+    //     installed by inventory_hooks::Install().
     // ═══ FIX-UAF-BUYITEM: MOVIDO a inventory_hooks.cpp (2026-07-14) ═══
     // El guard del retorno de BuyItem (0x74A630) ya NO se instala aquí. Se fusionó con el hook de
     // sync de red de BuyItem en inventory_hooks.cpp para evitar la colisión de dos hooks sobre la
@@ -1043,6 +1316,8 @@ bool Install() {
     return true;
 }
 
+// ES: Quita todos los hooks de combate (incluido "StartAttack", que hoy nunca se instala).
+// EN: Removes all combat hooks (including "StartAttack", which is currently never installed).
 void Uninstall() {
     HookManager::Get().Remove("CharacterDeath");
     HookManager::Get().Remove("CharacterKO");
@@ -1055,6 +1330,8 @@ void Uninstall() {
     spdlog::info("combat_hooks: Uninstalled");
 }
 
+// ES: Activan/desactivan la supresión de eco para muertes y KOs aplicados desde el servidor.
+// EN: Enable/disable echo suppression for server-applied deaths and KOs.
 void SetServerSourcedDeath(bool active) {
     s_serverSourcedDeath.store(active, std::memory_order_release);
 }
