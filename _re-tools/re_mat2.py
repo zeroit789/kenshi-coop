@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
+# ES: Desensambla la "rama del personaje vivo" 0x5CD1C0 (ejecuta el Task vía char+0x448+0xE8), anotando
+#     calls (con thunks), calls indirectos y cadenas referenciadas. Uso: python re_mat2.py
+# EN: Disassembles the "live character branch" 0x5CD1C0 (runs the Task through char+0x448+0xE8),
+#     annotating calls (with thunks), indirect calls and referenced strings. Usage: python re_mat2.py
+
 import struct
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind, Register
 EXE=r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"; IB=0x140000000
 DATA=open(EXE,"rb").read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e=struct.unpack_from("<I",DATA,0x3C)[0]; coff=e+4
 ns=struct.unpack_from("<H",DATA,coff+2)[0]; osz=struct.unpack_from("<H",DATA,coff+16)[0]
 so=coff+20+osz; SEC=[]
@@ -11,10 +18,14 @@ for i in range(ns):
     vs=struct.unpack_from("<I",DATA,o+8)[0]; rv=struct.unpack_from("<I",DATA,o+12)[0]
     rs=struct.unpack_from("<I",DATA,o+16)[0]; ro=struct.unpack_from("<I",DATA,o+20)[0]
     SEC.append((nm,rv,vs,ro,rs))
+# ES: RVA -> offset en el fichero (None si el RVA no tiene datos en disco).
+# EN: RVA -> file offset (None if the RVA has no on-disk data).
 def r2o(r):
     for nm,sr,vs,ro,rs in SEC:
         if sr<=r<sr+max(vs,rs) and r-sr<rs: return ro+(r-sr)
     return None
+# ES: Si en rva hay un JMP (thunk), lo sigue recursivamente (máx. 4 saltos) hasta la función real.
+# EN: If there is a JMP (thunk) at rva, follows it recursively (max 4 hops) to the real function.
 def resolve_thunk(rva,depth=0):
     if depth>4: return rva,""
     o=r2o(rva)
@@ -26,8 +37,14 @@ def resolve_thunk(rva,depth=0):
         real=ins.near_branch_target-IB; r2,_=resolve_thunk(real,depth+1)
         return r2,f" (thunk->0x{r2:X})"
     return rva,""
+# ES: Formateador Intel con prefijo 0x y mapa valor -> nombre de registro (RN).
+# EN: Intel formatter with 0x prefix and value -> register name map (RN).
 fmt=Formatter(FormatterSyntax.INTEL); fmt.hex_prefix="0x"; fmt.hex_suffix=""
 RN={getattr(Register,n):n for n in dir(Register) if isinstance(getattr(Register,n),int) and not n.startswith("_")}
+# ES: Desensambla maxlen bytes desde rva anotando destinos de call (con thunks resueltos), calls
+#     indirectos y otros datos; se detiene en int3 (relleno) y, si stop_ret, en el primer ret.
+# EN: Disassembles maxlen bytes from rva annotating call targets (thunks resolved), indirect
+#     calls and other details; stops at int3 (padding) and, if stop_ret, at the first ret.
 def dis(rva,maxlen,label,stop_ret=False):
     print(f"\n{'='*92}\n=== {label}  RVA 0x{rva:X} ===\n{'='*92}")
     o=r2o(rva); code=DATA[o:o+maxlen]

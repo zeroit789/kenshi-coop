@@ -1,5 +1,17 @@
+# ES: Verificación de las direcciones del panel de pausa: bytes de updatePauseUI (0x6E20D0) y si
+#     coinciden con el prefijo esperado, que el contenedor 0x21337B0 está en .data, bytes de
+#     setPaused (0x787D40) y del getter 0x720F50 (mov rax,[rcx+2C8]; ret), y unicidad en .text de los
+#     patrones AOB de updatePauseUI y setPaused. Carga k_setup.py desde C:/Users/Zero/ktmp.
+#     Uso: python k_verify.py
+# EN: Pause-panel address verification: bytes of updatePauseUI (0x6E20D0) and whether they match the
+#     expected prefix, that container 0x21337B0 is in .data, bytes of setPaused (0x787D40) and of the
+#     getter 0x720F50 (mov rax,[rcx+2C8]; ret), and uniqueness in .text of the updatePauseUI and
+#     setPaused AOB patterns. Loads k_setup.py from C:/Users/Zero/ktmp. Usage: python k_verify.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 
+# ES: Bytes en hexadecimal de [rva, rva+n).
+# EN: Hex bytes of [rva, rva+n).
 def hexbytes(rva,n): return ' '.join(f'{data[rva+i]:02X}' for i in range(n))
 
 print("=== 1. Bytes en 0x6E20D0 (updatePauseUI) ===")
@@ -18,7 +30,10 @@ print("\n=== 4. getter 0x720F50 (mov rax,[rcx+2C8]; ret) ===")
 print(hexbytes(0x720F50,8))
 
 # Verificar unicidad de AOB updatePauseUI en .text
+# EN: Check uniqueness of the updatePauseUI AOB in .text
 import re
+# ES: Cuenta coincidencias del patrón AOB (?? = comodín) en .text; devuelve (número, primer RVA).
+# EN: Counts matches of the AOB pattern (?? = wildcard) in .text; returns (count, first RVA).
 def count_aob(aob_str):
     toks=aob_str.split(); pat=bytearray(); mask=[]
     for t in toks:

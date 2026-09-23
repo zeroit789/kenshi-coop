@@ -1,3 +1,8 @@
+# ES: Busca en .text todos los thunks "jmp rel32" (opcode E9) que saltan a la función 0x796C40.
+#     Uso: python _t2.py. Imprime la lista de RVAs de los thunks.
+# EN: Searches .text for every "jmp rel32" thunk (opcode E9) that jumps to function 0x796C40.
+#     Usage: python _t2.py. Prints the list of thunk RVAs.
+
 import pefile
 PATH=r"E:/SteamLibrary/steamapps/common/Kenshi/kenshi_x64.exe"
 pe=pefile.PE(PATH, fast_load=True)

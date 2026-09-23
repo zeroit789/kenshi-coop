@@ -1,8 +1,16 @@
+# ES: Igual que _scan448.py pero para el desplazamiento 0xE8: lista todas las escrituras
+#     "mov [reg+0xE8], reg" (sin SIB, REX.W) en .text de kenshi_x64.exe.
+#     Uso: python _scanE8.py
+# EN: Same as _scan448.py but for displacement 0xE8: lists every
+#     "mov [reg+0xE8], reg" write (no SIB, REX.W) in .text of kenshi_x64.exe.
+#     Usage: python _scanE8.py
+
 import ke_re as k
 pe,data=k._load()
 text=[s for s in pe.sections if b".text" in s.Name][0]
 start=text.PointerToRawData; end=start+text.SizeOfRawData; base=text.VirtualAddress
 # Buscar mov [reg+0xE8], reg  (disp32 = E8 00 00 00) sin SIB, REX.W
+# EN: Find mov [reg+0xE8], reg (disp32 = E8 00 00 00) without SIB, REX.W
 disp=bytes([0xE8,0x00,0x00,0x00])
 res=[]
 i=start

@@ -1,14 +1,25 @@
+# ES: Versión generalizada de ke_findvt.py: busca vtables de .rdata (alineadas a 8) cuyo RVA termina
+#     en el sufijo hexadecimal dado (por defecto 0x6338; la máscara depende del número de dígitos).
+#     Uso: python ke_findvt2.py [sufijo_hex]
+# EN: Generalized version of ke_findvt.py: searches .rdata vtables (8-aligned) whose RVA ends in the
+#     given hex suffix (default 0x6338; the mask depends on the number of digits).
+#     Usage: python ke_findvt2.py [suffix_hex]
+
 import pefile, struct, sys
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IB = 0x140000000
 pe = pefile.PE(EXE, fast_load=True)
 img = pe.get_memory_mapped_image()
+# ES: Lectores little-endian por RVA (None si falla).
+# EN: Little-endian readers by RVA (None on failure).
 def u32(rva): 
     try: return struct.unpack("<I",img[rva:rva+4])[0]
     except: return None
 def u64(rva): 
     try: return struct.unpack("<Q",img[rva:rva+8])[0]
     except: return None
+# ES: Nombre RTTI (".?AV...") de la vtable vía COL (firma 0/1) y TypeDescriptor, o None.
+# EN: RTTI name (".?AV...") of the vtable through the COL (signature 0/1) and TypeDescriptor, or None.
 def name_of_vtable(vt_rva):
     try:
         colp=u64(vt_rva-8)
@@ -29,6 +40,7 @@ for s in pe.sections:
 suffix = int(sys.argv[1],16) if len(sys.argv)>1 else 0x6338
 smask = (1<<(4*len(sys.argv[1].replace('0x','')))) -1 if len(sys.argv)>1 else 0xFFFF
 # escanear alineado a 8 (vtables alineadas a 8)
+# EN: scan 8-aligned (vtables are 8-aligned)
 r = rd_start - (rd_start % 8)
 hits=[]
 while r < rd_end:

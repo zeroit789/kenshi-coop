@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
+# ES: Localiza la(s) vtable(s) de una clase por su nombre RTTI (".?AV<clase>@@" -> TypeDescriptor ->
+#     COL -> vtable) y vuelca sus slots mientras apunten a .text, resolviendo thunks JMP.
+#     Uso: python re_rtti_vt.py <Clase> [nslots=80]
+# EN: Finds a class's vtable(s) by RTTI name (".?AV<class>@@" -> TypeDescriptor -> COL -> vtable) and
+#     dumps its slots while they point into .text, resolving JMP thunks.
+#     Usage: python re_rtti_vt.py <Class> [nslots=80]
+
 # READ-ONLY: localiza vtable por nombre RTTI y vuelca N slots (resolviendo thunks JMP).
+# EN: READ-ONLY: finds a vtable by RTTI name and dumps N slots (resolving JMP thunks).
 import struct, sys
 from iced_x86 import Decoder, Mnemonic, FlowControl
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IMAGE_BASE = 0x140000000
 with open(EXE, "rb") as f: DATA = f.read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE.
+# EN: Section table parsed by hand from the PE headers.
 e_lfanew = struct.unpack_from("<I", DATA, 0x3C)[0]; coff = e_lfanew + 4
 num_sec = struct.unpack_from("<H", DATA, coff + 2)[0]; opt_size = struct.unpack_from("<H", DATA, coff + 16)[0]
 sec_off = coff + 20 + opt_size; SECTIONS = []
@@ -14,6 +24,8 @@ for i in range(num_sec):
     vsize = struct.unpack_from("<I", DATA, o+8)[0]; rva = struct.unpack_from("<I", DATA, o+12)[0]
     raw_size = struct.unpack_from("<I", DATA, o+16)[0]; raw_off = struct.unpack_from("<I", DATA, o+20)[0]
     SECTIONS.append((name, rva, vsize, raw_off, raw_size))
+# ES: RVA -> offset de fichero, sección de un RVA, lecturas qword/dword y resolución de thunks.
+# EN: RVA -> file offset, section of an RVA, qword/dword reads and thunk resolution.
 def rva_to_off(rva):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if srva <= rva < srva + max(vsize, raw_size):
@@ -28,6 +40,8 @@ def rd_qword(rva):
     off = rva_to_off(rva); return struct.unpack_from("<Q", DATA, off)[0] if off is not None else None
 def rd_dword(rva):
     off = rva_to_off(rva); return struct.unpack_from("<I", DATA, off)[0] if off is not None else None
+# ES: Si en rva hay un JMP (thunk), lo sigue recursivamente (máx. 4 saltos) hasta la función real.
+# EN: If there is a JMP (thunk) at rva, follows it recursively (max 4 hops) to the real function.
 def resolve_thunk(rva):
     off = rva_to_off(rva)
     if off is None: return None
@@ -39,8 +53,11 @@ def resolve_thunk(rva):
         except Exception: return None
     return None
 
+# ES: Offsets de fichero de todas las apariciones de la subcadena (no se usa en el main).
+# EN: File offsets of every occurrence of the substring (unused by main).
 def find_typedescriptor(name_substr):
     # busca el string .?AV<name>@@ en .data/.rdata
+    # EN: finds the .?AV<name>@@ string in .data/.rdata (actually searches the whole file)
     needle = name_substr.encode("ascii")
     res = []
     start = 0
@@ -50,22 +67,30 @@ def find_typedescriptor(name_substr):
         res.append(idx); start = idx+1
     return res
 
+# ES: Offset de fichero -> RVA.
+# EN: File offset -> RVA.
 def off_to_rva(off):
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if raw_off <= off < raw_off + raw_size:
             return srva + (off - raw_off)
     return None
 
+# ES: Devuelve (offset del nombre, RVA del TD, lista de (TD, COL, vtable)) para la clase.
+# EN: Returns (name offset, TD RVA, list of (TD, COL, vtable)) for the class.
 def find_vtable_by_rtti(class_name):
     # class_name p.ej. "CombatClass"  -> busca ".?AVCombatClass@@"
+    # EN: class_name e.g. "CombatClass" -> searches ".?AVCombatClass@@"
     needle = (".?AV"+class_name+"@@").encode("ascii")
     idx = DATA.find(needle)
     if idx < 0: return None, None, None
     # TypeDescriptor empieza 0x10 antes del string
+    # EN: The TypeDescriptor starts 0x10 before the string
     td_off = idx - 0x10
     td_rva = off_to_rva(td_off)
     # buscar COL que referencia td_rva por RVA (campo +0xC), luego vtable cuyo [-8]=COL
     # escanear .rdata por dwords == td_rva
+    # EN: find the COL referencing td_rva by RVA (field +0xC), then the vtable whose [-8]=COL
+    #     scan .rdata for dwords == td_rva
     cands = []
     for name, srva, vsize, raw_off, raw_size in SECTIONS:
         if name not in (".rdata",".data"): continue
@@ -73,8 +98,10 @@ def find_vtable_by_rtti(class_name):
             if struct.unpack_from("<I", DATA, p)[0] == td_rva:
                 col_field_rva = off_to_rva(p)
                 # +0xC del COL apunta a TD; COL base = col_field_rva - 0xC
+                # EN: COL +0xC points to the TD; COL base = col_field_rva - 0xC
                 col_rva = col_field_rva - 0xC
                 # buscar vtable: qword == (col_rva+IMAGE_BASE), vtable = ese+8
+                # EN: find the vtable: qword == (col_rva+IMAGE_BASE), vtable = that + 8
                 col_va = col_rva + IMAGE_BASE
                 for n2, sr2, vs2, ro2, rs2 in SECTIONS:
                     if n2 not in (".rdata",".data"): continue
@@ -84,6 +111,8 @@ def find_vtable_by_rtti(class_name):
                             cands.append((td_rva, col_rva, vt_rva))
     return idx, td_rva, cands
 
+# ES: Punto de entrada por línea de comandos.
+# EN: Command-line entry point.
 if __name__ == "__main__":
     cls = sys.argv[1]; nslots = int(sys.argv[2]) if len(sys.argv)>2 else 80
     idx, td_rva, cands = find_vtable_by_rtti(cls)

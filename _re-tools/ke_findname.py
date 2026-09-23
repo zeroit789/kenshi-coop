@@ -1,14 +1,25 @@
+# ES: Recorre .rdata en pasos de 8 bytes y, para cada posición cuyo qword anterior sea un COL válido,
+#     obtiene el nombre RTTI de la vtable; imprime las que contienen la subcadena pedida.
+#     Uso: python ke_findname.py <subcadena>
+# EN: Walks .rdata in 8-byte steps and, for each position whose previous qword is a valid COL, gets
+#     the vtable's RTTI name; prints those containing the requested substring.
+#     Usage: python ke_findname.py <substring>
+
 import pefile, struct, sys
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IB = 0x140000000
 pe = pefile.PE(EXE, fast_load=True)
 img = pe.get_memory_mapped_image()
+# ES: Lectores little-endian por RVA (None si falla).
+# EN: Little-endian readers by RVA (None on failure).
 def u32(rva):
     try: return struct.unpack("<I",img[rva:rva+4])[0]
     except: return None
 def u64(rva):
     try: return struct.unpack("<Q",img[rva:rva+8])[0]
     except: return None
+# ES: Nombre RTTI (".?AV...") de la vtable vía COL (firma 0/1) y TypeDescriptor, o None.
+# EN: RTTI name (".?AV...") of the vtable through the COL (signature 0/1) and TypeDescriptor, or None.
 def name_of_vtable(vt_rva):
     try:
         colp=u64(vt_rva-8)
@@ -21,6 +32,7 @@ def name_of_vtable(vt_rva):
         return s if s.startswith('.?A') else None
     except: return None
 want = sys.argv[1]  # substring del nombre
+# EN: name substring
 rd_start=rd_end=None
 for s in pe.sections:
     if s.Name.rstrip(b'\x00')==b'.rdata':

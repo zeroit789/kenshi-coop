@@ -1,10 +1,21 @@
 # -*- coding: utf-8 -*-
+# ES: Escaneo lineal de TODO .text buscando escrituras al CharBody: "mov [reg+0x70], 1/0" (flag de
+#     idle/materializado) y "mov [reg+0x68], reg64" (puntero), excluyendo bases rsp/rbp.
+#     Imprime las de +0x70=1 y hasta 60 de +0x68. Uso: python re_cb68c.py
+# EN: Linear scan of ALL of .text looking for CharBody writes: "mov [reg+0x70], 1/0" (idle/materialized
+#     flag) and "mov [reg+0x68], reg64" (pointer), excluding rsp/rbp bases.
+#     Prints the +0x70=1 ones and up to 60 of +0x68. Usage: python re_cb68c.py
+
 # Buscar funciones que escriban CharBody+0x68 con un puntero NO nulo (registro) Y/O CharBody+0x70=0 (materializa)
 # y +0x70=1 (idle). Escaneo lineal de TODO .text, agrupando por proximidad.
+# EN: Find functions writing CharBody+0x68 with a NON-null pointer (register) AND/OR CharBody+0x70=0 (materialize)
+#     and +0x70=1 (idle). Linear scan of ALL of .text, grouping by proximity (no grouping is implemented).
 import struct
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind, Register
 EXE=r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"; IB=0x140000000
 DATA=open(EXE,"rb").read()
+# ES: Tabla de secciones leída a mano de las cabeceras PE (e_lfanew -> COFF -> cabeceras de sección de 40 bytes).
+# EN: Section table parsed by hand from the PE headers (e_lfanew -> COFF -> 40-byte section headers).
 e=struct.unpack_from("<I",DATA,0x3C)[0]; coff=e+4
 ns=struct.unpack_from("<H",DATA,coff+2)[0]; osz=struct.unpack_from("<H",DATA,coff+16)[0]
 so=coff+20+osz; SEC=[]
@@ -15,14 +26,19 @@ for i in range(ns):
     SEC.append((nm,rv,vs,ro,rs))
 text=[s for s in SEC if s[0]==".text"][0]; nm,sr,vs,ro,rs=text
 code=DATA[ro:ro+rs]
+# ES: Formateador Intel con prefijo 0x y mapa valor -> nombre de registro (RN).
+# EN: Intel formatter with 0x prefix and value -> register name map (RN).
 fmt=Formatter(FormatterSyntax.INTEL); fmt.hex_prefix="0x"; fmt.hex_suffix=""
 RN={getattr(Register,n):n for n in dir(Register) if isinstance(getattr(Register,n),int) and not n.startswith("_")}
 # escaneo: registrar instrucciones que escriben [reg+0x70] con imm (0 o 1) y [reg+0x68] con reg (puntero)
+# EN: scan: record instructions writing [reg+0x70] with imm (0 or 1) and [reg+0x68] with a reg (pointer)
 hits70_1=[]; hits70_0=[]; hits68p=[]
 for ins in Decoder(64,code,ip=IB+sr):
     rr=ins.ip-IB
     if ins.mnemonic==Mnemonic.MOV and ins.op0_kind==OpKind.MEMORY and ins.memory_displacement==0x70 and ins.memory_base!=Register.RSP and ins.memory_base!=Register.RBP:
         if ins.op1_kind in (OpKind.IMMEDIATE8,OpKind.IMMEDIATE8TO32,OpKind.IMMEDIATE8TO64,OpKind.IMMEDIATE32):
+            # ES: Leer el inmediato con la API disponible según la versión de iced_x86.
+            # EN: Read the immediate with whichever API the iced_x86 version offers.
             v=ins.immediate(1) if hasattr(ins,'immediate') else None
             try: v=ins.get_immediate(1)
             except: v=ins.immediate8 if hasattr(ins,'immediate8') else '?'

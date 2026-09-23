@@ -1,7 +1,14 @@
+# ES: Busca en .text los thunks "jmp rel32" (E9) que saltan a la función 0x623920.
+#     Uso: python _t3.py
+# EN: Searches .text for "jmp rel32" (E9) thunks that jump to function 0x623920.
+#     Usage: python _t3.py
+
 import pefile
 PATH=r"E:/SteamLibrary/steamapps/common/Kenshi/kenshi_x64.exe"
 pe=pefile.PE(PATH, fast_load=True)
 secs=[(s.Name.rstrip(b'\x00').decode('latin1'),s.VirtualAddress,s.Misc_VirtualSize) for s in pe.sections]
+# ES: Recorre .text byte a byte y devuelve los RVAs de cada E9 cuyo destino es target.
+# EN: Walks .text byte by byte and returns the RVAs of every E9 whose target is target.
 def thunks(target):
   hits=[]
   for name,va,vs in secs:

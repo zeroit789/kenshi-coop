@@ -1,15 +1,27 @@
+# ES: Busca los thunks "jmp rel32" (E9) que apuntan a un RVA y después todos los call E8 al RVA o a
+#     esos thunks, en .text (0x1000-0x1671000). Usa re_kenshi.py.
+#     Uso: python find_xrefs.py <rva_hex>
+# EN: Finds the "jmp rel32" (E9) thunks pointing to an RVA and then every E8 call to the RVA or to
+#     those thunks, in .text (0x1000-0x1671000). Uses re_kenshi.py.
+#     Usage: python find_xrefs.py <rva_hex>
+
 from re_kenshi import *
 import struct
 from iced_x86 import Decoder, Mnemonic, OpKind
 
 # Buscar TODOS los call/jmp a un RVA destino (directos y via thunk de 5 bytes E9)
+# EN: Find ALL call/jmp to a target RVA (direct and through a 5-byte E9 thunk)
+#     Note: despite its name, find_callers() only returns the thunks; the calls are searched in __main__.
 def find_callers(target_rva, scan_start=0x1000, scan_end=0x1671000):
     target_abs = IMAGEBASE + target_rva
     results_direct = []
     # 1) Identificar thunks (jmp E9) que apuntan a target
+    # EN: 1) Identify thunks (jmp E9) pointing to target
     thunks = []
     # escaneo lineal de bytes buscando E9 con destino == target (thunks ILT)
     # los thunks estan en .text baja; escaneamos todo .text
+    # EN: linear byte scan for E9 whose target == target (ILT thunks)
+    #     thunks live low in .text; we scan all of .text
     chunk = data[scan_start:scan_end]
     base = scan_start
     i = 0
@@ -31,8 +43,10 @@ if __name__ == '__main__':
     thunks = find_callers(tgt)
     print(f"Thunks (jmp 0x{tgt:X}): {[hex(t) for t in thunks]}")
     # Ahora buscar calls directos a tgt Y a cada thunk
+    # EN: Now search for direct calls to tgt AND to each thunk
     targets = set([tgt] + thunks)
     # escaneo de calls E8
+    # EN: E8 call scan
     chunk = data[0x1000:0x1671000]
     base = 0x1000
     L = len(chunk)

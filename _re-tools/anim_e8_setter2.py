@@ -1,7 +1,18 @@
+# ES: Versión revisada de anim_e8_setter.py: mismas dos comprobaciones (0x5BD240 en las vtables
+#     Appearance* y escrituras "mov [reg+0xE8], reg" en 0x5C0000-0x5F0000), pero filtrando slots
+#     que no apuntan a .text y tolerando lecturas fallidas.
+#     Uso: python anim_e8_setter2.py
+# EN: Revised version of anim_e8_setter.py: same two checks (0x5BD240 in the Appearance* vtables
+#     and "mov [reg+0xE8], reg" writes in 0x5C0000-0x5F0000), but filtering slots that do not
+#     point into .text and tolerating failed reads.
+#     Usage: python anim_e8_setter2.py
+
 import ke_re as k
 import struct
 IMG=0x140000000
 def u64(b): return struct.unpack("<Q",b)[0]
+# ES: RVAs de los n primeros slots de la vtable (None si no es puntero a código), siguiendo thunks.
+# EN: RVAs of the first n vtable slots (None if not a code pointer), following thunks.
 def vt_slots(vt, n=20):
     out=[]
     for i in range(n):
@@ -22,6 +33,8 @@ for name,vt in [("AppearanceHuman",0x16E6338),("AppearanceAnimal",0x16E6598)]:
     sl=vt_slots(vt,20)
     print(name, "contiene 0x5bd240?", "SI" if 0x5bd240 in sl else "NO")
 
+# ES: Escaneo manual de escrituras al campo +0xE8.
+# EN: Manual scan for writes to field +0xE8.
 base=0x5C0000
 data=bytes(k.bytes_at_rva(base, 0x30000))
 REX={0x48,0x4C,0x49,0x4D}

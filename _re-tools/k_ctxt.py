@@ -1,7 +1,18 @@
+# ES: Desensambla la función (.pdata) que contiene el RVA dado, o un rango fijo si no está en .pdata,
+#     anotando destinos RIP-relativos (cadenas de .rdata, marcas de .data) y destinos de call/jmp.
+#     Carga k_setup.py/k_regs.py desde C:/Users/Zero/ktmp.
+#     Uso: python k_ctxt.py <rva_hex> [longitud_hex]
+# EN: Disassembles the function (.pdata) containing the given RVA, or a fixed range if it is not in
+#     .pdata, annotating RIP-relative targets (.rdata strings, .data tags) and call/jmp targets.
+#     Loads k_setup.py/k_regs.py from C:/Users/Zero/ktmp.
+#     Usage: python k_ctxt.py <rva_hex> [length_hex]
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 exec(open(r"C:/Users/Zero/ktmp/k_regs.py").read())
 from iced_x86 import Decoder, Formatter, FormatterSyntax, OpKind, Mnemonic, Register
 fmt=Formatter(FormatterSyntax.INTEL)
+# ES: Lee una cadena terminada en 0 (latin1) desde un RVA.
+# EN: Reads a NUL-terminated string (latin1) from an RVA.
 def readstr(rva,maxlen=80):
     b=bytearray(); i=rva
     while i<len(data) and data[i]!=0 and len(b)<maxlen: b.append(data[i]); i+=1
@@ -9,6 +20,7 @@ def readstr(rva,maxlen=80):
 import sys
 TARGET=int(sys.argv[1],16)
 # Si no esta en pdata, desensamblar un rango fijo
+# EN: If it is not in pdata, disassemble a fixed range
 fc=func_containing(TARGET)
 if fc: b,e=fc
 else:

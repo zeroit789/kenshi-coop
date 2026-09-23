@@ -1,3 +1,10 @@
+# ES: Lista las referencias "lea reg, [rip+disp32]" a la vtable 0x16F4588 (AnimationClassAnimal)
+#     en .text, con sus 7 bytes. Sirve para encontrar el constructor que instala esa vtable.
+#     Uso: python _xref_vt.py
+# EN: Lists "lea reg, [rip+disp32]" references to vtable 0x16F4588 (AnimationClassAnimal)
+#     in .text, with their 7 bytes. Used to find the constructor that installs that vtable.
+#     Usage: python _xref_vt.py
+
 import ke_re as k
 pe,data=k._load()
 text=[s for s in pe.sections if b".text" in s.Name][0]
@@ -6,6 +13,8 @@ IMG=0x140000000
 target=0x16F4588  # vtable AnimationClassAnimal (RVA)
 # lea reg,[rip+disp] -> REX.W 8D /r mod=00 rm=101 ; opcode 8D, modrm bits
 res=[]
+# ES: Recorrido byte a byte buscando la codificación del lea RIP-relativo.
+# EN: Byte-by-byte walk looking for the RIP-relative lea encoding.
 i=start
 while i<end-7:
     b0=data[i]

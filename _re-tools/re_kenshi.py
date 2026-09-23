@@ -1,3 +1,8 @@
+# ES: Helper mínimo (lo importan find_refs.py, find_xrefs.py, pdata.py con "from re_kenshi import *"):
+#     carga kenshi_x64.exe como imagen mapeada (data indexado por RVA) y ofrece disasm() y list_calls().
+# EN: Minimal helper (imported by find_refs.py, find_xrefs.py, pdata.py via "from re_kenshi import *"):
+#     loads kenshi_x64.exe as a mapped image (data indexed by RVA) and offers disasm() and list_calls().
+
 import pefile, iced_x86
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind
 
@@ -7,6 +12,8 @@ IMAGEBASE = 0x140000000
 pe = pefile.PE(PATH, fast_load=True)
 data = pe.get_memory_mapped_image()
 
+# ES: Desensambla count instrucciones desde rva; imprime cabecera si hay label y devuelve la lista.
+# EN: Disassembles count instructions from rva; prints a header if label is given and returns the list.
 def disasm(rva, count=40, label=""):
     code = data[rva: rva + count*16]
     decoder = Decoder(64, code, ip=IMAGEBASE + rva)
@@ -31,6 +38,8 @@ def disasm(rva, count=40, label=""):
         print(f"0x{rva_ip:X}  {text:<50} ; {bytestr}")
     return out
 
+# ES: Lista los call directos dentro de [rva_start, rva_end) y los imprime.
+# EN: Lists the direct calls inside [rva_start, rva_end) and prints them.
 def list_calls(rva_start, rva_end, label=""):
     code = data[rva_start: rva_end]
     decoder = Decoder(64, code, ip=IMAGEBASE + rva_start)

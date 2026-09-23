@@ -1,4 +1,12 @@
+# ES: Para cada RVA de un call/jmp rel32 (E8/E9) pasado por argumento, calcula el destino y, si el
+#     destino es un thunk jmp o un jmp de IAT (FF 25), lo indica. Usa ke_dis.py (imagen mapeada).
+#     Uso: python ke_call.py <rva_hex> [...]
+# EN: For each rel32 call/jmp RVA (E8/E9) passed as argument, computes the target and, if the target
+#     is a jmp thunk or an IAT jmp (FF 25), says so. Uses ke_dis.py (mapped image).
+#     Usage: python ke_call.py <rva_hex> [...]
+
 # resuelve target de call/jmp rel32 dado RVA del call
+# EN: resolves the target of a rel32 call/jmp given the call RVA
 import sys, ke_dis
 img = ke_dis._image
 ke_dis.load()
@@ -11,6 +19,7 @@ for a in sys.argv[1:]:
         rel=struct.unpack_from("<i",img,rva+1)[0]
         tgt=rva+5+rel
         # si es thunk jmp, resolver 1 nivel
+        # EN: if it is a jmp thunk, resolve 1 level
         kind="call" if op==0xE8 else "jmp"
         extra=""
         if img[tgt]==0xE9:

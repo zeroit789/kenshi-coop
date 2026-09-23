@@ -1,3 +1,8 @@
+# ES: Desensambla la instrucción en cada una de las 106 RVAs de escritura a +0xE8 para confirmar que
+#     es exactamente "mov [reg+0xE8], reg" (sin SIB). Usa ke_re. Uso: python ke_task2.py
+# EN: Disassembles the instruction at each of the 106 +0xE8 write RVAs to confirm it is exactly
+#     "mov [reg+0xE8], reg" (no SIB). Uses ke_re. Usage: python ke_task2.py
+
 import ke_re as k
 import struct, re
 
@@ -9,9 +14,12 @@ rvas = [0x74976,0xa96ec,0xb3b9a,0xb4c7e,0xdcf3d,0xf54da,0x10df78,0x10fb99,0x1abe
 
 # Para cada RVA, desensamblar ~0x70 bytes antes para tener contexto.
 # Buscamos: la instruccion mov [reg+0xE8],reg en la RVA. Confirmar que es +0xE8 exacto (no SIB).
+# EN: For each RVA, disassemble ~0x70 bytes before for context (the code only decodes 1 instruction).
+#     We look for: the mov [reg+0xE8],reg instruction at the RVA. Confirm it is exactly +0xE8 (no SIB).
 for rva in rvas:
     try:
         # desensamblar empezando un poco antes; disasm(rva, nbytes, count)
+        # EN: disassemble starting a bit earlier; disasm(rva, nbytes, count)
         d = k.disasm(rva, 12, 1)
         print(f"=== 0x{rva:X} : {d.strip()}")
     except Exception as e:

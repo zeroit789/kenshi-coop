@@ -1,10 +1,21 @@
+# ES: Lista las vtables que instala el constructor 0x72D3B0 (lea reg,[rip->.rdata] + mov [base+disp],reg)
+#     y resuelve el nombre RTTI de cada una para identificar la clase HUD y sus subobjetos.
+#     Carga k_setup.py/k_regs.py desde C:/Users/Zero/ktmp. Uso: python k_hudvt.py
+# EN: Lists the vtables installed by constructor 0x72D3B0 (lea reg,[rip->.rdata] + mov [base+disp],reg)
+#     and resolves the RTTI name of each one to identify the HUD class and its subobjects.
+#     Loads k_setup.py/k_regs.py from C:/Users/Zero/ktmp. Usage: python k_hudvt.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 exec(open(r"C:/Users/Zero/ktmp/k_regs.py").read())
 from iced_x86 import Decoder, Mnemonic, OpKind, Register
+# ES: Lee una cadena terminada en 0 (latin1) desde un RVA.
+# EN: Reads a NUL-terminated string (latin1) from an RVA.
 def readstr(rva,maxlen=200):
     b=bytearray(); i=rva
     while i<len(data) and data[i]!=0 and len(b)<maxlen: b.append(data[i]); i+=1
     return b.decode('latin1','replace')
+# ES: Busca instalaciones de vtable dentro del constructor.
+# EN: Look for vtable installs inside the constructor.
 b,e=func_containing(0x72d3b0)
 inss=list(Decoder(64,data[b:e],ip=IB+b))
 installs=[]
@@ -20,6 +31,8 @@ for i,ins in enumerate(inss):
 print("vtables instaladas en ctor 0x72D3B0:")
 for rva,vt,disp,base in installs:
     print(f"  @ {hex(rva)}: vtable RVA {hex(vt)} -> [{base}+{hex(disp)}]")
+# ES: (COL, TypeDescriptor, nombre) de una vtable, o None si el RTTI no es válido.
+# EN: (COL, TypeDescriptor, name) of a vtable, or None if the RTTI is not valid.
 def resolve_rtti(vtable_rva):
     col_va=u64(vtable_rva-8); col_rva=col_va-IB
     if not (in_rdata(col_rva) or in_data(col_rva)): return None

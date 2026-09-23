@@ -1,4 +1,12 @@
+# ES: Lee los slots indicados de una vtable y, si el qword apunta a un thunk jmp (E9), resuelve el
+#     destino real. Depende de ke_dis.load()/ke_dis._image (no definidos en el ke_dis.py versionado).
+#     Uso: python ke_vt.py <vtable_rva_hex> <slot_hex> [...]
+# EN: Reads the given slots of a vtable and, if the qword points to a jmp thunk (E9), resolves the real
+#     target. Depends on ke_dis.load()/ke_dis._image (not defined in the versioned ke_dis.py).
+#     Usage: python ke_vt.py <vtable_rva_hex> <slot_hex> [...]
+
 # resuelve slot de vtable: lee qword en (vtable_rva + slot), si apunta a thunk jmp resuelve destino real - READ ONLY
+# EN: resolves a vtable slot: reads the qword at (vtable_rva + slot); if it points to a jmp thunk, resolves the real target - READ ONLY
 import sys, struct, ke_dis
 ke_dis.load(); img=ke_dis._image; IB=0x140000000
 vt=int(sys.argv[1],16)

@@ -1,11 +1,24 @@
+# ES: Candidatos a función de actualización del HUD: funciones que cargan [reg+0x2C8] y, en las 8
+#     instrucciones siguientes, siguen el puntero hasta su vtable y hacen una llamada virtual
+#     call [vt+slot]. Imprime función, sitio y el call. Carga k_setup.py desde C:/Users/Zero/ktmp.
+#     Uso: python k_updatefind.py
+# EN: HUD update-function candidates: functions that load [reg+0x2C8] and, within the next 8
+#     instructions, follow the pointer to its vtable and make a virtual call call [vt+slot].
+#     Prints function, site and the call. Loads k_setup.py from C:/Users/Zero/ktmp.
+#     Usage: python k_updatefind.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 import iced_x86
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind, Register
 fmt=Formatter(FormatterSyntax.INTEL)
 OFF=0x2C8
 STACKREGS={Register.RBP,Register.RSP,Register.RIP}
+# ES: Nombre legible de un registro (si la versión de iced_x86 lo soporta).
+# EN: Readable register name (if the iced_x86 version supports it).
 def regname(r):
     return iced_x86.register_to_string(r) if hasattr(iced_x86,'register_to_string') else str(r)
+# ES: Decodifica la función [b_rva, e_rva) completa.
+# EN: Decodes the whole function [b_rva, e_rva).
 def decode_func(b_rva,e_rva):
     return list(Decoder(64,data[b_rva:e_rva],ip=IB+b_rva))
 cands=[]
@@ -19,6 +32,8 @@ for (b,e,u) in PDATA:
             if ins.memory_displacement==OFF and ins.memory_base not in STACKREGS and ins.memory_base!=Register.NONE:
                 loaded=ins.op_register(0)
                 window=inss[i+1:i+9]
+                # ES: cur sigue el registro que contiene el objeto y luego su vtable.
+                # EN: cur tracks the register holding the object and then its vtable.
                 ok=False; detail=""; cur=loaded
                 for nx in window:
                     if nx.mnemonic==Mnemonic.MOV and nx.op_count==2 and nx.op_kind(0)==OpKind.REGISTER and nx.op_kind(1)==OpKind.MEMORY and nx.memory_base==cur and nx.memory_displacement==0 and not nx.is_ip_rel_memory_operand:

@@ -1,3 +1,12 @@
+# ES: Serie ke_task*: estudio de las 106 escrituras "mov [reg+0xE8], reg" halladas en el binario
+#     (lista rvas) para saber qué objeto se instala en +0xE8. Este primer paso solo comprueba que el
+#     RTTI resuelve bien las vtables conocidas (Tasker, Task_MeleeAttack, AnimationClassAnimal,
+#     AnimationClass). Usa ke_re. Uso: python ke_task.py
+# EN: ke_task* series: study of the 106 "mov [reg+0xE8], reg" writes found in the binary (rvas list)
+#     to learn which object is installed at +0xE8. This first step only checks that RTTI resolves the
+#     known vtables correctly (Tasker, Task_MeleeAttack, AnimationClassAnimal, AnimationClass).
+#     Uses ke_re. Usage: python ke_task.py
+
 import ke_re as k
 import struct
 
@@ -5,13 +14,18 @@ IB = 0x140000000
 def u64(b): return struct.unpack('<Q', b[:8])[0]
 def u32(b): return struct.unpack('<I', b[:4])[0]
 
+# ES: vtables conocidas (RVAs)
+# EN: known vtables (RVAs)
 VT_TASKER = 0x16BDC68
 VT_MELEE  = 0x16BE448
 VT_ANIM   = 0x16F4588   # AnimationClassAnimal
 VT_ANIMB  = 0x16F10E8   # AnimationClass base
 
+# ES: Nombre RTTI de una vtable (vt-8 -> COL -> TD+0x10), None o "ERR:..." si falla.
+# EN: RTTI name of a vtable (vt-8 -> COL -> TD+0x10), None or "ERR:..." on failure.
 def rtti_name(vt_rva):
     # vt_rva es RVA de la vtable (sin imagebase)
+    # EN: vt_rva is the vtable RVA (without image base)
     try:
         col_va = u64(k.bytes_at_rva(vt_rva-8, 8))
         if col_va < IB or col_va > IB+0x2000000: return None
@@ -24,6 +38,7 @@ def rtti_name(vt_rva):
         return "ERR:"+str(e)
 
 # Lista de las 106 RVAs
+# EN: List of the 106 RVAs
 rvas = [0x74976,0xa96ec,0xb3b9a,0xb4c7e,0xdcf3d,0xf54da,0x10df78,0x10fb99,0x1abe78,0x1cc8d9,0x1f84a7,0x1f9137,0x1f9f69,0x1fa205,0x1fa8d1,0x1fb2ff,0x1fcb08,0x1fcc5d,0x206612,0x208f24,0x2094f4,0x209668,0x20c4d9,0x21f3f6,0x2235ac,0x22510a,0x225e58,0x226182,0x226e8f,0x22715b,0x227fde,0x232763,0x233e0a,0x2613a8,0x261eda,0x267ffd,0x3c8b32,0x3ce224,0x40bad6,0x42f392,0x44b3c0,0x471f1b,0x47add6,0x47ae64,0x48d823,0x492de1,0x49c3f0,0x49f6d4,0x5005fa,0x500656,0x52c28f,0x535990,0x535d01,0x5b97dd,0x5bd2b3,0x5bd467,0x5e8aad,0x646aa2,0x66b64b,0x6ccd75,0x6ccd8d,0x72a9a3,0x72b210,0x72b32a,0x72d4ed,0x7dc0aa,0x7dc0cb,0x7f6c56,0x7fa635,0x886ee1,0x913c87,0x917644,0xb01f6f,0xb02497,0xb02b91,0xb02eba,0xb08680,0xb08e5d,0xb3f8a4,0xb3f97c,0xb64b81,0xb64bea,0xb64cc5,0xb64ef4,0xb65366,0xb65657,0xb656e5,0xb65979,0xb65c36,0xb65d87,0xb6601e,0xb6604f,0xb66061,0xb66514,0xb6667a,0xb6668d,0xb7cee4,0xb7e213,0xb7e25b,0xb7ea24,0xb7fdf8,0xc1902a,0xc196f7,0xe11714,0xe11784,0xf005fe]
 
 print("Sanity check RTTI de vtables conocidas:")

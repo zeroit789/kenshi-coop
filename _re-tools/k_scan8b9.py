@@ -1,3 +1,10 @@
+# ES: Lista todas las instrucciones de .text con operando de memoria [reg+0x8B9] (base no RIP) y la
+#     función que las contiene: quién lee/escribe ese campo byte (+0x8B9). Carga k_setup.py/k_regs.py
+#     desde C:/Users/Zero/ktmp. Uso: python k_scan8b9.py
+# EN: Lists every .text instruction with a [reg+0x8B9] memory operand (non-RIP base) and its
+#     containing function: who reads/writes that byte field (+0x8B9). Loads k_setup.py/k_regs.py
+#     from C:/Users/Zero/ktmp. Usage: python k_scan8b9.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 exec(open(r"C:/Users/Zero/ktmp/k_regs.py").read())
 from iced_x86 import Decoder, Formatter, FormatterSyntax, OpKind, Mnemonic, MemorySize, Register
@@ -5,6 +12,7 @@ fmt=Formatter(FormatterSyntax.INTEL)
 text=data[TEXT_RVA:TEXT_RVA+TEXT_SZ]
 dec=Decoder(64,text,ip=IB+TEXT_RVA)
 # Buscar cualquier instruccion con desplazamiento de memoria == 0x8B9
+# EN: Find any instruction with memory displacement == 0x8B9
 hits=[]
 for ins in dec:
     if ins.memory_displacement & 0xFFFFFFFF == 0x8B9 and ins.memory_base not in (Register.RIP, Register.NONE):

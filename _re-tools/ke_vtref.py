@@ -1,4 +1,10 @@
+# ES: Lista las instrucciones de .text con operando RIP-relativo que apunta a la vtable indicada
+#     (típicamente lea reg,[vtable] en constructores). Uso: python ke_vtref.py <vtable_rva_hex>
+# EN: Lists .text instructions with a RIP-relative operand pointing to the given vtable
+#     (typically lea reg,[vtable] in constructors). Usage: python ke_vtref.py <vtable_rva_hex>
+
 # Busca lea reg,[vtable_rva] (referencia RIP-rel a la vtable) en .text. READ-ONLY.
+# EN: Finds lea reg,[vtable_rva] (RIP-rel reference to the vtable) in .text. READ-ONLY.
 import sys,pefile
 from iced_x86 import Decoder, Formatter, FormatterSyntax, OpKind
 EXE=r"E:/SteamLibrary/steamapps/common/Kenshi/kenshi_x64.exe"; IB=0x140000000

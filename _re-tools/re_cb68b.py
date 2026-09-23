@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
+# ES: Localiza el inicio de la función que contiene 0x62105F (retrocede hasta el relleno CC CC) y la
+#     desensambla 0x100 bytes resolviendo calls/thunks y marcando accesos CharBody+0x68/+0x70.
+#     Parsea las secciones PE a mano. Uso: python re_cb68b.py
+# EN: Finds the start of the function containing 0x62105F (walks back to the CC CC padding) and
+#     disassembles 0x100 bytes resolving calls/thunks and flagging CharBody+0x68/+0x70 accesses.
+#     Parses the PE sections by hand. Usage: python re_cb68b.py
+
 import struct
 from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic, OpKind, Register
 EXE=r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"; IB=0x140000000
 DATA=open(EXE,"rb").read()
+# ES: Tabla de secciones desde las cabeceras PE.
+# EN: Section table from the PE headers.
 e=struct.unpack_from("<I",DATA,0x3C)[0]; coff=e+4
 ns=struct.unpack_from("<H",DATA,coff+2)[0]; osz=struct.unpack_from("<H",DATA,coff+16)[0]
 so=coff+20+osz; SEC=[]
@@ -11,10 +20,14 @@ for i in range(ns):
     vs=struct.unpack_from("<I",DATA,o+8)[0]; rv=struct.unpack_from("<I",DATA,o+12)[0]
     rs=struct.unpack_from("<I",DATA,o+16)[0]; ro=struct.unpack_from("<I",DATA,o+20)[0]
     SEC.append((nm,rv,vs,ro,rs))
+# ES: RVA -> offset de fichero.
+# EN: RVA -> file offset.
 def r2o(r):
     for nm,sr,vs,ro,rs in SEC:
         if sr<=r<sr+max(vs,rs) and r-sr<rs: return ro+(r-sr)
     return None
+# ES: Sigue cadenas de thunks JMP (máx. 4 niveles); devuelve (destino, nota).
+# EN: Follows JMP thunk chains (max 4 levels); returns (target, note).
 def resolve_thunk(rva,depth=0):
     if depth>4: return rva,""
     o=r2o(rva)
@@ -28,9 +41,12 @@ fmt=Formatter(FormatterSyntax.INTEL); fmt.hex_prefix="0x"; fmt.hex_suffix=""
 RN={getattr(Register,n):n for n in dir(Register) if isinstance(getattr(Register,n),int) and not n.startswith("_")}
 # Buscar el inicio de la funcion que contiene 0x62105F. Retroceder a prologo.
 # Desensamblar desde un poco antes con backtrack a int3+1
+# EN: Find the start of the function containing 0x62105F. Walk back to the prologue.
+#     Disassemble from a bit earlier, backtracking to int3+1
 target=0x62105F
 o=r2o(target)
 # retroceder hasta encontrar CC CC (padding) anterior
+# EN: walk back until the previous CC CC (padding)
 start=o
 while start>o-0x400:
     if DATA[start-1]==0xCC and DATA[start-2]==0xCC: break

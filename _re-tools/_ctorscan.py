@@ -1,3 +1,12 @@
+# ES: Desensambla 0x900 bytes desde el RVA 0x622200 (zona de un constructor del juego) y solo imprime
+#     las escrituras en [reg+0x648] / [reg+0x448] y las llamadas, con sus bytes crudos.
+#     Busca qué factorías/vtables inicializan esos campos del objeto. Usa el helper ke_re.
+#     Uso: python _ctorscan.py
+# EN: Disassembles 0x900 bytes starting at RVA 0x622200 (area of a game constructor) and prints only
+#     writes to [reg+0x648] / [reg+0x448] and calls, with their raw bytes.
+#     Looks for which factories/vtables initialize those object fields. Uses the ke_re helper.
+#     Usage: python _ctorscan.py
+
 import ke_re as k, struct
 pe,data=k._load()
 base_rva=0x622200; n=0x900
@@ -5,9 +14,12 @@ b=k.bytes_at_rva(base_rva,n)
 from iced_x86 import Decoder, Formatter, FormatterSyntax
 dec=Decoder(64,b,ip=0x140000000+base_rva)
 fmt=Formatter(FormatterSyntax.INTEL)
+# ES: Recorre las instrucciones y filtra las interesantes.
+# EN: Walk the instructions and keep only the interesting ones.
 for ins in dec:
     s=fmt.format(ins)
     # interesa: mov [reg+0x648], / [reg+0x448], / call (factories) / lea vtable
+    # EN: of interest: mov [reg+0x648], / [reg+0x448], / call (factories) / lea vtable
     if ('+648h]' in s and 'mov' in s) or ('+448h]' in s and 'mov' in s) or ('call ' in s):
         rva=ins.ip-0x140000000
         raw=" ".join(f"{x:02X}" for x in b[rva-base_rva:rva-base_rva+ins.len])

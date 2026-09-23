@@ -1,3 +1,8 @@
+# ES: Busca los thunks "jmp rel32" (E9) de .text que saltan a la función 0x7874E0 e imprime cada uno.
+#     Uso: python _thunk.py
+# EN: Finds the "jmp rel32" (E9) thunks in .text that jump to function 0x7874E0 and prints each one.
+#     Usage: python _thunk.py
+
 import pefile
 PATH=r"E:/SteamLibrary/steamapps/common/Kenshi/kenshi_x64.exe"; IB=0x140000000
 pe=pefile.PE(PATH, fast_load=True)

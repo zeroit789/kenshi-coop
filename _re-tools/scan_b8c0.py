@@ -1,3 +1,12 @@
+# ES: Recorre todas las funciones de .pdata y lista las que acceden a +0xB8 Y +0xC0 (base no rsp/rbp),
+#     marcando si hacen call [reg+0x18] (posible setVisible), call [reg+0x88] (posible setCaption) o
+#     referencian GameWorld (0x2134110). Carga k_setup.py/k_regs.py desde C:/Users/Zero/ktmp.
+#     Uso: python scan_b8c0.py
+# EN: Walks every .pdata function and lists those accessing +0xB8 AND +0xC0 (non rsp/rbp base), flagging
+#     whether they call [reg+0x18] (possible setVisible), call [reg+0x88] (possible setCaption) or
+#     reference GameWorld (0x2134110). Loads k_setup.py/k_regs.py from C:/Users/Zero/ktmp.
+#     Usage: python scan_b8c0.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 exec(open(r"C:/Users/Zero/ktmp/k_regs.py").read())
 from iced_x86 import Decoder, Mnemonic, OpKind, Register
@@ -6,6 +15,10 @@ from iced_x86 import Decoder, Mnemonic, OpKind, Register
 #  - marcar si lee/escribe desplazamiento 0xB8 y 0xC0 (cualquier base reg que no sea rsp/rbp)
 #  - marcar si hace un call qword [reg+0x18] (posible setVisible)
 #  - marcar si lee GameWorld+0x8B9 (acceso a 0x2134110 + ... no, es abs) o referencia .data 0x2134110
+# EN: Scan every PDATA function inside .text. For each one:
+#      - flag whether it reads/writes displacement 0xB8 and 0xC0 (any base reg other than rsp/rbp)
+#      - flag whether it does a call qword [reg+0x18] (possible setVisible)
+#      - flag whether it reads GameWorld+0x8B9 (access to 0x2134110 + ... no, it is abs) or references .data 0x2134110
 GW=0x2134110
 res=[]
 for (b,e,u) in PDATA:

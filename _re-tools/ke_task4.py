@@ -1,3 +1,12 @@
+# ES: Para cada una de las 106 escrituras a +0xE8, localiza el registro origen y clasifica de dónde
+#     viene su valor en las 8 líneas previas: retorno de un call (posible constructor/alocador),
+#     mov desde otro campo o lea. Imprime origen y calls de la ventana. Usa ke_re.
+#     Uso: python ke_task4.py
+# EN: For each of the 106 +0xE8 writes, finds the source register and classifies where its value comes
+#     from in the previous 8 lines: a call return (possible constructor/allocator), a mov from another
+#     field or a lea. Prints origin and the calls in the window. Uses ke_re.
+#     Usage: python ke_task4.py
+
 import ke_re as k
 import struct, re
 
@@ -5,6 +14,8 @@ IB = 0x140000000
 def u64(b): return struct.unpack('<Q', b[:8])[0]
 def u32(b): return struct.unpack('<I', b[:4])[0]
 
+# ES: Nombre RTTI de una vtable o None (no se usa en este script).
+# EN: RTTI name of a vtable or None (not used by this script).
 def rtti_name(vt_rva):
     try:
         col_va = u64(k.bytes_at_rva(vt_rva-8, 8))
@@ -25,6 +36,12 @@ mov_re = re.compile(r'mov \[(\w+)\+0E8h\],(\w+)')
 #   mov srcreg,[dst+off]         -> copiado de otro campo (ya existe)
 #   mov srcreg,[reg+off]         -> lectura
 # Imprimimos las ~10 lineas previas a la escritura para clasificar.
+# EN: For each write: identify srcreg, and trace back the last def of srcreg.
+#     We look for patterns:
+#       call X ; ... mov srcreg,rax  -> origin = return of call X (possible allocator/ctor)
+#       mov srcreg,[dst+off]         -> copied from another field (already exists)
+#       mov srcreg,[reg+off]         -> read
+#     We print the ~10 lines before the write to classify it.
 for rva in rvas:
     start = rva - 0x60
     try:
@@ -33,6 +50,7 @@ for rva in rvas:
         print(f"0x{rva:X} ERR {e}"); continue
     lines = block.splitlines()
     # localizar indice de la linea objetivo
+    # EN: find the index of the target line
     idx = None; srcreg=None; dstreg=None
     for i,ln in enumerate(lines):
         m = mov_re.search(ln)
@@ -40,15 +58,18 @@ for rva in rvas:
             idx=i; dstreg,srcreg=m.group(1),m.group(2); break
     if idx is None:
         # fallback: tomar ultima coincidencia
+        # EN: fallback: take the last match
         for i,ln in enumerate(lines):
             m=mov_re.search(ln)
             if m: idx=i; dstreg,srcreg=m.group(1),m.group(2)
     prev = lines[max(0,idx-8):idx] if idx is not None else []
     # detectar si justo antes hay call (origen=retorno) o mov src,[..]
+    # EN: detect whether right before there is a call (origin=return) or mov src,[..]
     origin="?"
     for ln in reversed(prev):
         low=ln.lower()
         # def de srcreg
+        # EN: def of srcreg
         if re.search(rf'\b{srcreg}\b', low):
             if 'call' in low: origin="CALL_RET"; break
             mm=re.search(rf'mov {srcreg},(.+)', low)
@@ -57,11 +78,13 @@ for rva in rvas:
             if mm: origin="LEA<-"+mm.group(1).strip(); break
             mm=re.search(rf'(\w*call\w*) ', low)
     # Tambien: hubo un 'call' en las 8 lineas previas?
+    # EN: Also: was there a 'call' in the previous 8 lines?
     callprev = [ln.split('0x')[-1] for ln in prev if 'call ' in ln.lower()]
     callstr=""
     for ln in prev:
         if 'call' in ln.lower():
             # extraer destino del call
+            # EN: extract the call target
             cm=re.search(r'call\s+(0x[0-9A-Fa-f]+|\w+)', ln)
             if cm: callstr+= cm.group(1)+" "
     print(f"0x{rva:X} src={srcreg} dst={dstreg} origin[{origin}] calls_in_window=[{callstr.strip()}]")

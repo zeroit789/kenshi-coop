@@ -1,3 +1,10 @@
+# ES: Lista las funciones que referencian (operando RIP-relativo) SOLO la vtable específica de
+#     MainBarGUI (0x17099F8), con los sitios de cada referencia. Carga k_setup.py/k_regs.py desde
+#     C:/Users/Zero/ktmp. Uso: python k_strict.py
+# EN: Lists the functions that reference (RIP-relative operand) ONLY the MainBarGUI-specific vtable
+#     (0x17099F8), with the sites of each reference. Loads k_setup.py/k_regs.py from
+#     C:/Users/Zero/ktmp. Usage: python k_strict.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 exec(open(r"C:/Users/Zero/ktmp/k_regs.py").read())
 from iced_x86 import Decoder, Mnemonic, OpKind, Register

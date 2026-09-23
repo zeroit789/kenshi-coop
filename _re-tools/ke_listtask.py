@@ -1,14 +1,25 @@
+# ES: Recorre .rdata en pasos de 8 bytes y lista todas las vtables cuyo nombre RTTI contiene "Task"
+#     (jerarquía Task/Tasker de las órdenes de los personajes), con los 16 bits bajos de su RVA.
+#     Uso: python ke_listtask.py
+# EN: Walks .rdata in 8-byte steps and lists every vtable whose RTTI name contains "Task" (the
+#     Task/Tasker hierarchy of character orders), with the low 16 bits of its RVA.
+#     Usage: python ke_listtask.py
+
 import pefile, struct
 EXE = r"E:\SteamLibrary\steamapps\common\Kenshi\kenshi_x64.exe"
 IB = 0x140000000
 pe = pefile.PE(EXE, fast_load=True)
 img = pe.get_memory_mapped_image()
+# ES: Lectores little-endian por RVA (None si falla).
+# EN: Little-endian readers by RVA (None on failure).
 def u32(rva):
     try: return struct.unpack("<I",img[rva:rva+4])[0]
     except: return None
 def u64(rva):
     try: return struct.unpack("<Q",img[rva:rva+8])[0]
     except: return None
+# ES: Nombre RTTI (".?AV...") de la vtable vía COL (firma 0/1) y TypeDescriptor, o None.
+# EN: RTTI name (".?AV...") of the vtable through the COL (signature 0/1) and TypeDescriptor, or None.
 def name_of_vtable(vt_rva):
     try:
         colp=u64(vt_rva-8)
@@ -29,5 +40,6 @@ while r < rd_end:
     nm = name_of_vtable(r)
     if nm and ('Task' in nm or 'Tasker' in nm):
         # solo terminadas en 338 para acotar, o todas Task
+        # EN: only those ending in 338 to narrow down, or all Task ones (no suffix filter is applied)
         print(f"0x{r:X}  (low16=0x{r&0xFFFF:04X})  {nm}")
     r += 8

@@ -1,3 +1,10 @@
+# ES: Lista las referencias en .text a la función 0x72D3B0: ramas directas (call/jmp) y operandos
+#     RIP-relativos, con la función que contiene cada una. Carga k_setup.py desde C:/Users/Zero/ktmp.
+#     Uso: python k_xref.py
+# EN: Lists .text references to function 0x72D3B0: direct branches (call/jmp) and RIP-relative
+#     operands, with the containing function of each. Loads k_setup.py from C:/Users/Zero/ktmp.
+#     Usage: python k_xref.py
+
 exec(open(r"C:/Users/Zero/ktmp/k_setup.py").read())
 from iced_x86 import Decoder, OpKind, Mnemonic
 TARGET = 0x72D3B0
