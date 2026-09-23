@@ -1,3 +1,7 @@
+# ES: KenshiMP.Server: servidor dedicado autoritativo (ENet/UDP): jugadores, entidades,
+#     zonas, combate, persistencia del mundo, UPnP y validación de autoridad.
+# EN: KenshiMP.Server: authoritative dedicated server (ENet/UDP): players, entities,
+#     zones, combat, world persistence, UPnP and authority validation.
 add_executable(KenshiMP.Server
     main.cpp
     server.cpp
@@ -10,10 +14,16 @@ add_executable(KenshiMP.Server
     world_persistence.cpp
     authority_validator.cpp
 )
-# FIX (Onyx 2026-06-17): authority_validator.cpp faltaba en la lista de fuentes del
-# servidor. Sin el, el linker no resolvia ServerAuthorityValidator::CanClientCommandEntity
-# ni ::ValidatePositionUpdate (errores LNK2019/LNK1120). Anadido para que el servidor enlace.
+# FIX (2026-06-17):
+# ES: authority_validator.cpp faltaba en la lista de fuentes del
+#     servidor. Sin el, el linker no resolvia ServerAuthorityValidator::CanClientCommandEntity
+#     ni ::ValidatePositionUpdate (errores LNK2019/LNK1120). Anadido para que el servidor enlace.
+# EN: authority_validator.cpp was missing from the server's source list. Without it the
+#     linker couldn't resolve ServerAuthorityValidator::CanClientCommandEntity or
+#     ::ValidatePositionUpdate (LNK2019/LNK1120 errors). Added so the server links.
 
+# ES: Librerías: Common, ENet, spdlog, json, Winsock, winmm, COM/OLE (UPnP) e iphlpapi (interfaces de red).
+# EN: Libraries: Common, ENet, spdlog, json, Winsock, winmm, COM/OLE (UPnP) and iphlpapi (network interfaces).
 target_include_directories(KenshiMP.Server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(KenshiMP.Server PRIVATE
     KenshiMP.Common
@@ -27,7 +37,10 @@ target_link_libraries(KenshiMP.Server PRIVATE
     iphlpapi
 )
 
-# Copy server exe to Kenshi directory so the Host button can find it
+# ES: Copiar el exe del servidor a la carpeta de Kenshi para que el botón "Host" lo encuentre
+#     (igual que en Core: supone el repo dentro de la carpeta del juego)
+# EN: Copy server exe to Kenshi directory so the Host button can find it
+#     (same as Core: assumes the repo lives inside the game folder)
 get_filename_component(KENSHI_DIR "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
 if(EXISTS "${KENSHI_DIR}/kenshi_x64.exe")
     add_custom_command(TARGET KenshiMP.Server POST_BUILD

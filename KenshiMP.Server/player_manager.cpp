@@ -1,3 +1,5 @@
+// ES: player_manager.cpp - Implementación de PlayerManager (nombres, baneos, AFK, rate limit).
+// EN: player_manager.cpp - PlayerManager implementation (names, bans, AFK, rate limit).
 #include "player_manager.h"
 #include "server.h"
 #include <spdlog/spdlog.h>
@@ -5,8 +7,11 @@
 
 namespace kmp {
 
-// ── Name management ──
+// ES: ── Gestión de nombres ──
+// EN: ── Name management ──
 
+// ES: Copia del texto en minúsculas (ASCII) para comparar sin distinguir mayúsculas.
+// EN: Lowercase (ASCII) copy of the text for case-insensitive comparisons.
 static std::string ToLower(const std::string& s) {
     std::string result = s;
     std::transform(result.begin(), result.end(), result.begin(),
@@ -14,24 +19,29 @@ static std::string ToLower(const std::string& s) {
     return result;
 }
 
+// ES: Tres pasadas de menor a mayor laxitud: exacto, prefijo y subcadena.
+// EN: Three passes from strictest to loosest: exact, prefix and substring.
 PlayerID PlayerManager::FindByName(
     const std::unordered_map<PlayerID, ConnectedPlayer>& players,
     const std::string& name) {
 
     std::string needle = ToLower(name);
 
-    // Exact match first
+    // ES: Primero coincidencia exacta.
+    // EN: Exact match first
     for (auto& [id, player] : players) {
         if (ToLower(player.name) == needle) return id;
     }
 
-    // Partial match (prefix)
+    // ES: Coincidencia parcial (prefijo).
+    // EN: Partial match (prefix)
     for (auto& [id, player] : players) {
         std::string lower = ToLower(player.name);
         if (lower.find(needle) == 0) return id;
     }
 
-    // Substring match
+    // ES: Coincidencia por subcadena.
+    // EN: Substring match
     for (auto& [id, player] : players) {
         std::string lower = ToLower(player.name);
         if (lower.find(needle) != std::string::npos) return id;
@@ -40,6 +50,8 @@ PlayerID PlayerManager::FindByName(
     return 0;
 }
 
+// ES: Solo coincidencia exacta sin distinguir mayúsculas.
+// EN: Exact case-insensitive match only.
 PlayerID PlayerManager::FindByExactName(
     const std::unordered_map<PlayerID, ConnectedPlayer>& players,
     const std::string& name) {
@@ -51,6 +63,8 @@ PlayerID PlayerManager::FindByExactName(
     return 0;
 }
 
+// ES: Nombre ocupado = existe un jugador con ese nombre exacto.
+// EN: Name taken = a player with that exact name exists.
 bool PlayerManager::IsNameTaken(
     const std::unordered_map<PlayerID, ConnectedPlayer>& players,
     const std::string& name) {
@@ -58,6 +72,8 @@ bool PlayerManager::IsNameTaken(
     return FindByExactName(players, name) != 0;
 }
 
+// ES: Prueba base, base_2 ... base_99; si todos están ocupados añade un número aleatorio.
+// EN: Tries base, base_2 ... base_99; if all are taken appends a random number.
 std::string PlayerManager::MakeUniqueName(
     const std::unordered_map<PlayerID, ConnectedPlayer>& players,
     const std::string& baseName) {
@@ -71,8 +87,11 @@ std::string PlayerManager::MakeUniqueName(
     return baseName + "_" + std::to_string(rand() % 9999);
 }
 
-// ── Ban list ──
+// ES: ── Lista de baneos ──
+// EN: ── Ban list ──
 
+// ES: Añade/quita una IP de la lista de baneos, consulta si está baneada y devuelve la lista.
+// EN: Adds/removes an IP from the ban list, checks if it is banned and returns the list.
 void PlayerManager::BanIP(const std::string& ip) {
     m_bannedIPs.insert(ip);
     spdlog::info("PlayerManager: Banned IP {}", ip);
@@ -91,8 +110,11 @@ std::vector<std::string> PlayerManager::GetBanList() const {
     return std::vector<std::string>(m_bannedIPs.begin(), m_bannedIPs.end());
 }
 
-// ── AFK detection ──
+// ES: ── Detección de AFK ──
+// EN: ── AFK detection ──
 
+// ES: Devuelve los jugadores cuya última actualización es más antigua que timeoutSeconds.
+// EN: Returns players whose last update is older than timeoutSeconds.
 std::vector<PlayerID> PlayerManager::GetAFKPlayers(
     const std::unordered_map<PlayerID, ConnectedPlayer>& players,
     float currentTime, float timeoutSeconds) {
@@ -106,8 +128,13 @@ std::vector<PlayerID> PlayerManager::GetAFKPlayers(
     return afk;
 }
 
-// ── Rate limiting ──
+// ES: ── Limitación de mensajes ──
+// EN: ── Rate limiting ──
 
+// ES: Cuenta los mensajes del jugador dentro de la ventana; true si llega a maxMessages.
+//     Un jugador sin registros nunca está limitado.
+// EN: Counts the player's messages within the window; true if it reaches maxMessages.
+//     A player with no records is never throttled.
 bool PlayerManager::CheckRateLimit(PlayerID id, float currentTime,
                                     float windowSeconds, int maxMessages) {
     auto it = m_rateLimits.find(id);
@@ -115,7 +142,8 @@ bool PlayerManager::CheckRateLimit(PlayerID id, float currentTime,
 
     auto& timestamps = it->second.timestamps;
 
-    // Count messages within the window
+    // ES: Cuenta mensajes dentro de la ventana de tiempo.
+    // EN: Count messages within the window
     int count = 0;
     for (auto& t : timestamps) {
         if (currentTime - t <= windowSeconds) count++;
@@ -123,10 +151,14 @@ bool PlayerManager::CheckRateLimit(PlayerID id, float currentTime,
     return count >= maxMessages;
 }
 
+// ES: Apunta la marca de tiempo de un mensaje del jugador.
+// EN: Records the timestamp of one of the player's messages.
 void PlayerManager::RecordMessage(PlayerID id, float currentTime) {
     m_rateLimits[id].timestamps.push_back(currentTime);
 }
 
+// ES: Borra marcas de tiempo más viejas que windowSeconds para que los vectores no crezcan sin fin.
+// EN: Drops timestamps older than windowSeconds so the vectors do not grow forever.
 void PlayerManager::CleanupRateLimits(float currentTime, float windowSeconds) {
     for (auto& [id, entry] : m_rateLimits) {
         entry.timestamps.erase(

@@ -1,3 +1,11 @@
+// ES: world_persistence.cpp - Guardado y carga del mundo del servidor en JSON (formato versión 2).
+//     Guarda hora, clima, todas las entidades (tipo, dueño, plantilla, facción, posición, rotación,
+//     vida por parte del cuerpo, nombre de plantilla y equipo) y el mapa nombre de jugador ->
+//     entidades, para que un jugador que reconecta recupere las suyas. Escritura atómica.
+// EN: world_persistence.cpp - Saving and loading the server world as JSON (format version 2).
+//     Stores time, weather, every entity (type, owner, template, faction, position, rotation,
+//     per-body-part health, template name and equipment) and the player name -> entities map,
+//     so a reconnecting player gets theirs back. Atomic write.
 #include "server.h"
 #include "kmp/constants.h"
 #include <nlohmann/json.hpp>
@@ -6,6 +14,8 @@
 #include <cmath>
 #include <spdlog/spdlog.h>
 
+// ES: windows.h solo hace falta para MoveFileExA (reemplazo atómico del fichero).
+// EN: windows.h is only needed for MoveFileExA (atomic file replacement).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -15,9 +25,12 @@ namespace kmp {
 
 using json = nlohmann::json;
 
-// Save/load world state to JSON for the dedicated server.
+// ES: Guarda/carga el estado del mundo en JSON para que un servidor (p. ej. en un VPS) lo conserve entre reinicios.
+// EN: Save/load world state to JSON for the dedicated server.
 // This allows VPS-hosted servers to persist world state between restarts.
 
+// ES: Serializa el mundo a JSON y lo escribe en 'path'. Devuelve false si no se pudo escribir.
+// EN: Serializes the world to JSON and writes it to 'path'. Returns false if it could not be written.
 bool SaveWorldToFile(const std::string& path,
                      const std::unordered_map<EntityID, ServerEntity>& entities,
                      const std::unordered_map<std::string, SavedPlayer>& savedPlayers,
@@ -27,6 +40,10 @@ bool SaveWorldToFile(const std::string& path,
     j["timeOfDay"] = timeOfDay;
     j["weather"] = weatherState;
 
+    // ES: Una entrada por entidad. La rotación se guarda como [w, x, y, z]; health tiene 7 partes
+    //     del cuerpo y equipment 14 ranuras.
+    // EN: One entry per entity. Rotation is stored as [w, x, y, z]; health has 7 body parts and
+    //     equipment 14 slots.
     json entityArray = json::array();
     for (auto& [id, entity] : entities) {
         json e;
@@ -53,7 +70,8 @@ bool SaveWorldToFile(const std::string& path,
     }
     j["entities"] = entityArray;
 
-    // Save player→entity mapping so reconnecting players can reclaim entities
+    // ES: Guarda el mapa jugador -> entidades para que al reconectar reclame sus entidades.
+    // EN: Save player→entity mapping so reconnecting players can reclaim entities
     json playersObj = json::object();
     for (auto& [name, sp] : savedPlayers) {
         json ids = json::array();
@@ -62,7 +80,9 @@ bool SaveWorldToFile(const std::string& path,
     }
     j["players"] = playersObj;
 
-    // Write to temp file first, then atomically replace the destination.
+    // ES: Escribe primero en un fichero temporal (.tmp) y luego reemplaza el destino de forma atómica:
+    //     si el proceso muere en cualquier punto, en disco queda entero el fichero viejo o el nuevo.
+    // EN: Write to temp file first, then atomically replace the destination.
     // This ensures no data-loss window: if we crash at any point, either
     // the old file or the new file exists in full on disk.
     std::string tmpPath = path + ".tmp";
@@ -83,7 +103,9 @@ bool SaveWorldToFile(const std::string& path,
         file.close();
     }
 
-    // MoveFileExA with MOVEFILE_REPLACE_EXISTING is atomic on NTFS:
+    // ES: MoveFileExA con MOVEFILE_REPLACE_EXISTING es atómico en NTFS (una sola operación) y
+    //     MOVEFILE_WRITE_THROUGH espera a que el movimiento llegue a disco.
+    // EN: MoveFileExA with MOVEFILE_REPLACE_EXISTING is atomic on NTFS:
     // it replaces the destination in a single filesystem operation.
     // MOVEFILE_WRITE_THROUGH ensures the move is flushed to disk before returning.
     if (!MoveFileExA(tmpPath.c_str(), path.c_str(),
@@ -91,22 +113,27 @@ bool SaveWorldToFile(const std::string& path,
         DWORD err = GetLastError();
         spdlog::error("SaveWorld: MoveFileExA failed (error {}), falling back to manual rename", err);
 
-        // Fallback: rotate old -> backup, temp -> target.
+        // ES: Plan B si MoveFileExA falla: viejo -> .bak, temporal -> destino. No es del todo atómico,
+        //     pero conserva el viejo como copia en vez de borrarlo primero.
+        // EN: Fallback: rotate old -> backup, temp -> target.
         // Not fully atomic, but still safer than remove-then-rename because
         // the old file is preserved as a backup rather than deleted first.
         std::string backupPath = path + ".bak";
         std::remove(backupPath.c_str());
 
-        // Move current file to backup (OK if it doesn't exist yet)
+        // ES: Mueve el fichero actual a la copia (no pasa nada si aún no existe).
+        // EN: Move current file to backup (OK if it doesn't exist yet)
         std::rename(path.c_str(), backupPath.c_str());
 
         if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
             spdlog::error("SaveWorld: Fallback rename '{}' -> '{}' also failed", tmpPath, path);
-            // Try to restore backup so we don't lose the old state
+            // ES: Intenta restaurar la copia para no perder el estado anterior.
+            // EN: Try to restore backup so we don't lose the old state
             std::rename(backupPath.c_str(), path.c_str());
             return false;
         }
-        // Clean up backup on success
+        // ES: Si salió bien, borra la copia.
+        // EN: Clean up backup on success
         std::remove(backupPath.c_str());
     }
 
@@ -114,6 +141,14 @@ bool SaveWorldToFile(const std::string& path,
     return true;
 }
 
+// ES: Carga el mundo desde 'path'. Todas las entidades quedan con owner = 0 (sin dueño) hasta
+//     que su jugador reconecte. Limita a KMP_MAX_SYNC_ENTITIES, descarta posiciones inválidas y
+//     calcula nextEntityId = id máximo + 1. Devuelve false si no existe o el JSON es inválido
+//     (atrapa la excepción, no revienta).
+// EN: Loads the world from 'path'. Every entity gets owner = 0 (unowned) until its player
+//     reconnects. Caps at KMP_MAX_SYNC_ENTITIES, drops invalid positions and computes
+//     nextEntityId = max id + 1. Returns false if missing or the JSON is invalid (the exception
+//     is caught, it does not crash).
 bool LoadWorldFromFile(const std::string& path,
                        std::unordered_map<EntityID, ServerEntity>& entities,
                        std::unordered_map<std::string, SavedPlayer>& savedPlayers,
@@ -151,7 +186,8 @@ bool LoadWorldFromFile(const std::string& path,
             auto& pos = e["position"];
             entity.position = Vec3(pos[0], pos[1], pos[2]);
 
-            // Validate position — skip entities with NaN, inf, or extreme coordinates
+            // ES: Valida la posición: salta entidades con NaN, infinito o coordenadas extremas (harían petar al cliente).
+            // EN: Validate position — skip entities with NaN, inf, or extreme coordinates
             if (std::isnan(entity.position.x) || std::isnan(entity.position.y) || std::isnan(entity.position.z) ||
                 std::isinf(entity.position.x) || std::isinf(entity.position.y) || std::isinf(entity.position.z) ||
                 std::abs(entity.position.x) > 1000000.f || std::abs(entity.position.y) > 1000000.f ||
@@ -159,7 +195,8 @@ bool LoadWorldFromFile(const std::string& path,
                 skippedBadPos++;
                 spdlog::warn("LoadWorld: Skipping entity {} — bad position ({:.1f}, {:.1f}, {:.1f})",
                              entity.id, entity.position.x, entity.position.y, entity.position.z);
-                // Still track max ID to prevent collisions
+                // ES: Aun así se cuenta su ID para que no se reutilice y choque.
+                // EN: Still track max ID to prevent collisions
                 if (entity.id > maxId) maxId = entity.id;
                 continue;
             }
@@ -189,14 +226,16 @@ bool LoadWorldFromFile(const std::string& path,
             loadedCount++;
         }
 
-        // Load player→entity mapping (version 2+)
+        // ES: Carga el mapa jugador -> entidades (versión 2+), quedándose solo con entidades que sí se cargaron.
+        // EN: Load player→entity mapping (version 2+)
         if (j.contains("players") && j["players"].is_object()) {
             for (auto& [name, ids] : j["players"].items()) {
                 SavedPlayer sp;
                 sp.name = name;
                 for (auto& eid : ids) {
                     EntityID id = eid.get<EntityID>();
-                    // Only keep references to entities that actually loaded
+                    // ES: Solo referencias a entidades cargadas de verdad.
+                    // EN: Only keep references to entities that actually loaded
                     if (entities.count(id)) sp.entityIds.push_back(id);
                 }
                 if (!sp.entityIds.empty()) {
