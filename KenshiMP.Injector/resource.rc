@@ -1,5 +1,8 @@
-// Resource file for KenshiMP Injector
-// Placeholder - add icon and version info when building
+// ES: Fichero de recursos del lanzador KenshiMP (Injector): solo contiene el bloque de
+//     información de versión que Windows muestra en las propiedades del .exe.
+//     Provisional - falta añadir el icono.
+// EN: Resource file for KenshiMP Injector
+//     Placeholder - add icon and version info when building
 
 #include <winres.h>
 
